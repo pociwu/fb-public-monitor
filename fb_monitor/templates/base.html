@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{% block title %}FB Public Monitor{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://unpkg.com/htmx.org@2.0.4" defer></script>
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+<header><a href="/" class="brand">FB Public Monitor</a><nav><a href="/">儀表板</a><a href="/jobs">工作紀錄</a><a href="/diagnostics">診斷</a></nav></header>
+<main>{% block content %}{% endblock %}</main>
+<div class="lightbox" id="lightbox" hidden aria-modal="true" role="dialog"><button class="lightbox-close" type="button" aria-label="關閉">×</button><button class="lightbox-prev" type="button" aria-label="上一張">‹</button><img alt="媒體預覽"><button class="lightbox-next" type="button" aria-label="下一張">›</button><a class="lightbox-download button" download>下載原檔</a></div>
+<footer>唯讀介面 · 僅監聽 localhost</footer>
+</body></html>

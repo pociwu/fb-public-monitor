@@ -1,0 +1,9 @@
+{% if e.media %}<div class="media-gallery count-{{[e.media_count,4]|min}}" data-gallery="entity-{{e.id}}">
+  {% for m in e.media[:4] %}<div class="media-tile">
+    {% if m.status == 'ready' and m.kind == 'image' %}<button class="media-button" type="button" data-lightbox-src="/media/{{m.id}}" data-download="/media/{{m.id}}?download=true"><img src="/media/{{m.id}}/thumbnail" loading="lazy" alt="{{m.role or '照片'}}"></button>
+    {% elif m.status == 'ready' and m.kind == 'video' %}<video src="/media/{{m.id}}" controls preload="metadata" {% if not e.present %}data-gone="true"{% endif %}></video><a class="video-download" href="/media/{{m.id}}?download=true">下載原檔</a>
+    {% else %}<div class="media-placeholder"><span>{% if m.status=='pending' %}媒體等待補抓{% elif m.status=='paused_low_disk' %}磁碟空間不足，下載暫停{% elif m.status=='unavailable' %}媒體已無法取得{% else %}{{m.mime_type or m.status or '附件'}}{% endif %}</span></div>{% endif %}
+    {% if loop.index==4 and e.media_count>4 %}<span class="more-media">+{{e.media_count-4}}</span>{% endif %}
+  </div>{% endfor %}
+  {% if not e.present %}<span class="gone-overlay">已消失</span>{% endif %}
+</div>{% endif %}

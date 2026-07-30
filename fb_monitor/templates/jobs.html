@@ -1,0 +1,2 @@
+{% extends "base.html" %}{% block title %}工作紀錄{% endblock %}{% block content %}<h1>工作紀錄</h1><table><thead><tr><th>ID</th><th>帳號</th><th>類型</th><th>狀態</th><th>建立／完成</th><th>錯誤</th></tr></thead><tbody>{% for j in jobs %}<tr><td>{{j.id}}</td><td>{{j.profile_name or '系統'}}</td><td>{{j.job_type}}</td><td><span class="badge {{j.status}}">{{j.status}}</span></td><td>{{j.created_at}}<br>{{j.finished_at or ''}}</td><td>{{j.error or ''}}</td></tr>{% endfor %}</tbody></table>{% endblock %}
+

@@ -1,0 +1,47 @@
+timezone: Asia/Taipei
+
+profiles:
+  - name: example-account
+    url: https://www.facebook.com/example
+    enabled: true
+
+schedule:
+  visit_min_hours: 6
+  visit_max_hours: 8
+  spacing_min_minutes: 20
+  spacing_max_minutes: 30
+  recent_posts: 10
+  backfill_posts: 20
+  full_audit_days: 7
+
+storage:
+  data_dir: /data
+  low_disk_gb: 10
+  media_retry_days: 30
+
+budget:
+  monthly_usd: 5
+  warning_ratio: 0.8
+
+telegram:
+  health_hour: 8
+  # 同一貼文／留言的變更先合併，並以持久化佇列節流送出。
+  coalesce_minutes: 15
+  send_interval_seconds: 3
+  high_water: 50
+  max_attempts: 5
+  retry_hours: 24
+
+web:
+  # Docker 內監聽所有介面，但 compose 只發布至主機 127.0.0.1。
+  host: 0.0.0.0
+  port: 8080
+
+actors:
+  profile: apify/facebook-pages-scraper
+  posts: unseenuser/fb-profile
+  comments: apify/facebook-comments-scraper
+  # Actor schema 日後改變時，可在下列 mapping 覆寫輸入欄位。
+  profile_input: {}
+  posts_input: {}
+  comments_input: {}

@@ -1,0 +1,57 @@
+{% extends "base.html" %}{% block title %}{{ profile.display_name or profile.name }} · FB Monitor{% endblock %}
+{% block content %}
+<section class="profile-titlebar">
+  <div><a href="/">← 返回儀表板</a><h1>{{ profile.display_name or profile.name }}</h1>{% if profile.display_name and profile.display_name != profile.name %}<p class="muted">設定別名：{{ profile.name }}</p>{% endif %}</div>
+  <a class="button secondary" href="{{ profile.url }}" target="_blank" rel="noreferrer">Facebook 來源</a>
+</section>
+<div class="tabs">{% for tab,label in [('post','貼文'),('comment','留言'),('profile','個人檔案')] %}<a class="{% if kind==tab %}active{% endif %}" href="?kind={{tab}}" hx-get="?kind={{tab}}" hx-target="#profile-content" hx-select="#profile-content" hx-swap="outerHTML" hx-push-url="true">{{label}}</a>{% endfor %}</div>
+
+<div id="profile-content">
+{% if kind != 'profile' %}
+<form class="content-filters" method="get" hx-get="/profiles/{{profile.id}}" hx-target="#profile-content" hx-select="#profile-content" hx-swap="outerHTML" hx-push-url="true">
+  <input type="hidden" name="kind" value="{{kind}}">
+  <input name="q" value="{{q}}" placeholder="搜尋文字、ID 或網址">
+  <select name="media_filter" aria-label="媒體篩選">
+    {% for value,label in [('all','全部'),('image','有圖片'),('video','有影片'),('none','無媒體'),('gone','已消失')] %}<option value="{{value}}" {% if media_filter==value %}selected{% endif %}>{{label}}</option>{% endfor %}
+  </select>
+  <button>搜尋</button>
+</form>
+{% endif %}
+
+{% if kind == 'profile' %}
+  {% for e in entities %}
+    {% set ready_images = e.media|selectattr('status','equalto','ready')|selectattr('kind','equalto','image')|list %}
+    {% set covers = ready_images|selectattr('role','equalto','cover_photo')|list %}
+    {% set avatars = ready_images|selectattr('role','equalto','profile_picture')|list %}
+    <article class="profile-overview {% if not e.present %}is-gone{% endif %}">
+      <div class="profile-cover" data-gallery="profile-{{e.id}}">
+        {% if covers %}<button class="media-button" data-lightbox-src="/media/{{covers[0].id}}" data-download="/media/{{covers[0].id}}?download=true"><img src="/media/{{covers[0].id}}/thumbnail" loading="lazy" alt="封面照片"></button>{% else %}<div class="media-placeholder">沒有封面照片</div>{% endif %}
+        {% if avatars %}<button class="profile-avatar media-button" data-lightbox-src="/media/{{avatars[0].id}}" data-download="/media/{{avatars[0].id}}?download=true"><img src="/media/{{avatars[0].id}}/thumbnail" loading="lazy" alt="大頭照"></button>{% endif %}
+        {% if not e.present %}<span class="gone-overlay">已消失</span>{% endif %}
+      </div>
+      <div class="profile-overview-body"><h2>{{profile.display_name or e.content.title or profile.name}}</h2>{% if e.content.text %}<p class="content-text">{{e.content.text}}</p>{% endif %}
+        <div class="entity-meta"><span class="badge {{'ok' if e.present else 'gone'}}">{{'存在' if e.present else '已消失'}}</span><span>Facebook ID：{{profile.fb_id or e.external_id}}</span><span>{{e.version_count}} 個版本</span></div>
+        <div class="card-actions"><a class="button" href="/entities/{{e.id}}">查看完整版本</a><a class="button secondary" href="{{e.source_url or profile.url}}" target="_blank" rel="noreferrer">Facebook 來源</a></div>
+      </div>
+    </article>
+  {% else %}<p class="empty">尚無個人檔案資料</p>{% endfor %}
+{% else %}
+  <section class="entity-cards">
+  {% for e in entities %}
+    <article class="entity-card {% if not e.present %}is-gone{% endif %}">
+      {% include "_media_gallery.html" %}
+      <div class="entity-card-body">
+        <div class="entity-heading"><div><span class="eyebrow">{{'留言' if kind=='comment' else '貼文'}}</span><h2>{{e.content.title}}</h2></div><span class="badge {{'ok' if e.present else 'gone'}}">{{'存在' if e.present else '已消失'}}</span></div>
+        {% if e.content.text %}<div class="content-text clamp" data-expandable>{{e.content.text}}</div><button class="text-toggle" type="button" hidden>顯示更多</button>{% else %}<p class="content-text muted">{% if e.video_count %}影片貼文{% elif e.image_count %}圖片貼文{% else %}無文字內容{% endif %}</p>{% endif %}
+        {% if kind=='comment' and e.parent_external_id %}<p class="parent-link"><a href="{{e.parent_external_id}}" target="_blank" rel="noreferrer">查看所屬貼文</a></p>{% endif %}
+        <div class="entity-meta"><span>{{e.content.timestamp if e.content.timestamp != '時間未知' else e.published_display}}</span><span>{{e.version_count}} 版本</span><span>{{e.media_count}} 媒體</span></div>
+        <div class="card-actions"><a class="button" href="/entities/{{e.id}}">查看詳細與版本</a>{% if e.source_url %}<a class="button secondary" href="{{e.source_url}}" target="_blank" rel="noreferrer">Facebook 來源</a>{% endif %}</div>
+        <details class="technical"><summary>技術資訊</summary><p>Entity ID：{{e.external_id}}</p>{% if e.source_url %}<p class="break-all">{{e.source_url}}</p>{% endif %}</details>
+      </div>
+    </article>
+  {% else %}<p class="empty">沒有符合資料</p>{% endfor %}
+  </section>
+  <nav class="pagination">{% if page>1 %}<a href="?kind={{kind}}&q={{q|urlencode}}&media_filter={{media_filter}}&page={{page-1}}" hx-get="?kind={{kind}}&q={{q|urlencode}}&media_filter={{media_filter}}&page={{page-1}}" hx-target="#profile-content" hx-select="#profile-content" hx-swap="outerHTML" hx-push-url="true">上一頁</a>{% endif %}<span>{{page}} / {{pages}}</span>{% if page<pages %}<a href="?kind={{kind}}&q={{q|urlencode}}&media_filter={{media_filter}}&page={{page+1}}" hx-get="?kind={{kind}}&q={{q|urlencode}}&media_filter={{media_filter}}&page={{page+1}}" hx-target="#profile-content" hx-select="#profile-content" hx-swap="outerHTML" hx-push-url="true">下一頁</a>{% endif %}</nav>
+{% endif %}
+</div>
+{% endblock %}

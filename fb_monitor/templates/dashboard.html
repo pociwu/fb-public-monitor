@@ -1,0 +1,33 @@
+{% extends "base.html" %}{% block title %}儀表板 · FB Monitor{% endblock %}
+{% block content %}
+<div id="dashboard" hx-get="/" hx-trigger="every 60s" hx-select="#dashboard" hx-swap="outerHTML">
+<h1>監控儀表板</h1>
+<section class="stats">
+  <article><span>工作佇列</span><strong>{{ pending.count or 0 }}</strong></article>
+  <article><span>待送通知</span><strong>{{ outbox.count or 0 }}</strong></article>
+  <article><span>媒體</span><strong>{{ media.ready or 0 }} / {{ media.total or 0 }}</strong></article>
+  <article><span>月預算</span><strong>${{ "%.2f"|format(budget) }}</strong></article>
+</section>
+<section class="panel"><h2>Facebook 帳號</h2>
+<div class="cards">{% for p in profiles %}<a class="profile-card" href="/profiles/{{ p.id }}">
+  <div class="profile-head">{% if p.avatar_media_id %}<img class="avatar" src="/media/{{ p.avatar_media_id }}" alt="">{% else %}<span class="avatar placeholder">FB</span>{% endif %}<div><span class="dot {{ p.public_state }}"></span><strong>{{ p.display_name or p.name }}</strong>{% if p.display_name and p.name != p.display_name %}<small class="alias">別名：{{ p.name }}</small>{% endif %}</div></div>
+  <small>{{ p.public_state }} · Facebook ID：{{ p.fb_id or '尚未解析' }}</small>
+  <p>{{ p.post_count }} 篇貼文 · {{ p.comment_count }} 則留言</p>
+  <small>最近成功：{{ p.last_success_at or '—' }}<br>下次拜訪：{{ p.next_visit_at or '佇列中' }}</small>
+</a>{% endfor %}</div></section>
+<section class="panel"><h2>Apify 使用估算</h2><table><thead><tr><th>月份</th><th>類別</th><th>結果</th><th>美元</th></tr></thead><tbody>{% for u in usage %}<tr><td>{{ u.month }}</td><td>{{ u.category }}</td><td>{{ u.results }}</td><td>${{ "%.4f"|format(u.estimated_usd) }}</td></tr>{% else %}<tr><td colspan="4">尚無資料</td></tr>{% endfor %}</tbody></table></section>
+<section class="panel outbox-panel">
+  <div class="panel-heading"><h2>發送佇列</h2><form method="post" action="/outbox/clear" onsubmit="return confirm('清空所有待發與重試中的 Telegram 訊息？')"><button class="button danger" type="submit">清空待發佇列</button></form></div>
+  <div class="queue-stats"><span>待發 {{ outbox_counts.get('pending', 0) }}</span><span>已失敗 {{ outbox_counts.get('failed', 0) }}</span><span>已取消 {{ outbox_counts.get('cancelled', 0) }}</span></div>
+  <div class="queue-table"><table><thead><tr><th>內容</th><th>帳號／建立時間</th><th>下次嘗試</th><th>狀態</th><th></th></tr></thead><tbody>
+  {% for item in outbox_rows %}<tr><td>{{ item.summary[:160] }}</td><td>{{ item.profile_name }}<br><small>{{ item.created_display }}</small></td><td>{{ item.next_display }}<br><small>{{ item.attempts }} 次</small></td><td><span class="badge {{ item.status }}">{{ item.status }}</span>{% if item.last_error %}<br><small>{{ item.last_error[:100] }}</small>{% endif %}</td><td>{% if item.status == 'pending' %}<form method="post" action="/outbox/{{ item.id }}/cancel"><button class="button secondary" type="submit">取消</button></form>{% endif %}</td></tr>{% else %}<tr><td colspan="5" class="muted">目前沒有待處理訊息</td></tr>{% endfor %}
+  </tbody></table></div>
+</section>
+<section class="panel maintenance-panel">
+  <h2>去重與維護紀錄</h2>
+  <div class="queue-table"><table><thead><tr><th>工作</th><th>時間</th><th>狀態</th><th>結果</th></tr></thead><tbody>
+  {% for run in maintenance_runs %}<tr><td>{{ run.task_name }}</td><td>{{ run.started_display }}{% if run.finished_at %}<br><small>完成：{{ run.finished_display }}</small>{% endif %}</td><td><span class="badge {{ run.status }}">{{ run.status }}</span></td><td>{% if run.summary %}貼文合併 {{ run.summary.get('posts_merged', 0) }}、留言合併 {{ run.summary.get('comments_merged', 0) }}、媒體合併 {{ run.summary.get('merged', 0) }}、無引用檔案 {{ run.summary.get('orphaned', 0) }}{% endif %}{% if run.error %}<br><small>{{ run.error }}</small>{% endif %}</td></tr>{% else %}<tr><td colspan="4" class="muted">尚無維護紀錄</td></tr>{% endfor %}
+  </tbody></table></div>
+</section>
+</div>
+{% endblock %}

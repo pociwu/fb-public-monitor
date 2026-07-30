@@ -1,0 +1,8 @@
+{% extends "base.html" %}{% block title %}Actor 診斷 · FB Monitor{% endblock %}
+{% block content %}
+<h1>Actor 診斷</h1>
+<form class="search"><select name="profile_id"><option value="">全部帳號</option>{% for p in profiles %}<option value="{{p.id}}" {% if profile_id==p.id %}selected{% endif %}>{{p.label}}</option>{% endfor %}</select><button>篩選</button></form>
+<section class="list">{% for r in runs %}<details class="diag"><summary><strong>#{{r.id}} {{r.category}} / {{r.input_variant}}</strong><span class="badge {{'ok' if r.status=='succeeded' else 'gone'}}">{{r.status}}</span><small>{{r.profile_name or '系統'}} · {{r.result_count}} 筆 · {{r.started_at}}</small></summary>
+<p>Actor：{{r.actor_id}} · Run：{{r.run_id or '—'}} · 費用：${{'%.4f'|format(r.charged_usd or 0)}}</p>{% if r.error %}<pre>{{r.error}}</pre>{% endif %}<h3>輸入（密鑰已遮蔽）</h3><pre>{{r.input|tojson(indent=2)}}</pre>{% if r.summary %}<h3>SUMMARY</h3><pre>{{r.summary|tojson(indent=2)}}</pre>{% endif %}{% if r.samples %}<h3>失敗樣本（最多 20 筆）</h3><pre>{{r.samples|tojson(indent=2)}}</pre>{% endif %}
+</details>{% else %}<p class="empty">尚無 Actor 診斷紀錄</p>{% endfor %}</section>
+{% endblock %}
