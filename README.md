@@ -1,6 +1,6 @@
 # FB Public Monitor
 
-在 Ubuntu 以 Docker Compose 長期監控最多 10 個公開 Facebook 個人帳號。服務透過 Apify 擷取個人檔案、貼文、公開留言與附件，保存完整版本歷史，並將變更送至單一 Telegram 群組。
+在 Ubuntu 以 Docker Compose 長期監控最多 16 個公開 Facebook 個人帳號。服務透過 Apify 擷取個人檔案、貼文、公開留言與附件，保存完整版本歷史，並將變更送至單一 Telegram 群組。
 
 ## 已實作行為
 
@@ -58,7 +58,7 @@ WEB_BIND_IP=100.x.x.x
 
 ## 管理
 
-編輯 `config.yaml` 可新增、停用或移除網址，服務會自動重新載入；最多 10 個。移除只停止監控，不刪除歷史資料。
+編輯 `config.yaml` 可新增、停用或移除網址，服務會自動重新載入；最多 16 個。移除只停止監控，不刪除歷史資料。
 
 ```bash
 docker compose exec monitor fb-monitor status
