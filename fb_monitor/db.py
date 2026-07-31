@@ -204,7 +204,7 @@ class Database:
 
     def reorder_profiles(self, profile_ids: list[int]) -> None:
         with self.connect() as conn:
-            current = [int(row[0]) for row in conn.execute("SELECT id FROM profiles")]
+            current = [int(row[0]) for row in conn.execute("SELECT id FROM profiles WHERE enabled=1")]
             if len(profile_ids) != len(current) or len(set(profile_ids)) != len(profile_ids) or set(profile_ids) != set(current):
                 raise ValueError("profile order must contain every profile exactly once")
             conn.executemany(

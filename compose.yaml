@@ -4,7 +4,7 @@ services:
     restart: unless-stopped
     env_file: .env
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
+      - ./config.yaml:/app/config.yaml
       - ./data:/data
     ports:
       - "${WEB_BIND_IP:-127.0.0.1}:8080:8080"

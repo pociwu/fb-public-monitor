@@ -8,7 +8,7 @@ from fb_monitor.config import load_settings
 from fb_monitor.web import create_app
 
 
-def test_dashboard_is_read_only(tmp_path: Path, monkeypatch):
+def test_dashboard_health_and_diagnostics_routes(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text("profiles: []\nstorage:\n  data_dir: data\n", encoding="utf-8")
     monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
@@ -18,7 +18,9 @@ def test_dashboard_is_read_only(tmp_path: Path, monkeypatch):
         assert client.get("/healthz").json() == {"ok": True}
         assert client.get("/diagnostics").status_code == 200
         assert client.get("/diagnostics?profile_id=").status_code == 200
-        assert client.post("/profiles").status_code in {404, 405}
+        invalid_add = client.post("/profiles")
+        assert invalid_add.status_code == 200
+        assert "請輸入 Facebook 個人檔案網址" in invalid_add.text
 
 
 def test_profile_cards_render_media_and_thumbnail_cache(tmp_path: Path, monkeypatch):
@@ -131,3 +133,37 @@ storage:
         all_profiles = client.post("/profiles/scan-all", follow_redirects=False)
         assert all_profiles.status_code == 303
         assert db.row("SELECT COUNT(*) count FROM jobs WHERE job_type='visit' AND status='pending'")["count"] == 2
+
+
+def test_dashboard_can_add_and_remove_validated_profile_urls(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """profiles:
+  - name: first
+    url: https://www.facebook.com/first
+storage:
+  data_dir: data
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    app = create_app(load_settings(config))
+    db = app.state.db
+
+    with TestClient(app) as client:
+        invalid = client.post("/profiles", data={"url": "https://example.com/not-facebook"})
+        assert invalid.status_code == 200
+        assert "網址必須是" in invalid.text
+
+        added = client.post("/profiles", data={"url": "https://m.facebook.com/profile.php?id=24680"})
+        assert added.status_code == 200
+        assert "已新增並排程驗證" in added.text
+        profile = db.row("SELECT * FROM profiles WHERE url='https://www.facebook.com/profile.php?id=24680'")
+        assert profile and profile["enabled"] == 1
+        assert db.row("SELECT COUNT(*) count FROM jobs WHERE profile_id=? AND job_type='visit' AND status='pending'", (profile["id"],))["count"] == 1
+
+        removed = client.post(f"/profiles/{profile['id']}/remove")
+        assert removed.status_code == 200
+        assert "已停止監控並保留歷史資料" in removed.text
+        assert db.row("SELECT enabled FROM profiles WHERE id=?", (profile["id"],))["enabled"] == 0
+        assert db.row("SELECT COUNT(*) count FROM jobs WHERE profile_id=? AND status='pending'", (profile["id"],))["count"] == 0

@@ -8,6 +8,7 @@ from difflib import unified_diff
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, quote
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, RedirectResponse
@@ -15,8 +16,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from .config import MAX_PROFILES, Settings, load_settings
-from .db import Database
+from .config import MAX_PROFILES, Settings, add_profile_to_config, load_settings, remove_profile_from_config
+from .db import Database, utcnow
 from .service import MonitorService
 from .timeutil import display_time, parse_time
 
@@ -123,7 +124,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.mount("/static", StaticFiles(directory=str(PACKAGE / "static")), name="static")
 
     @app.get("/")
-    def dashboard(request: Request):
+    def dashboard(request: Request, notice: str = "", error: str = ""):
         db: Database = request.app.state.db
         profiles = db.rows("""SELECT p.*,
             (SELECT COUNT(*) FROM entities e WHERE e.profile_id=p.id AND e.kind='post') post_count,
@@ -134,7 +135,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                CASE WHEN LOWER(COALESCE(em.discovery_path,'')) LIKE '%large%' THEN 0
                     WHEN LOWER(COALESCE(em.discovery_path,'')) LIKE '%medium%' THEN 1 ELSE 2 END,
                m.id DESC LIMIT 1) avatar_media_id
-            FROM profiles p ORDER BY COALESCE(p.sort_order,p.id),p.id""")
+            FROM profiles p WHERE p.enabled=1 ORDER BY COALESCE(p.sort_order,p.id),p.id""")
         for profile in profiles:
             profile["last_success_display"] = display_time(profile.get("last_success_at"), cfg.timezone)
             profile["next_visit_display"] = display_time(profile.get("next_visit_at"), cfg.timezone)
@@ -157,7 +158,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             row["finished_display"] = display_time(row.get("finished_at"), cfg.timezone)
         media = db.row("SELECT COUNT(*) total,SUM(CASE WHEN status='ready' THEN 1 ELSE 0 END) ready FROM media")
         monitored = db.row("SELECT COUNT(*) count FROM profiles WHERE enabled=1")
-        return templates.TemplateResponse(request, "dashboard.html", {"profiles": profiles, "usage": usage, "pending": pending, "outbox": outbox, "outbox_counts": outbox_counts, "outbox_rows": outbox_rows, "maintenance_runs": maintenance_runs, "media": media, "budget": cfg.monthly_budget_usd, "monitored": monitored, "max_profiles": MAX_PROFILES})
+        return templates.TemplateResponse(request, "dashboard.html", {"profiles": profiles, "usage": usage, "pending": pending, "outbox": outbox, "outbox_counts": outbox_counts, "outbox_rows": outbox_rows, "maintenance_runs": maintenance_runs, "media": media, "budget": cfg.monthly_budget_usd, "monitored": monitored, "max_profiles": MAX_PROFILES, "notice": notice, "error": error})
+
+    @app.post("/profiles")
+    async def add_profile(request: Request):
+        db: Database = request.app.state.db
+        params = parse_qs((await request.body()).decode("utf-8"))
+        submitted_url = (params.get("url") or [""])[0]
+        try:
+            added = add_profile_to_config(cfg.config_path, submitted_url)
+            refreshed = load_settings(cfg.config_path)
+            db.sync_profiles(refreshed.profiles)
+            profile = db.row("SELECT id FROM profiles WHERE url=?", (added.url,))
+            if not profile:
+                raise RuntimeError("新增後找不到監控帳號")
+            db.queue_profile_visits([int(profile["id"])])
+        except (OSError, RuntimeError, ValueError) as exc:
+            return RedirectResponse(url=f"/?error={quote(str(exc))}", status_code=303)
+        return RedirectResponse(url=f"/?notice={quote('已新增並排程驗證：' + added.url)}", status_code=303)
 
     @app.post("/profiles/reorder")
     async def reorder_profiles(request: Request):
@@ -187,6 +205,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(404)
         db.queue_profile_visits([profile_id])
         return RedirectResponse(url="/", status_code=303)
+
+    @app.post("/profiles/{profile_id}/remove")
+    def remove_profile(request: Request, profile_id: int):
+        db: Database = request.app.state.db
+        profile = db.row("SELECT id,name,url FROM profiles WHERE id=? AND enabled=1", (profile_id,))
+        if not profile:
+            raise HTTPException(404)
+        try:
+            if not remove_profile_from_config(cfg.config_path, str(profile["url"])):
+                raise ValueError("此帳號不在 config.yaml 監控名單中")
+            refreshed = load_settings(cfg.config_path)
+            db.sync_profiles(refreshed.profiles)
+            db.execute(
+                "UPDATE jobs SET status='cancelled',finished_at=?,error='monitoring removed from dashboard' WHERE profile_id=? AND status='pending'",
+                (utcnow(), profile_id),
+            )
+        except (OSError, ValueError) as exc:
+            return RedirectResponse(url=f"/?error={quote(str(exc))}", status_code=303)
+        return RedirectResponse(url=f"/?notice={quote('已停止監控並保留歷史資料：' + str(profile['name']))}", status_code=303)
 
     @app.post("/outbox/{outbox_id}/cancel")
     def cancel_outbox(request: Request, outbox_id: int):

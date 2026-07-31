@@ -2,6 +2,8 @@
 {% block content %}
 <div id="dashboard" hx-get="/" hx-trigger="every 60s" hx-select="#dashboard" hx-swap="outerHTML">
 <h1>監控儀表板</h1>
+{% if notice %}<p class="notice success">{{ notice }}</p>{% endif %}
+{% if error %}<p class="notice error">{{ error }}</p>{% endif %}
 <section class="stats">
   <article><span>監控人數</span><strong>{{ monitored.count or 0 }} / {{ max_profiles }}</strong></article>
   <article><span>工作佇列</span><strong>{{ pending.count or 0 }}</strong></article>
@@ -10,6 +12,11 @@
   <article><span>月預算</span><strong>${{ "%.2f"|format(budget) }}</strong></article>
 </section>
 <section class="panel"><div class="panel-heading"><h2>Facebook 帳號</h2><div class="panel-actions"><small class="sort-hint">拖曳卡片可調整順序</small><form method="post" action="/profiles/scan-all" onsubmit="return confirm('將全部啟用帳號排到拜訪佇列最前端？仍會遵守間隔與預算限制。')"><button class="button" type="submit">立即拜訪（全部）</button></form></div></div>
+<form class="add-profile-form" method="post" action="/profiles">
+  <label for="profile-url">新增監控網址</label>
+  <div><input id="profile-url" name="url" type="url" required autocomplete="url" placeholder="https://www.facebook.com/使用者名稱或數字ID"><button class="button" type="submit">驗證並新增</button></div>
+  <small>接受 Facebook 個人檔案首頁網址；新增後會立即排程，由個人檔案 Actor 驗證公開可讀性。</small>
+</form>
 <div class="cards" data-profile-cards>{% for p in profiles %}<div class="profile-card-wrap" draggable="true" data-profile-id="{{ p.id }}">
   <span class="drag-handle" aria-hidden="true" title="拖曳調整順序">⠿</span>
   <a class="profile-card" href="/profiles/{{ p.id }}">
@@ -18,7 +25,10 @@
   <p>{{ p.post_count }} 篇貼文 · {{ p.comment_count }} 則留言</p>
   <small>最近成功：{{ p.last_success_at or '—' }}<br>下次拜訪：{{ p.next_visit_at or '佇列中' }}</small>
   </a>
-  {% if p.enabled %}<form class="quick-visit-form" method="post" action="/profiles/{{ p.id }}/scan" onsubmit="return confirm('立即排程拜訪 {{ p.display_name or p.name }}？')"><button class="button secondary" type="submit">立即拜訪</button></form>{% endif %}
+  <div class="card-admin-actions">
+    <form method="post" action="/profiles/{{ p.id }}/scan" onsubmit="return confirm('立即排程拜訪 {{ p.display_name or p.name }}？')"><button class="button secondary" type="submit">立即拜訪</button></form>
+    <form method="post" action="/profiles/{{ p.id }}/remove" onsubmit="return confirm('停止監控 {{ p.display_name or p.name }}？歷史貼文與留言會保留。')"><button class="button danger" type="submit">移除</button></form>
+  </div>
 </div>{% endfor %}</div></section>
 <section class="panel"><h2>Apify 使用估算</h2><table><thead><tr><th>月份</th><th>類別</th><th>結果</th><th>美元</th></tr></thead><tbody>{% for u in usage %}<tr><td>{{ u.month }}</td><td>{{ u.category }}</td><td>{{ u.results }}</td><td>${{ "%.4f"|format(u.estimated_usd) }}</td></tr>{% else %}<tr><td colspan="4">尚無資料</td></tr>{% endfor %}</tbody></table></section>
 <section class="panel outbox-panel">

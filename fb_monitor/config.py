@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import yaml
 
 MAX_PROFILES = 16
+_CONFIG_WRITE_LOCK = threading.Lock()
+_RESERVED_FACEBOOK_PATHS = {
+    "events", "groups", "marketplace", "permalink.php", "photo", "photos",
+    "posts", "reel", "reels", "share", "story.php", "watch",
+}
 
 
 @dataclass(slots=True)
@@ -25,6 +32,78 @@ class ActorConfig:
     profile_input: dict[str, Any] = field(default_factory=dict)
     posts_input: dict[str, Any] = field(default_factory=dict)
     comments_input: dict[str, Any] = field(default_factory=dict)
+
+
+def normalize_profile_url(value: str) -> str:
+    candidate = value.strip()
+    if not candidate:
+        raise ValueError("請輸入 Facebook 個人檔案網址")
+    parsed = urlsplit(candidate)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in {"http", "https"} or not (host == "facebook.com" or host.endswith(".facebook.com")):
+        raise ValueError("網址必須是 https://www.facebook.com/ 的個人檔案網址")
+    path = parsed.path.rstrip("/")
+    segments = [segment for segment in path.split("/") if segment]
+    if not segments:
+        raise ValueError("Facebook 網址缺少個人檔案識別名稱或 ID")
+    first = segments[0].lower()
+    query = ""
+    if first == "profile.php":
+        profile_id = (parse_qs(parsed.query).get("id") or [""])[0]
+        if not profile_id.isdigit():
+            raise ValueError("profile.php 網址必須包含數字 id")
+        path = "/profile.php"
+        query = f"id={profile_id}"
+    elif first == "people":
+        if len(segments) != 3 or not segments[-1].isdigit():
+            raise ValueError("Facebook people 網址格式不正確")
+    elif first in _RESERVED_FACEBOOK_PATHS or len(segments) != 1:
+        raise ValueError("請輸入個人檔案首頁網址，不要使用貼文、社團或影音網址")
+    return urlunsplit(("https", "www.facebook.com", path, query, ""))
+
+
+def profile_name_from_url(url: str) -> str:
+    parsed = urlsplit(url)
+    if parsed.path.lower() == "/profile.php":
+        return f"FB-{(parse_qs(parsed.query).get('id') or ['profile'])[0]}"
+    return parsed.path.rstrip("/").split("/")[-1]
+
+
+def _write_config(path: Path, raw: dict[str, Any]) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        yaml.safe_dump(raw, handle, allow_unicode=True, sort_keys=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def add_profile_to_config(path: Path, url: str) -> ProfileConfig:
+    normalized = normalize_profile_url(url)
+    with _CONFIG_WRITE_LOCK:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        profiles = list(raw.get("profiles") or [])
+        existing_urls = {normalize_profile_url(str(item.get("url") or "")) for item in profiles}
+        if normalized in existing_urls:
+            raise ValueError("此 Facebook 網址已在監控名單中")
+        if len(profiles) >= MAX_PROFILES:
+            raise ValueError(f"監控人數已達上限 {MAX_PROFILES} 人")
+        item = {"name": profile_name_from_url(normalized), "url": normalized, "enabled": True}
+        profiles.append(item)
+        raw["profiles"] = profiles
+        _write_config(path, raw)
+    return ProfileConfig(**item)
+
+
+def remove_profile_from_config(path: Path, url: str) -> bool:
+    target = normalize_profile_url(url)
+    with _CONFIG_WRITE_LOCK:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        profiles = list(raw.get("profiles") or [])
+        kept = [item for item in profiles if normalize_profile_url(str(item.get("url") or "")) != target]
+        if len(kept) == len(profiles):
+            return False
+        raw["profiles"] = kept
+        _write_config(path, raw)
+    return True
 
 
 @dataclass(slots=True)

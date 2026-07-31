@@ -51,7 +51,7 @@
       let changed = false;
 
       container.addEventListener("dragstart", (event) => {
-        if (event.target.closest(".quick-visit-form")) {
+        if (event.target.closest(".card-admin-actions")) {
           event.preventDefault();
           return;
         }
