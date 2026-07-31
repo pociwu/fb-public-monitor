@@ -68,3 +68,34 @@ storage:
         assert thumbnail.status_code == 200
         assert thumbnail.headers["content-type"].startswith("image/webp")
         assert client.get("/profiles/1?kind=post&media_filter=image").status_code == 200
+
+
+def test_dashboard_profile_order_can_be_dragged_and_persisted(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """profiles:
+  - name: first
+    url: https://facebook.com/first
+  - name: second
+    url: https://facebook.com/second
+storage:
+  data_dir: data
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    app = create_app(load_settings(config))
+
+    with TestClient(app) as client:
+        initial = client.get("/")
+        assert initial.status_code == 200
+        assert 'data-profile-cards' in initial.text
+        assert initial.text.index("first") < initial.text.index("second")
+
+        reordered = client.post("/profiles/reorder", json={"profile_ids": [2, 1]})
+        assert reordered.status_code == 200
+        assert reordered.json() == {"ok": True}
+
+        refreshed = client.get("/")
+        assert refreshed.text.index("second") < refreshed.text.index("first")
+        assert client.post("/profiles/reorder", json={"profile_ids": [1]}).status_code == 400

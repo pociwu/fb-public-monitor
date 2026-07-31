@@ -134,7 +134,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                CASE WHEN LOWER(COALESCE(em.discovery_path,'')) LIKE '%large%' THEN 0
                     WHEN LOWER(COALESCE(em.discovery_path,'')) LIKE '%medium%' THEN 1 ELSE 2 END,
                m.id DESC LIMIT 1) avatar_media_id
-            FROM profiles p ORDER BY p.id""")
+            FROM profiles p ORDER BY COALESCE(p.sort_order,p.id),p.id""")
         for profile in profiles:
             profile["last_success_display"] = display_time(profile.get("last_success_at"), cfg.timezone)
             profile["next_visit_display"] = display_time(profile.get("next_visit_at"), cfg.timezone)
@@ -157,6 +157,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             row["finished_display"] = display_time(row.get("finished_at"), cfg.timezone)
         media = db.row("SELECT COUNT(*) total,SUM(CASE WHEN status='ready' THEN 1 ELSE 0 END) ready FROM media")
         return templates.TemplateResponse(request, "dashboard.html", {"profiles": profiles, "usage": usage, "pending": pending, "outbox": outbox, "outbox_counts": outbox_counts, "outbox_rows": outbox_rows, "maintenance_runs": maintenance_runs, "media": media, "budget": cfg.monthly_budget_usd})
+
+    @app.post("/profiles/reorder")
+    async def reorder_profiles(request: Request):
+        db: Database = request.app.state.db
+        payload = await request.json()
+        profile_ids = payload.get("profile_ids") if isinstance(payload, dict) else None
+        if not isinstance(profile_ids, list) or not all(isinstance(profile_id, int) and not isinstance(profile_id, bool) for profile_id in profile_ids):
+            raise HTTPException(400, "profile_ids 必須是整數陣列")
+        try:
+            db.reorder_profiles(profile_ids)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {"ok": True}
 
     @app.post("/outbox/{outbox_id}/cancel")
     def cancel_outbox(request: Request, outbox_id: int):

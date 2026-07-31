@@ -51,3 +51,21 @@ def test_legacy_outbox_is_upgraded_before_new_index_is_created(tmp_path: Path):
     columns = {row["name"] for row in db.rows("PRAGMA table_info(outbox)")}
     assert {"group_id", "media_sha256", "cancelled_at"} <= columns
     assert db.row("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_outbox_media_sha'")
+
+
+def test_legacy_profiles_get_stable_sort_order(tmp_path: Path):
+    path = tmp_path / "legacy-profiles.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute("""CREATE TABLE profiles (
+      id INTEGER PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    )""")
+    connection.execute("INSERT INTO profiles(id,name,url,created_at,updated_at) VALUES(4,'four','https://facebook.com/4','x','x')")
+    connection.execute("INSERT INTO profiles(id,name,url,created_at,updated_at) VALUES(9,'nine','https://facebook.com/9','x','x')")
+    connection.commit()
+    connection.close()
+
+    db = Database(path)
+
+    assert db.has_column("profiles", "sort_order")
+    assert [row["sort_order"] for row in db.rows("SELECT sort_order FROM profiles ORDER BY id")] == [4, 9]

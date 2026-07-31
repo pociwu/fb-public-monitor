@@ -40,6 +40,66 @@
     });
   }
 
+  function initProfileSorting(root = document) {
+    const containers = [];
+    if (root.matches?.("[data-profile-cards]")) containers.push(root);
+    containers.push(...root.querySelectorAll("[data-profile-cards]"));
+    containers.forEach((container) => {
+      if (container.dataset.sortInitialized) return;
+      container.dataset.sortInitialized = "true";
+      let dragged = null;
+      let changed = false;
+
+      container.addEventListener("dragstart", (event) => {
+        dragged = event.target.closest("[data-profile-id]");
+        if (!dragged) return;
+        changed = false;
+        dragged.classList.add("is-dragging");
+        document.body.classList.add("profile-drag-active");
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("text/plain", dragged.dataset.profileId);
+      });
+
+      container.addEventListener("dragover", (event) => {
+        if (!dragged) return;
+        const target = event.target.closest("[data-profile-id]");
+        if (!target || target === dragged) return;
+        event.preventDefault();
+        const rect = target.getBoundingClientRect();
+        const sameRow = event.clientY >= rect.top && event.clientY <= rect.bottom;
+        const insertAfter = sameRow
+          ? event.clientX > rect.left + rect.width / 2
+          : event.clientY > rect.top + rect.height / 2;
+        container.insertBefore(dragged, insertAfter ? target.nextSibling : target);
+        changed = true;
+      });
+
+      container.addEventListener("drop", (event) => event.preventDefault());
+      container.addEventListener("dragend", async () => {
+        if (!dragged) return;
+        dragged.classList.remove("is-dragging");
+        document.body.classList.remove("profile-drag-active");
+        dragged = null;
+        if (!changed) return;
+        const profileIds = [...container.querySelectorAll("[data-profile-id]")]
+          .map((card) => Number(card.dataset.profileId));
+        try {
+          const response = await fetch("/profiles/reorder", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({profile_ids: profileIds}),
+          });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          container.classList.add("order-saved");
+          setTimeout(() => container.classList.remove("order-saved"), 600);
+        } catch (error) {
+          window.alert(`排序儲存失敗：${error.message}`);
+          window.location.reload();
+        }
+      });
+    });
+  }
+
   document.addEventListener("click", (event) => {
     const preview = event.target.closest("[data-lightbox-src]");
     if (preview) {
@@ -69,6 +129,12 @@
     const delta = event.changedTouches[0].clientX - touchStartX;
     if (Math.abs(delta) > 50) show(current + (delta < 0 ? 1 : -1));
   }, { passive: true });
-  document.addEventListener("htmx:afterSwap", (event) => initExpandable(event.target));
-  window.addEventListener("load", () => initExpandable());
+  document.addEventListener("htmx:afterSwap", (event) => {
+    initExpandable(event.target);
+    initProfileSorting(event.target);
+  });
+  window.addEventListener("load", () => {
+    initExpandable();
+    initProfileSorting();
+  });
 })();

@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS profiles (
   fb_id TEXT, display_name TEXT, public_state TEXT NOT NULL DEFAULT 'unknown', missing_successes INTEGER NOT NULL DEFAULT 0,
   last_attempt_at TEXT, last_success_at TEXT, next_visit_at TEXT, last_full_audit_at TEXT,
   backfill_cursor TEXT, backfill_done INTEGER NOT NULL DEFAULT 0, audit_cursor TEXT, audit_token TEXT,
-  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0, sort_order INTEGER,
   last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS entities (
@@ -130,6 +130,9 @@ class Database:
             for name in ("audit_cursor", "audit_token", "display_name"):
                 if name not in columns:
                     conn.execute(f"ALTER TABLE profiles ADD COLUMN {name} TEXT")
+            if "sort_order" not in columns:
+                conn.execute("ALTER TABLE profiles ADD COLUMN sort_order INTEGER")
+            conn.execute("UPDATE profiles SET sort_order=id WHERE sort_order IS NULL")
             entity_columns = {row[1] for row in conn.execute("PRAGMA table_info(entities)")}
             if "dedupe_key" not in entity_columns:
                 conn.execute("ALTER TABLE entities ADD COLUMN dedupe_key TEXT")
@@ -197,6 +200,17 @@ class Database:
             for row in rows:
                 if row["url"] not in configured:
                     conn.execute("UPDATE profiles SET enabled=0,updated_at=? WHERE id=?", (now, row["id"]))
+            conn.execute("UPDATE profiles SET sort_order=id WHERE sort_order IS NULL")
+
+    def reorder_profiles(self, profile_ids: list[int]) -> None:
+        with self.connect() as conn:
+            current = [int(row[0]) for row in conn.execute("SELECT id FROM profiles")]
+            if len(profile_ids) != len(current) or len(set(profile_ids)) != len(profile_ids) or set(profile_ids) != set(current):
+                raise ValueError("profile order must contain every profile exactly once")
+            conn.executemany(
+                "UPDATE profiles SET sort_order=? WHERE id=?",
+                ((position, profile_id) for position, profile_id in enumerate(profile_ids)),
+            )
 
     def rows(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         with self.connect() as conn:

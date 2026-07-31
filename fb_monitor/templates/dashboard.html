@@ -8,13 +8,16 @@
   <article><span>媒體</span><strong>{{ media.ready or 0 }} / {{ media.total or 0 }}</strong></article>
   <article><span>月預算</span><strong>${{ "%.2f"|format(budget) }}</strong></article>
 </section>
-<section class="panel"><h2>Facebook 帳號</h2>
-<div class="cards">{% for p in profiles %}<a class="profile-card" href="/profiles/{{ p.id }}">
+<section class="panel"><div class="panel-heading"><h2>Facebook 帳號</h2><small class="sort-hint">拖曳卡片可調整順序</small></div>
+<div class="cards" data-profile-cards>{% for p in profiles %}<div class="profile-card-wrap" draggable="true" data-profile-id="{{ p.id }}">
+  <span class="drag-handle" aria-hidden="true" title="拖曳調整順序">⠿</span>
+  <a class="profile-card" href="/profiles/{{ p.id }}">
   <div class="profile-head">{% if p.avatar_media_id %}<img class="avatar" src="/media/{{ p.avatar_media_id }}" alt="">{% else %}<span class="avatar placeholder">FB</span>{% endif %}<div><span class="dot {{ p.public_state }}"></span><strong>{{ p.display_name or p.name }}</strong>{% if p.display_name and p.name != p.display_name %}<small class="alias">別名：{{ p.name }}</small>{% endif %}</div></div>
   <small>{{ p.public_state }} · Facebook ID：{{ p.fb_id or '尚未解析' }}</small>
   <p>{{ p.post_count }} 篇貼文 · {{ p.comment_count }} 則留言</p>
   <small>最近成功：{{ p.last_success_at or '—' }}<br>下次拜訪：{{ p.next_visit_at or '佇列中' }}</small>
-</a>{% endfor %}</div></section>
+  </a>
+</div>{% endfor %}</div></section>
 <section class="panel"><h2>Apify 使用估算</h2><table><thead><tr><th>月份</th><th>類別</th><th>結果</th><th>美元</th></tr></thead><tbody>{% for u in usage %}<tr><td>{{ u.month }}</td><td>{{ u.category }}</td><td>{{ u.results }}</td><td>${{ "%.4f"|format(u.estimated_usd) }}</td></tr>{% else %}<tr><td colspan="4">尚無資料</td></tr>{% endfor %}</tbody></table></section>
 <section class="panel outbox-panel">
   <div class="panel-heading"><h2>發送佇列</h2><form method="post" action="/outbox/clear" onsubmit="return confirm('清空所有待發與重試中的 Telegram 訊息？')"><button class="button danger" type="submit">清空待發佇列</button></form></div>
