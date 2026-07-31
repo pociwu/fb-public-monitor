@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 import uvicorn
 
 from .config import load_settings
-from .db import Database, utcnow
+from .db import Database
 
 
 def main() -> None:
@@ -32,14 +32,7 @@ def main() -> None:
         profile = db.row("SELECT * FROM profiles WHERE CAST(id AS TEXT)=? OR name=? OR display_name=? OR url=?", (args.profile, args.profile, args.profile, args.profile.rstrip("/")))
         if not profile:
             raise SystemExit("找不到指定 profile")
-        pending = db.row("SELECT id FROM jobs WHERE profile_id=? AND job_type='visit' AND status='pending' ORDER BY id LIMIT 1", (profile["id"],))
-        if pending:
-            db.execute("UPDATE jobs SET priority=0,available_at=? WHERE id=?", (utcnow(), pending["id"]))
-        else:
-            db.execute(
-                "INSERT INTO jobs(profile_id,job_type,priority,payload_json,available_at,created_at) VALUES(?,'visit',0,'{}',?,?)",
-                (profile["id"], utcnow(), utcnow()),
-            )
+        db.queue_profile_visits([int(profile["id"])])
         print(f"已將 {profile['name']} 排到佇列最前端；仍遵守全域間隔與預算上限。")
     elif args.command == "status":
         profiles = db.rows("SELECT id,name,display_name,fb_id,public_state,last_success_at,next_visit_at,consecutive_failures,last_error FROM profiles ORDER BY id")

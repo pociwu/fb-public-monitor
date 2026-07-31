@@ -212,6 +212,25 @@ class Database:
                 ((position, profile_id) for position, profile_id in enumerate(profile_ids)),
             )
 
+    def queue_profile_visits(self, profile_ids: list[int]) -> int:
+        now = utcnow()
+        queued = 0
+        with self.connect() as conn:
+            for profile_id in dict.fromkeys(profile_ids):
+                pending = conn.execute(
+                    "SELECT id FROM jobs WHERE profile_id=? AND job_type='visit' AND status='pending' ORDER BY id LIMIT 1",
+                    (profile_id,),
+                ).fetchone()
+                if pending:
+                    conn.execute("UPDATE jobs SET priority=0,available_at=? WHERE id=?", (now, pending["id"]))
+                else:
+                    conn.execute(
+                        "INSERT INTO jobs(profile_id,job_type,priority,payload_json,available_at,created_at) VALUES(?,'visit',0,'{}',?,?)",
+                        (profile_id, now, now),
+                    )
+                queued += 1
+        return queued
+
     def rows(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         with self.connect() as conn:
             return [dict(row) for row in conn.execute(sql, params).fetchall()]

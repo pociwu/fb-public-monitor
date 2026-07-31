@@ -7,6 +7,8 @@ from typing import Any
 
 import yaml
 
+MAX_PROFILES = 16
+
 
 @dataclass(slots=True)
 class ProfileConfig:
@@ -81,8 +83,8 @@ def load_settings(path: str | Path | None = None) -> Settings:
     if not data_dir.is_absolute():
         data_dir = (config_path.parent / data_dir).resolve()
     profiles = [ProfileConfig(**item) for item in raw.get("profiles", [])]
-    if len(profiles) > 16:
-        raise ValueError("profiles 最多只能設定 16 個")
+    if len(profiles) > MAX_PROFILES:
+        raise ValueError(f"profiles 最多只能設定 {MAX_PROFILES} 個")
     urls = [p.url.rstrip("/") for p in profiles]
     if len(set(urls)) != len(urls):
         raise ValueError("profiles 不可包含重複網址")

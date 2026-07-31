@@ -99,3 +99,35 @@ storage:
         refreshed = client.get("/")
         assert refreshed.text.index("second") < refreshed.text.index("first")
         assert client.post("/profiles/reorder", json={"profile_ids": [1]}).status_code == 400
+
+
+def test_dashboard_can_queue_single_or_all_profile_visits(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """profiles:
+  - name: first
+    url: https://facebook.com/first
+  - name: second
+    url: https://facebook.com/second
+storage:
+  data_dir: data
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    app = create_app(load_settings(config))
+    db = app.state.db
+    db.execute("DELETE FROM jobs")
+
+    with TestClient(app) as client:
+        dashboard = client.get("/")
+        assert "2 / 16" in dashboard.text
+        assert "立即拜訪（全部）" in dashboard.text
+
+        single = client.post("/profiles/1/scan", follow_redirects=False)
+        assert single.status_code == 303
+        assert db.row("SELECT COUNT(*) count FROM jobs WHERE job_type='visit' AND status='pending'")["count"] == 1
+
+        all_profiles = client.post("/profiles/scan-all", follow_redirects=False)
+        assert all_profiles.status_code == 303
+        assert db.row("SELECT COUNT(*) count FROM jobs WHERE job_type='visit' AND status='pending'")["count"] == 2

@@ -51,6 +51,10 @@
       let changed = false;
 
       container.addEventListener("dragstart", (event) => {
+        if (event.target.closest(".quick-visit-form")) {
+          event.preventDefault();
+          return;
+        }
         dragged = event.target.closest("[data-profile-id]");
         if (!dragged) return;
         changed = false;

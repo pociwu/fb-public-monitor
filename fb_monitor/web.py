@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from .config import Settings, load_settings
+from .config import MAX_PROFILES, Settings, load_settings
 from .db import Database
 from .service import MonitorService
 from .timeutil import display_time, parse_time
@@ -156,7 +156,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             row["started_display"] = display_time(row.get("started_at"), cfg.timezone)
             row["finished_display"] = display_time(row.get("finished_at"), cfg.timezone)
         media = db.row("SELECT COUNT(*) total,SUM(CASE WHEN status='ready' THEN 1 ELSE 0 END) ready FROM media")
-        return templates.TemplateResponse(request, "dashboard.html", {"profiles": profiles, "usage": usage, "pending": pending, "outbox": outbox, "outbox_counts": outbox_counts, "outbox_rows": outbox_rows, "maintenance_runs": maintenance_runs, "media": media, "budget": cfg.monthly_budget_usd})
+        monitored = db.row("SELECT COUNT(*) count FROM profiles WHERE enabled=1")
+        return templates.TemplateResponse(request, "dashboard.html", {"profiles": profiles, "usage": usage, "pending": pending, "outbox": outbox, "outbox_counts": outbox_counts, "outbox_rows": outbox_rows, "maintenance_runs": maintenance_runs, "media": media, "budget": cfg.monthly_budget_usd, "monitored": monitored, "max_profiles": MAX_PROFILES})
 
     @app.post("/profiles/reorder")
     async def reorder_profiles(request: Request):
@@ -170,6 +171,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         return {"ok": True}
+
+    @app.post("/profiles/scan-all")
+    def scan_all_profiles(request: Request):
+        db: Database = request.app.state.db
+        profile_ids = [int(row["id"]) for row in db.rows("SELECT id FROM profiles WHERE enabled=1 ORDER BY id")]
+        db.queue_profile_visits(profile_ids)
+        return RedirectResponse(url="/", status_code=303)
+
+    @app.post("/profiles/{profile_id}/scan")
+    def scan_profile(request: Request, profile_id: int):
+        db: Database = request.app.state.db
+        profile = db.row("SELECT id FROM profiles WHERE id=? AND enabled=1", (profile_id,))
+        if not profile:
+            raise HTTPException(404)
+        db.queue_profile_visits([profile_id])
+        return RedirectResponse(url="/", status_code=303)
 
     @app.post("/outbox/{outbox_id}/cancel")
     def cancel_outbox(request: Request, outbox_id: int):
