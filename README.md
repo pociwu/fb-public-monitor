@@ -15,7 +15,7 @@
 - Telegram 先傳文字、後補媒體；過大檔案降級為本機路徑提示。通知失敗持久化補發。
 - Telegram 使用固定中文摘要並直接上傳真正變更的照片／影片，不傳 CDN 網址或原始 JSON diff。
 - 每天 08:00（Asia/Taipei）發健康摘要。
-- 唯讀 FastAPI/Jinja2/HTMX Web UI 顯示自動名稱、設定別名、Facebook ID 與大頭照，並提供永久 Actor 診斷頁；只由 Docker 發布至主機 `127.0.0.1:8080`。
+- 唯讀 FastAPI/Jinja2/HTMX Web UI 顯示自動名稱、設定別名、Facebook ID 與大頭照，並提供永久 Actor 診斷頁；預設只由 Docker 發布至主機 `127.0.0.1:8080`，也可用 `WEB_BIND_IP` 綁定 Tailscale IP。
 - 貼文與留言列表使用實際媒體卡片：圖片縮圖、影片原地播放、最多四格附件、文字摘要、媒體篩選及已消失遮罩；個人檔案分頁使用封面＋大頭照概覽卡。
 - 圖片列表採延遲生成的 640px 縮圖，快取位於 `/data/cache/thumbnails/`；原始媒體不變，lightbox 與詳細頁仍可下載原檔。
 - 貼文 Actor 依原始網址、數字 ID、`profile.php?id=` 自動重試；仍無結果時才使用 Profile Actor 內嵌貼文 fallback。
@@ -47,6 +47,14 @@ ssh -L 8080:127.0.0.1:8080 ubuntu@your-server
 ```
 
 然後在本機瀏覽器開啟 `http://127.0.0.1:8080`。
+
+若 OCI 已加入 Tailscale，可在 OCI 的 `.env` 設定：
+
+```env
+WEB_BIND_IP=100.x.x.x
+```
+
+實際 IP 可用 `tailscale ip -4` 查詢。重建容器後，即可從同一 tailnet 使用 `http://100.x.x.x:8080` 存取；此設定保存在不受 Git 管理的 `.env`，後續更新不會被覆寫。
 
 ## 管理
 
