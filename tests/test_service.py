@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from fb_monitor.apify import ActorResult
+from fb_monitor.apify import ActorResult, MonthlyUsage
 from fb_monitor.config import load_settings
 from fb_monitor.service import MonitorService, actor_summary_error
 
@@ -10,6 +10,13 @@ from fb_monitor.service import MonitorService, actor_summary_error
 def test_failed_actor_summary_is_not_treated_as_empty_success():
     summary = {"health": "failed", "profiles": [{"status": "failed", "error": {"code": "rate_limited", "message": "Facebook rate-limited the timeline query."}}]}
     assert actor_summary_error(summary) == "Facebook rate-limited the timeline query."
+
+
+async def allow_official_usage(service: MonitorService) -> None:
+    async def fake_monthly_usage():
+        return MonthlyUsage(1.0, "2026-07-09T00:00:00+00:00", "2026-08-08T23:59:59+00:00")
+
+    service.apify.monthly_usage = fake_monthly_usage
 
 
 @pytest.mark.asyncio
@@ -32,6 +39,7 @@ schedule:
     )
     monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
     service = MonitorService(load_settings(config))
+    await allow_official_usage(service)
 
     async def fake_call(actor_id, payload, max_charge_usd=None):
         if "pages-scraper" in actor_id:
@@ -72,6 +80,7 @@ actors:
     )
     monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
     service = MonitorService(load_settings(config))
+    await allow_official_usage(service)
     calls = []
 
     async def fake_call(actor_id, payload, max_charge_usd=None):
@@ -109,6 +118,7 @@ schedule:
     )
     monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
     service = MonitorService(load_settings(config))
+    await allow_official_usage(service)
 
     async def fake_call(actor_id, payload, max_charge_usd=None):
         if "pages-scraper" in actor_id:

@@ -9,9 +9,9 @@
 - 僅處理未登入可見資料。公開判定以個人檔案 Actor 能否回傳有效資料為準。
 - 內容消失需連續兩次成功核對才確認；Actor 失敗不會改變 Facebook 狀態。
 - 所有公開留言及最多三層回覆；留言附件依官方 Actor 回傳內容 best-effort 下載。
-- SQLite 保存實體、版本、事件、排程、通知 outbox 與預算估算。JSON、Markdown 和媒體保存在 `/data`。
+- SQLite 保存實體、版本、事件、排程、通知 outbox、本地費用估算與 Apify 官方用量快照。JSON、Markdown 和媒體保存在 `/data`。
 - 媒體依 SHA-256 去重。磁碟少於 10 GB 時暫停媒體下載；失敗項目保留 30 天補抓狀態。
-- 每月 Apify 上限 5 美元，Actor run 也帶入剩餘費用上限；80% 與 100% 時 Telegram 告警。
+- 每次 Actor 執行前查詢 Apify Billing 的官方當期用量。已達 5 美元、剩餘額不足一筆結果，或官方 API 查詢失敗時，都不會啟動 Actor；Actor run 也帶入剩餘費用上限。
 - Telegram 先傳文字、後補媒體；過大檔案降級為本機路徑提示。通知失敗持久化補發。
 - Telegram 使用固定中文摘要並直接上傳真正變更的照片／影片，不傳 CDN 網址或原始 JSON diff。
 - 每天 08:00（Asia/Taipei）發健康摘要。
@@ -77,7 +77,7 @@ install -m 750 ~/fb-public-monitor/fb.sh ~/fb.sh
 ~/fb.sh
 ```
 
-`scan` 只將工作排到最前端，仍遵守全域間隔與預算。Web UI 提供首頁卡片排序與通知佇列管理，但不提供修改監控設定、刪除監控資料或觸發掃描 API。
+`scan` 只將工作排到最前端，仍遵守全域間隔與預算。Web UI 提供首頁卡片排序、新增／移除監控帳號、全部／單人立即拜訪、Apify 官方用量快照與通知佇列管理。
 
 ### 從 GitHub 更新 OCI
 

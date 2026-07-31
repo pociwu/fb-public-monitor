@@ -158,7 +158,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             row["finished_display"] = display_time(row.get("finished_at"), cfg.timezone)
         media = db.row("SELECT COUNT(*) total,SUM(CASE WHEN status='ready' THEN 1 ELSE 0 END) ready FROM media")
         monitored = db.row("SELECT COUNT(*) count FROM profiles WHERE enabled=1")
-        return templates.TemplateResponse(request, "dashboard.html", {"profiles": profiles, "usage": usage, "pending": pending, "outbox": outbox, "outbox_counts": outbox_counts, "outbox_rows": outbox_rows, "maintenance_runs": maintenance_runs, "media": media, "budget": cfg.monthly_budget_usd, "monitored": monitored, "max_profiles": MAX_PROFILES, "notice": notice, "error": error})
+        official_usage = db.apify_usage_snapshot()
+        if official_usage:
+            official_usage["cycle_start_display"] = display_time(official_usage.get("cycle_start_at"), cfg.timezone)
+            official_usage["cycle_end_display"] = display_time(official_usage.get("cycle_end_at"), cfg.timezone)
+            official_usage["fetched_display"] = display_time(official_usage.get("fetched_at"), cfg.timezone)
+        return templates.TemplateResponse(request, "dashboard.html", {"profiles": profiles, "usage": usage, "official_usage": official_usage, "pending": pending, "outbox": outbox, "outbox_counts": outbox_counts, "outbox_rows": outbox_rows, "maintenance_runs": maintenance_runs, "media": media, "budget": cfg.monthly_budget_usd, "monitored": monitored, "max_profiles": MAX_PROFILES, "notice": notice, "error": error})
 
     @app.post("/profiles")
     async def add_profile(request: Request):

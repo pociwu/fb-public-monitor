@@ -17,6 +17,13 @@ class ActorResult:
     diagnostic_id: int | None = None
 
 
+@dataclass(slots=True)
+class MonthlyUsage:
+    used_usd: float
+    cycle_start_at: str
+    cycle_end_at: str
+
+
 class ApifyGateway:
     def __init__(self, token: str):
         self.token = token
@@ -26,6 +33,30 @@ class ApifyGateway:
         if not self.client:
             raise RuntimeError("APIFY_TOKEN 尚未設定")
         return await asyncio.to_thread(self._call_sync, actor_id, payload, max_charge_usd)
+
+    async def monthly_usage(self) -> MonthlyUsage:
+        """Read the same current-cycle usage shown on Apify's Billing page."""
+        if not self.client:
+            raise RuntimeError("APIFY_TOKEN 未設定")
+        return await asyncio.to_thread(self._monthly_usage_sync)
+
+    def _monthly_usage_sync(self) -> MonthlyUsage:
+        data = self.client.user("me").monthly_usage()  # type: ignore[union-attr]
+        if not isinstance(data, dict):
+            raise RuntimeError("Apify 官方用量 API 未回傳資料")
+        cycle = data.get("usageCycle")
+        if not isinstance(cycle, dict):
+            raise RuntimeError("Apify 官方用量缺少帳期資料")
+        start_at = cycle.get("startAt")
+        end_at = cycle.get("endAt")
+        used = data.get("totalUsageCreditsUsdAfterVolumeDiscount")
+        if start_at is None or end_at is None or used is None:
+            raise RuntimeError("Apify 官方用量回傳格式不完整")
+        return MonthlyUsage(
+            used_usd=float(used),
+            cycle_start_at=start_at.isoformat() if hasattr(start_at, "isoformat") else str(start_at),
+            cycle_end_at=end_at.isoformat() if hasattr(end_at, "isoformat") else str(end_at),
+        )
 
     def _call_sync(self, actor_id: str, payload: dict[str, Any], max_charge_usd: float | None) -> ActorResult:
         kwargs: dict[str, Any] = {"run_input": payload, "timeout_secs": 3600}

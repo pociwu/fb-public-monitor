@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .apify import ActorResult, ApifyGateway
+from .apify import ActorResult, ApifyGateway, MonthlyUsage
 from .config import Settings, actor_input, load_settings
 from .db import Database, utcnow
 from .ingest import Ingester, embedded_posts, external_id
@@ -26,7 +26,9 @@ NOTIFICATION_HYGIENE_MIGRATION = "notification_hygiene_v5_20260723"
 
 
 class BudgetExceeded(RuntimeError):
-    pass
+    def __init__(self, message: str, resume_at: datetime | None = None):
+        super().__init__(message)
+        self.resume_at = resume_at
 
 
 def actor_summary_error(summary: dict[str, Any] | None) -> str | None:
@@ -231,7 +233,7 @@ class MonitorService:
                     raise
             self.db.execute("UPDATE jobs SET status='done',finished_at=?,error=NULL WHERE id=?", (utcnow(), job["id"]))
         except BudgetExceeded as exc:
-            resume = self._next_month()
+            resume = exc.resume_at or self._next_month()
             self.db.execute("UPDATE jobs SET status='deferred_budget',finished_at=?,error=? WHERE id=?", (utcnow(), str(exc), job["id"]))
             if job["job_type"] == "visit":
                 self.db.execute("UPDATE profiles SET next_visit_at=? WHERE id=?", (resume.isoformat(), job["profile_id"]))
@@ -249,6 +251,20 @@ class MonitorService:
                 )
 
     def _remaining_budget(self) -> float:
+        snapshot = self.db.apify_usage_snapshot()
+        if snapshot:
+            try:
+                now = datetime.now(UTC)
+                start_at = datetime.fromisoformat(str(snapshot["cycle_start_at"]).replace("Z", "+00:00"))
+                end_at = datetime.fromisoformat(str(snapshot["cycle_end_at"]).replace("Z", "+00:00"))
+                if start_at.tzinfo is None:
+                    start_at = start_at.replace(tzinfo=UTC)
+                if end_at.tzinfo is None:
+                    end_at = end_at.replace(tzinfo=UTC)
+                if start_at <= now <= end_at:
+                    return max(0.0, self.settings.monthly_budget_usd - float(snapshot["used_usd"]))
+            except (KeyError, TypeError, ValueError):
+                pass
         month = datetime.now(UTC).strftime("%Y-%m")
         return max(0.0, self.settings.monthly_budget_usd - self.db.usage_total(month))
 
@@ -271,15 +287,41 @@ class MonitorService:
         reserve_left = max(0.0, reserve_total - float(profile_used["estimated_usd"] if profile_used else 0))
         return max(0.0, remaining - reserve_left)
 
+    @staticmethod
+    def _usage_cycle_resume(usage: MonthlyUsage) -> datetime:
+        end_at = datetime.fromisoformat(usage.cycle_end_at.replace("Z", "+00:00"))
+        if end_at.tzinfo is None:
+            end_at = end_at.replace(tzinfo=UTC)
+        return end_at.astimezone(UTC) + timedelta(minutes=5)
+
+    async def _official_available(self) -> tuple[float, MonthlyUsage]:
+        try:
+            usage = await self.apify.monthly_usage()
+        except Exception as exc:
+            day = datetime.now(UTC).date().isoformat()
+            self.db.add_event(
+                f"budget-check:{day}:failed",
+                "budget_check_failed",
+                {"title": "Apify 官方用量查詢失敗", "text": f"為避免超支，本次 Actor 不執行。\n錯誤：{str(exc)[:1000]}"},
+            )
+            raise BudgetExceeded(
+                "Apify 官方用量查詢失敗；本次付費工作已取消",
+                datetime.now(UTC) + timedelta(minutes=15),
+            ) from exc
+        self.db.save_apify_usage(usage.used_usd, usage.cycle_start_at, usage.cycle_end_at)
+        return max(0.0, self.settings.monthly_budget_usd - usage.used_usd), usage
+
     async def _actor(self, category: str, actor_id: str, payload: dict[str, Any], profile_id: int | None = None, input_variant: str = "default") -> ActorResult:
-        remaining = self._available_for(category)
-        if remaining <= 0:
-            month = datetime.now(UTC).strftime("%Y-%m")
-            if self._remaining_budget() <= 0:
-                self.db.add_event(f"budget:{month}:limit", "budget_limit", {"title": "Apify 月預算已達上限", "text": f"本月上限 ${self.settings.monthly_budget_usd:.2f}；付費工作暫停至下月。"})
+        official_remaining, official_usage = await self._official_available()
+        remaining = min(self._available_for(category), official_remaining)
+        if remaining < PRICES[category]:
+            cycle_key = official_usage.cycle_start_at[:10]
+            if official_remaining < PRICES[category]:
+                self.db.add_event(f"budget:{cycle_key}:limit", "budget_limit", {"title": "Apify 官方用量已達上限", "text": f"官方用量 ${official_usage.used_usd:.2f} / ${self.settings.monthly_budget_usd:.2f}；付費工作暫停至帳期更新。"})
+                raise BudgetExceeded("Apify 官方帳期已無足夠額度產生一筆結果；付費工作延至下一帳期", self._usage_cycle_resume(official_usage))
             else:
-                self.db.add_event(f"budget:{month}:reserved", "budget_reserved", {"title": "Apify 剩餘預算已保留", "text": "剩餘額優先保留給個人檔案與公開狀態檢查；貼文、留言與回溯暫停。"})
-            raise BudgetExceeded("已達本月 Apify 可用預算；付費工作延至下月")
+                self.db.add_event(f"budget:{cycle_key}:reserved", "budget_reserved", {"title": "Apify 剩餘預算已保留", "text": "剩餘額優先保留給個人檔案與公開狀態檢查；貼文、留言與回溯暫停。"})
+                raise BudgetExceeded("Apify 剩餘額度已保留給個人檔案檢查；本次工作不執行")
         diagnostic_id = self.db.start_actor_run(profile_id, category, actor_id, input_variant, payload)
         try:
             result = await self.apify.call(actor_id, payload, remaining)
@@ -302,10 +344,10 @@ class MonitorService:
         # local ledger from understating synthetic Actor-start events.
         cost = max(len(result.items) * PRICES[category], result.charged_usd) + 0.001
         self.db.add_usage(datetime.now(UTC).strftime("%Y-%m"), category, len(result.items), cost)
-        month = datetime.now(UTC).strftime("%Y-%m")
-        used = self.db.usage_total(month)
+        cycle_key = official_usage.cycle_start_at[:10]
+        used = official_usage.used_usd
         if used >= self.settings.monthly_budget_usd * self.settings.budget_warning_ratio:
-            self.db.add_event(f"budget:{month}:warning", "budget_warning", {"title": "Apify 月預算已使用 80%", "text": f"目前估算 ${used:.2f} / ${self.settings.monthly_budget_usd:.2f}"})
+            self.db.add_event(f"budget:{cycle_key}:warning", "budget_warning", {"title": "Apify 官方用量已使用 80%", "text": f"執行前官方用量 ${used:.2f} / ${self.settings.monthly_budget_usd:.2f}"})
         return result
 
     async def visit_profile(self, profile_id: int) -> None:
@@ -589,9 +631,11 @@ class MonitorService:
                 key = f"health:{local.date().isoformat()}"
                 profiles = self.db.rows("SELECT name,public_state,last_success_at,next_visit_at,consecutive_failures FROM profiles WHERE enabled=1 ORDER BY id")
                 free_gb = __import__("shutil").disk_usage(self.settings.data_dir).free / 1024**3
-                used = self.settings.monthly_budget_usd - self._remaining_budget()
+                official = self.db.apify_usage_snapshot()
+                used = float(official["used_usd"]) if official else self.settings.monthly_budget_usd - self._remaining_budget()
+                usage_label = "官方" if official else "本地估算"
                 lines = [f"{p['name']}: {p['public_state']} · 最近成功 {p['last_success_at'] or '-'}" for p in profiles]
-                self.db.add_event(key, "health", {"title": "每日 08:00 健康摘要", "text": "\n".join(lines) + f"\n磁碟剩餘：{free_gb:.1f} GB\nApify：${used:.2f}/${self.settings.monthly_budget_usd:.2f}"})
+                self.db.add_event(key, "health", {"title": "每日 08:00 健康摘要", "text": "\n".join(lines) + f"\n磁碟剩餘：{free_gb:.1f} GB\nApify（{usage_label}）：${used:.2f}/${self.settings.monthly_budget_usd:.2f}"})
             try:
                 await asyncio.wait_for(self.stop_event.wait(), timeout=60)
             except TimeoutError:

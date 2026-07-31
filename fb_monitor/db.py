@@ -73,6 +73,10 @@ CREATE TABLE IF NOT EXISTS usage (
   month TEXT NOT NULL, category TEXT NOT NULL, estimated_usd REAL NOT NULL DEFAULT 0,
   results INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY(month, category)
 );
+CREATE TABLE IF NOT EXISTS apify_usage_snapshot (
+  id INTEGER PRIMARY KEY CHECK(id=1), used_usd REAL NOT NULL,
+  cycle_start_at TEXT NOT NULL, cycle_end_at TEXT NOT NULL, fetched_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS audit_seen (
   profile_id INTEGER NOT NULL REFERENCES profiles(id), audit_token TEXT NOT NULL,
   kind TEXT NOT NULL, external_id TEXT NOT NULL,
@@ -341,6 +345,17 @@ class Database:
             results=results+excluded.results,updated_at=excluded.updated_at""",
             (month, category, estimated_usd, results, now),
         )
+
+    def save_apify_usage(self, used_usd: float, cycle_start_at: str, cycle_end_at: str) -> None:
+        self.execute(
+            """INSERT INTO apify_usage_snapshot(id,used_usd,cycle_start_at,cycle_end_at,fetched_at)
+            VALUES(1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET used_usd=excluded.used_usd,
+            cycle_start_at=excluded.cycle_start_at,cycle_end_at=excluded.cycle_end_at,fetched_at=excluded.fetched_at""",
+            (used_usd, cycle_start_at, cycle_end_at, utcnow()),
+        )
+
+    def apify_usage_snapshot(self) -> dict[str, Any] | None:
+        return self.row("SELECT used_usd,cycle_start_at,cycle_end_at,fetched_at FROM apify_usage_snapshot WHERE id=1")
 
     def migration_applied(self, name: str) -> bool:
         return self.row("SELECT name FROM schema_migrations WHERE name=?", (name,)) is not None
