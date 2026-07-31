@@ -23,6 +23,21 @@ def test_dashboard_health_and_diagnostics_routes(tmp_path: Path, monkeypatch):
         assert "請輸入 Facebook 個人檔案網址" in invalid_add.text
 
 
+def test_dashboard_shows_official_usage_reset_countdown(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text("profiles: []\nstorage:\n  data_dir: data\nbudget:\n  monthly_usd: 5\n", encoding="utf-8")
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    app = create_app(load_settings(config))
+    app.state.db.save_apify_usage(4.25, "2026-07-09T00:00:00+00:00", "2026-08-08T23:59:59+00:00")
+
+    with TestClient(app) as client:
+        dashboard = client.get("/")
+        assert dashboard.status_code == 200
+        assert "$4.25 / $5.00" in dashboard.text
+        assert "重置倒數" in dashboard.text
+        assert 'data-cycle-end="2026-08-08T23:59:59+00:00"' in dashboard.text
+
+
 def test_profile_cards_render_media_and_thumbnail_cache(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text(

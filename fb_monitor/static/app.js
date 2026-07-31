@@ -40,6 +40,26 @@
     });
   }
 
+  function updateUsageCountdowns(root = document) {
+    root.querySelectorAll("[data-usage-countdown]").forEach((element) => {
+      const endAt = Date.parse(element.dataset.cycleEnd);
+      if (!Number.isFinite(endAt)) {
+        element.textContent = "帳期時間無效";
+        return;
+      }
+      const remainingSeconds = Math.max(0, Math.floor((endAt - Date.now()) / 1000));
+      if (remainingSeconds === 0) {
+        element.textContent = "已到期，等待官方用量更新";
+        return;
+      }
+      const days = Math.floor(remainingSeconds / 86400);
+      const hours = Math.floor((remainingSeconds % 86400) / 3600);
+      const minutes = Math.floor((remainingSeconds % 3600) / 60);
+      const seconds = remainingSeconds % 60;
+      element.textContent = `${days} 天 ${String(hours).padStart(2, "0")} 時 ${String(minutes).padStart(2, "0")} 分 ${String(seconds).padStart(2, "0")} 秒`;
+    });
+  }
+
   function initProfileSorting(root = document) {
     const containers = [];
     if (root.matches?.("[data-profile-cards]")) containers.push(root);
@@ -136,9 +156,12 @@
   document.addEventListener("htmx:afterSwap", (event) => {
     initExpandable(event.target);
     initProfileSorting(event.target);
+    updateUsageCountdowns(event.target);
   });
   window.addEventListener("load", () => {
     initExpandable();
     initProfileSorting();
+    updateUsageCountdowns();
+    window.setInterval(() => updateUsageCountdowns(), 1000);
   });
 })();
