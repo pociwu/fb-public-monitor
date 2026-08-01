@@ -4,6 +4,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 from PIL import Image
 
+from fb_monitor.brightdata import BrightDataBalance
 from fb_monitor.config import load_settings
 from fb_monitor.serpapi import SerpApiAccount
 from fb_monitor.web import create_app
@@ -40,6 +41,25 @@ def test_dashboard_shows_official_usage_reset_countdown(tmp_path: Path, monkeypa
         assert 'data-cycle-end="2026-08-08T23:59:59+00:00"' in dashboard.text
         assert "40 / 250" in dashboard.text
         assert "Free Plan" in dashboard.text
+
+
+def test_dashboard_shows_brightdata_official_balance(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text("profiles: []\nstorage:\n  data_dir: data\n", encoding="utf-8")
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("BRIGHTDATA_API_TOKEN", "secret")
+    app = create_app(load_settings(config))
+
+    async def fake_balance():
+        return BrightDataBalance(1.75, 0.25)
+
+    app.state.service.brightdata.balance = fake_balance
+    with TestClient(app) as client:
+        dashboard = client.get("/")
+        assert dashboard.status_code == 200
+        assert "Bright Data 可用額度" in dashboard.text
+        assert "$1.75" in dashboard.text
+        assert "待入帳：$0.25" in dashboard.text
 
 
 def test_dashboard_card_shows_serpapi_profile_details(tmp_path: Path, monkeypatch):
