@@ -1,2 +1,24 @@
-{% extends "base.html" %}{% block title %}工作紀錄{% endblock %}{% block content %}<h1>工作紀錄</h1><table><thead><tr><th>ID</th><th>帳號</th><th>類型</th><th>狀態</th><th>建立／完成</th><th>錯誤</th></tr></thead><tbody>{% for j in jobs %}<tr><td>{{j.id}}</td><td>{{j.profile_name or '系統'}}</td><td>{{j.job_type}}</td><td><span class="badge {{j.status}}">{{j.status}}</span></td><td>{{j.created_at}}<br>{{j.finished_at or ''}}</td><td>{{j.error or ''}}</td></tr>{% endfor %}</tbody></table>{% endblock %}
-
+{% extends "base.html" %}
+{% block title %}工作紀錄{% endblock %}
+{% block content %}
+<div class="panel-heading"><div><h1>工作紀錄</h1><small>共 {{ count }} 筆</small></div><a href="/" class="button secondary">返回儀表板</a></div>
+<nav class="tabs" aria-label="工作狀態篩選">
+  <a class="{% if status == 'active' %}active{% endif %}" href="/jobs?status=active">進行中</a>
+  <a class="{% if status == 'pending' %}active{% endif %}" href="/jobs?status=pending">等待中</a>
+  <a class="{% if status == 'running' %}active{% endif %}" href="/jobs?status=running">執行中</a>
+  <a class="{% if status == 'failed' %}active{% endif %}" href="/jobs?status=failed">失敗</a>
+  <a class="{% if status == 'all' %}active{% endif %}" href="/jobs?status=all">全部</a>
+</nav>
+<section class="panel queue-table">
+<table><thead><tr><th>ID／帳號</th><th>工作</th><th>狀態</th><th>預定／執行時間</th><th>詳細</th></tr></thead><tbody>
+{% for j in jobs %}<tr>
+  <td>#{{ j.id }}<br><small>{{ j.profile_name or '系統' }}</small></td>
+  <td>{{ j.type_label }}<br><small>優先序 {{ j.priority }} · 嘗試 {{ j.attempts }} 次</small></td>
+  <td><span class="badge {{ j.status }}">{{ j.status_label }}</span></td>
+  <td>預定：{{ j.available_at_display or '—' }}{% if j.started_at %}<br><small>開始：{{ j.started_at_display }}</small>{% endif %}{% if j.finished_at %}<br><small>完成：{{ j.finished_at_display }}</small>{% endif %}<br><small>建立：{{ j.created_at_display }}</small></td>
+  <td>{% if j.error %}<span class="error">{{ j.error }}</span>{% endif %}{% if j.payload %}<details><summary>輸入資料</summary><pre>{{ j.payload | tojson(indent=2) }}</pre></details>{% elif not j.error %}<span class="muted">—</span>{% endif %}</td>
+</tr>{% else %}<tr><td colspan="5" class="empty">此狀態目前沒有工作</td></tr>{% endfor %}
+</tbody></table>
+</section>
+{% if pages > 1 %}<nav class="pagination">{% if page > 1 %}<a href="/jobs?status={{ status }}&page={{ page - 1 }}">← 上一頁</a>{% endif %}<span>{{ page }} / {{ pages }}</span>{% if page < pages %}<a href="/jobs?status={{ status }}&page={{ page + 1 }}">下一頁 →</a>{% endif %}</nav>{% endif %}
+{% endblock %}

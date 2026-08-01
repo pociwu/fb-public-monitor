@@ -15,7 +15,13 @@ def test_dashboard_health_and_diagnostics_routes(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
     app = create_app(load_settings(config))
     with TestClient(app) as client:
-        assert client.get("/").status_code == 200
+        dashboard = client.get("/")
+        assert dashboard.status_code == 200
+        assert 'href="/jobs?status=active"' in dashboard.text
+        jobs = client.get("/jobs?status=active")
+        assert jobs.status_code == 200
+        assert "工作紀錄" in jobs.text
+        assert "進行中" in jobs.text
         assert client.get("/healthz").json() == {"ok": True}
         assert client.get("/diagnostics").status_code == 200
         assert client.get("/diagnostics?profile_id=").status_code == 200

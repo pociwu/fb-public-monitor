@@ -6,7 +6,7 @@
 {% if error %}<p class="notice error">{{ error }}</p>{% endif %}
 <section class="stats">
   <article><span>監控人數</span><strong>{{ monitored.count or 0 }} / {{ max_profiles }}</strong></article>
-  <article><span>工作佇列</span><strong>{{ pending.count or 0 }}</strong></article>
+  <a class="stat-card-link" href="/jobs?status=active" aria-label="查看工作佇列詳細內容"><article><span>工作佇列</span><strong>{{ pending.count or 0 }}</strong><small>查看詳細 →</small></article></a>
   <article><span>待送通知</span><strong>{{ outbox.count or 0 }}</strong></article>
   <article><span>媒體</span><strong>{{ media.ready or 0 }} / {{ media.total or 0 }}</strong></article>
   <article><span>Apify 官方用量</span><strong>{% if official_usage %}${{ "%.2f"|format(official_usage.used_usd) }} / ${{ "%.2f"|format(budget) }}{% else %}尚未查詢{% endif %}</strong>{% if official_usage %}<small>重置倒數：<b data-usage-countdown data-cycle-end="{{ official_usage.cycle_end_at }}">計算中…</b><br>帳期：{{ official_usage.cycle_start_display }} ～ {{ official_usage.cycle_end_display }}<br>查詢：{{ official_usage.fetched_display }}</small>{% endif %}</article>

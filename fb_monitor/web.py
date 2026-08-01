@@ -401,9 +401,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return FileResponse(path, filename=path.name)
 
     @app.get("/jobs")
-    def jobs(request: Request, page: int = Query(1, ge=1)):
-        rows = request.app.state.db.rows("SELECT j.*,p.name profile_name FROM jobs j LEFT JOIN profiles p ON p.id=j.profile_id ORDER BY j.id DESC LIMIT 100 OFFSET ?", ((page - 1) * 100,))
-        return templates.TemplateResponse(request, "jobs.html", {"jobs": rows, "page": page})
+    def jobs(
+        request: Request,
+        status: str = Query("active", pattern="^(active|all|pending|running|done|failed|cancelled|deferred_budget)$"),
+        page: int = Query(1, ge=1),
+    ):
+        db: Database = request.app.state.db
+        if status == "active":
+            where, params = "WHERE j.status IN ('pending','running')", ()
+        elif status == "all":
+            where, params = "", ()
+        else:
+            where, params = "WHERE j.status=?", (status,)
+        size = 100
+        count = db.row(f"SELECT COUNT(*) count FROM jobs j {where}", params) or {"count": 0}
+        rows = db.rows(
+            f"""SELECT j.*,COALESCE(p.display_name,p.name) profile_name
+            FROM jobs j LEFT JOIN profiles p ON p.id=j.profile_id {where}
+            ORDER BY CASE j.status WHEN 'running' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END,
+            CASE WHEN j.status IN ('running','pending') THEN j.available_at END ASC,j.id DESC
+            LIMIT ? OFFSET ?""",
+            params + (size, (page - 1) * size),
+        )
+        type_labels = {
+            "visit": "定期拜訪", "backfill": "首次回溯", "audit": "完整核對",
+            "repair_scan": "修復掃描", "migrate_raw": "歷史資料轉換",
+            "migrate_profile_pics": "大頭照欄位更新", "dedupe_database": "資料庫去重",
+        }
+        status_labels = {"pending": "等待中", "running": "執行中", "done": "完成", "failed": "失敗", "cancelled": "已取消", "deferred_budget": "額度延後"}
+        for row in rows:
+            row["type_label"] = type_labels.get(str(row["job_type"]), str(row["job_type"]))
+            row["status_label"] = status_labels.get(str(row["status"]), str(row["status"]))
+            row["payload"] = _json(row.get("payload_json"))
+            for field in ("available_at", "created_at", "started_at", "finished_at"):
+                row[f"{field}_display"] = display_time(row.get(field), cfg.timezone)
+        pages = max(1, (int(count["count"]) + size - 1) // size)
+        return templates.TemplateResponse(request, "jobs.html", {"jobs": rows, "status": status, "page": page, "pages": pages, "count": count["count"]})
 
     @app.get("/diagnostics")
     def diagnostics(request: Request, profile_id: str = "", page: int = Query(1, ge=1)):
