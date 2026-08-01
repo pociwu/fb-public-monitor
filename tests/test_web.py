@@ -60,6 +60,9 @@ def test_dashboard_card_shows_serpapi_profile_details(tmp_path: Path, monkeypatc
             assert expected in dashboard.text
         assert "Facebook ID：100" in dashboard.text
         assert "https://www.facebook.com/100" in dashboard.text
+        assert "https://www.facebook.com/wu.jia.xin" in dashboard.text
+        assert "監控網址：" in dashboard.text
+        assert "Facebook 網址：" in dashboard.text
         assert "pfbid0example" not in dashboard.text
         assert "2026-08-01 08:10" in dashboard.text
         assert '<div class="profile-card">' in dashboard.text
