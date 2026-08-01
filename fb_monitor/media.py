@@ -95,6 +95,16 @@ class MediaStore:
         return shutil.disk_usage(self.root).free >= self.low_disk_bytes
 
     @staticmethod
+    def image_dimensions(path: str | Path | None, mime: str | None) -> tuple[int, int] | None:
+        if not path or not str(mime or "").startswith("image/"):
+            return None
+        try:
+            with Image.open(path) as image:
+                return image.size
+        except (OSError, UnidentifiedImageError):
+            return None
+
+    @staticmethod
     def perceptual_hash(path: Path, mime: str) -> str | None:
         if not mime.startswith("image/"):
             return None

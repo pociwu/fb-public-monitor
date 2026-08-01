@@ -151,6 +151,8 @@ class Ingester:
         if not existing and dedupe_key:
             existing = self.db.row("SELECT * FROM entities WHERE profile_id=? AND kind='comment' AND dedupe_key=?", (profile_id, dedupe_key))
         if existing and existing["current_hash"] == digest:
+            if kind == "profile":
+                await self._upgrade_low_resolution_avatar(existing, media_refs)
             self.db.execute("UPDATE entities SET notification_hash=COALESCE(notification_hash,?),last_seen_at=?,present=1,missing_successes=0 WHERE id=?", (digest, now, existing["id"]))
             return int(existing["id"]), ext_id, False
         notify_change = notify and not (existing and existing.get("notification_hash") is None)
@@ -199,6 +201,29 @@ class Ingester:
                 int(existing["current_version_id"]) if existing and existing.get("current_version_id") else None,
             )
         return entity_id, ext_id, True
+
+    async def _upgrade_low_resolution_avatar(self, entity: dict[str, Any], refs: list[MediaRef]) -> None:
+        version_id = entity.get("current_version_id")
+        avatar = next(((position, ref) for position, ref in enumerate(refs) if ref.role == "profile_picture"), None)
+        if not version_id or not avatar:
+            return
+        current = self.db.row(
+            """SELECT m.* FROM media m JOIN entity_media em ON em.media_id=m.id
+            WHERE em.entity_id=? AND em.version_id=? AND em.role='profile_picture' AND m.status='ready'
+            ORDER BY COALESCE(m.size_bytes,0) DESC,m.id DESC LIMIT 1""",
+            (entity["id"], version_id),
+        )
+        current_size = self.media.image_dimensions(current.get("path"), current.get("mime_type")) if current else None
+        if current_size and min(current_size) >= 128:
+            return
+        position, ref = avatar
+        result = await self.media.download(ref.url)
+        if result.get("status") != "ready":
+            return
+        upgraded_size = self.media.image_dimensions(result.get("path"), result.get("mime_type"))
+        if not upgraded_size or (current_size and upgraded_size[0] * upgraded_size[1] <= current_size[0] * current_size[1]):
+            return
+        self._link_media(int(entity["id"]), int(version_id), result, ref.role, ref.json_path, position, None, None)
 
     def _link_media(self, entity_id: int, version_id: int, result: dict[str, Any], role: str, discovery_path: str, position: int, event_id: int | None, previous_version_id: int | None) -> None:
         now = utcnow()
