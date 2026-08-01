@@ -26,7 +26,7 @@
   <small>{{ p.public_state }} · Facebook ID：{{ p.display_fb_id or '尚未解析' }}</small>
   {% if p.details %}<div class="profile-details">
     {% if p.details.profile_intro_text %}<p>{{ p.details.profile_intro_text }}</p>{% endif %}
-    <small>{% if p.details.followers %}追蹤者：{{ p.details.followers }}{% endif %}{% if p.details.current_city %}<br>居住地：{{ p.details.current_city }}{% endif %}{% if p.details.hometown %}<br>家鄉：{{ p.details.hometown }}{% endif %}{% if p.work_labels %}<br>工作：{{ p.work_labels[0] }}{% endif %}{% if p.education_labels %}<br>學歷：{{ p.education_labels[0] }}{% endif %}<br>監控網址：<span class="break-all">{{ p.url }}</span>{% if p.details.url and p.details.url != p.url %}<br>Facebook 網址：<span class="break-all">{{ p.details.url }}</span>{% endif %}</small>
+    <small>{% if p.details.profile_data_source %}個人資料來源：{{ p.details.profile_data_source }}{% endif %}{% if p.details.followers %}<br>追蹤者：{{ p.details.followers }}{% endif %}{% if p.details.current_city %}<br>居住地：{{ p.details.current_city }}{% endif %}{% if p.details.hometown %}<br>家鄉：{{ p.details.hometown }}{% endif %}{% if p.work_labels %}<br>工作：{{ p.work_labels[0] }}{% endif %}{% if p.education_labels %}<br>學歷：{{ p.education_labels[0] }}{% endif %}<br>監控網址：<span class="break-all">{{ p.url }}</span>{% if p.details.url and p.details.url != p.url %}<br>Facebook 網址：<span class="break-all">{{ p.details.url }}</span>{% endif %}</small>
   </div>{% endif %}
   {% if p.public_photo_ids %}<div class="card-photo-strip">{% for media_id in p.public_photo_ids %}<img src="/media/{{ media_id }}/thumbnail" alt="公開照片">{% endfor %}</div>{% endif %}
   <p>{{ p.post_count }} 篇貼文 · {{ p.comment_count }} 則留言</p>

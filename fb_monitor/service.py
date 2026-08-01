@@ -11,6 +11,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .apify import ActorResult, ApifyGateway, MonthlyUsage
+from .brightdata import BrightDataError, BrightDataGateway
 from .config import Settings, actor_input, load_settings
 from .db import Database, utcnow
 from .ingest import Ingester, external_id
@@ -56,6 +57,7 @@ class MonitorService:
         self.db.sync_profiles(settings.profiles)
         self.apify = ApifyGateway(settings.apify_token)
         self.serpapi = SerpApiGateway(settings.serpapi_key)
+        self.brightdata = BrightDataGateway(settings.brightdata_api_token, settings.brightdata_dataset_id)
         self.media = MediaStore(self.db, settings.data_dir, settings.low_disk_gb, settings.media_retry_days)
         self.ingester = Ingester(self.db, settings.data_dir, self.media)
         self.telegram = TelegramSender(
@@ -362,8 +364,9 @@ class MonitorService:
                 self.db.add_event(
                     f"serpapi:{day}:quota",
                     "serpapi_quota",
-                    {"title": "SerpApi 免費查詢額度已用完", "text": f"{exc}；個人檔案暫停更新，貼文仍依 Apify 額度執行。"},
+                    {"title": "SerpApi 免費查詢額度已用完", "text": f"{exc}；若已設定 Bright Data 將改用備援，貼文仍依 Apify 額度執行。"},
                 )
+                await self._try_brightdata_fallback(profile, str(exc))
             except SerpApiError as exc:
                 hour = datetime.now(UTC).strftime("%Y-%m-%dT%H")
                 self.db.add_event(
@@ -372,6 +375,8 @@ class MonitorService:
                     {"title": "SerpApi 個人檔案查詢失敗", "text": str(exc)[:1000]},
                     profile_id,
                 )
+                await self._try_brightdata_fallback(profile, str(exc))
+            profile = self.db.row("SELECT * FROM profiles WHERE id=?", (profile_id,)) or profile
         if profile.get("public_state") != "public":
             self._schedule_next(profile_id)
             return
@@ -430,15 +435,48 @@ class MonitorService:
         account.searches_left = max(0, account.searches_left - 1)
         account.this_month_usage += 1
         self.db.save_serpapi_usage(account)
-        item = result.item
+        item = dict(result.item)
+        item["profile_data_source"] = "SerpApi"
+        await self._store_profile_details(profile, item)
+        if account.searches_left in {50, 10, 0}:
+            self.db.add_event(
+                f"serpapi:{account.renewal_date}:{account.searches_left}",
+                "serpapi_usage_warning",
+                {"title": f"SerpApi 剩餘 {account.searches_left} 次", "text": f"{account.plan_name}：已用 {account.this_month_usage} / {account.searches_per_month}；重置日 {account.renewal_date or '-'}。"},
+            )
+
+    async def _try_brightdata_fallback(self, profile: dict[str, Any], primary_error: str) -> bool:
+        if not self.settings.brightdata_api_token:
+            return False
+        try:
+            item = await self.brightdata.profile(str(profile["url"]))
+            await self._store_profile_details(profile, item)
+        except BrightDataError as exc:
+            hour = datetime.now(UTC).strftime("%Y-%m-%dT%H")
+            self.db.add_event(
+                f"brightdata:{profile['id']}:{hour}:failed",
+                "brightdata_error",
+                {"title": "Bright Data 備援查詢失敗", "text": f"SerpApi：{primary_error[:450]}\nBright Data：{str(exc)[:450]}"},
+                int(profile["id"]),
+            )
+            return False
+        self.db.add_event(
+            f"brightdata:{profile['id']}:{utcnow()[:13]}:success",
+            "brightdata_fallback",
+            {"title": "Bright Data 備援查詢成功", "text": f"SerpApi 失敗後已由 Bright Data 更新個人檔案。\n原因：{primary_error[:700]}"},
+            int(profile["id"]),
+        )
+        return True
+
+    async def _store_profile_details(self, profile: dict[str, Any], item: dict[str, Any]) -> None:
         previous_state = str(profile.get("public_state") or "unknown")
-        state = "private" if bool(item.get("private")) else "public"
+        state = "private" if bool(item.get("private") or item.get("is_private")) else "public"
         configured_id = profile_id_from_url(str(profile["url"]))
-        serpapi_id = str(item.get("id") or "")
+        provider_id = str(item.get("id") or "")
         previous_id = str(profile.get("fb_id") or "")
         # SerpApi may return a pfbid token. Keep numeric Facebook IDs from the
         # monitored URL instead; pfbid is not a useful account identifier here.
-        fb_id = next((value for value in (configured_id, serpapi_id, previous_id) if value.isdigit()), "")
+        fb_id = next((value for value in (configured_id, provider_id, previous_id) if value.isdigit()), "")
         await self.ingester.ingest(int(profile["id"]), "profile", item, notify=previous_state != "unknown")
         self.db.execute(
             """UPDATE profiles SET fb_id=?,public_state=?,profile_details_json=?,serp_last_checked_at=?,
@@ -450,12 +488,6 @@ class MonitorService:
             self.db.add_event(f"profile:{profile['id']}:opened:{utcnow()}", "profile_opened", {"title": f"{display} 已公開", "source_url": profile["url"]}, int(profile["id"]))
         if state == "private" and previous_state != "private":
             self.db.add_event(f"profile:{profile['id']}:private:{utcnow()[:13]}", "profile_private", {"title": f"{display} 目前為私人帳號", "source_url": profile["url"]}, int(profile["id"]))
-        if account.searches_left in {50, 10, 0}:
-            self.db.add_event(
-                f"serpapi:{account.renewal_date}:{account.searches_left}",
-                "serpapi_usage_warning",
-                {"title": f"SerpApi 剩餘 {account.searches_left} 次", "text": f"{account.plan_name}：已用 {account.this_month_usage} / {account.searches_per_month}；重置日 {account.renewal_date or '-'}。"},
-            )
 
     async def _fetch_posts(self, profile: dict[str, Any], maximum: int, cursor: str | None = None) -> ActorResult:
         original = str(profile["url"])

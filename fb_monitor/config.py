@@ -135,6 +135,8 @@ class Settings:
     profiles: list[ProfileConfig] = field(default_factory=list)
     apify_token: str = ""
     serpapi_key: str = ""
+    brightdata_api_token: str = ""
+    brightdata_dataset_id: str = "gd_mf0urb782734ik94dz"
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     scheduler_enabled: bool = True
@@ -206,6 +208,8 @@ def load_settings(path: str | Path | None = None) -> Settings:
         profiles=profiles,
         apify_token=os.getenv("APIFY_TOKEN", ""),
         serpapi_key=os.getenv("SERPAPI_KEY", ""),
+        brightdata_api_token=os.getenv("BRIGHTDATA_API_TOKEN", ""),
+        brightdata_dataset_id=os.getenv("BRIGHTDATA_DATASET_ID", "gd_mf0urb782734ik94dz"),
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
         scheduler_enabled=os.getenv("FB_MONITOR_SCHEDULER", "1") not in {"0", "false", "False"},

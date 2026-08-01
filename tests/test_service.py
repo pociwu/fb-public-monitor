@@ -4,7 +4,7 @@ import pytest
 
 from fb_monitor.apify import ActorResult, MonthlyUsage
 from fb_monitor.config import load_settings
-from fb_monitor.serpapi import SerpApiAccount, SerpApiProfileResult
+from fb_monitor.serpapi import SerpApiAccount, SerpApiError, SerpApiProfileResult
 from fb_monitor.service import MonitorService, actor_summary_error
 
 
@@ -162,3 +162,49 @@ def test_health_summary_uses_resolved_display_name():
         "吳佳欣: public · 最近成功 2026-08-01T00:00:00+00:00",
         "姓名待確認: unknown · 最近成功 -",
     ]
+
+
+@pytest.mark.asyncio
+async def test_brightdata_fallback_updates_profile_after_serpapi_failure(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """profiles:
+  - name: FB-100
+    url: https://facebook.com/100
+storage:
+  data_dir: data
+  low_disk_gb: 0
+schedule:
+  spacing_min_minutes: 0
+  spacing_max_minutes: 0
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("BRIGHTDATA_API_TOKEN", "secret")
+    service = MonitorService(load_settings(config))
+
+    async def failed_serpapi(url):
+        raise SerpApiError("Facebook Profile hasn't returned any results for this query.")
+
+    calls = []
+
+    async def brightdata_profile(url):
+        calls.append(url)
+        return {
+            "id": "100", "name": "Alice", "url": url,
+            "profile_picture": "https://cdn.example/avatar.jpg",
+            "profile_data_source": "Bright Data",
+        }
+
+    service.serpapi.profile = failed_serpapi
+    service.brightdata.profile = brightdata_profile
+    await service.visit_profile(1)
+
+    profile = service.db.row("SELECT * FROM profiles WHERE id=1")
+    assert calls == ["https://facebook.com/100"]
+    assert profile["public_state"] == "public"
+    assert profile["fb_id"] == "100"
+    assert profile["serp_last_checked_at"] is not None
+    assert '"profile_data_source": "Bright Data"' in profile["profile_details_json"]
+    assert service.db.row("SELECT COUNT(*) count FROM events WHERE event_type='brightdata_fallback'")["count"] == 1

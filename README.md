@@ -1,6 +1,6 @@
 # FB Public Monitor
 
-在 Ubuntu 以 Docker Compose 長期監控最多 16 個公開 Facebook 個人帳號。服務透過 SerpApi 取得個人檔案，並以 Apify 擷取貼文、公開留言與附件，保存完整版本歷史，並將變更送至單一 Telegram 群組。
+在 Ubuntu 以 Docker Compose 長期監控最多 16 個公開 Facebook 個人帳號。服務透過 SerpApi 取得個人檔案，失敗時以 Bright Data 備援，並以 Apify 擷取貼文、公開留言與附件，保存完整版本歷史，並將變更送至單一 Telegram 群組。
 
 ## 已實作行為
 
@@ -38,6 +38,8 @@ docker compose logs -f monitor
 
 - `APIFY_TOKEN`：Apify Console → Integrations 中的 API token。
 - `SERPAPI_KEY`：SerpApi 帳號 API key；程式先查免費 Account API，剩餘次數為 0 時不會執行個人檔案查詢。
+- `BRIGHTDATA_API_TOKEN`：Bright Data API token。設定後，SerpApi 額度用完、連線失敗或查無結果時，才呼叫 Facebook Profiles Scraper API 作備援。
+- `BRIGHTDATA_DATASET_ID`：Bright Data Facebook Profiles dataset ID，預設 `gd_mf0urb782734ik94dz`，通常不需修改。
 - `TELEGRAM_BOT_TOKEN`：由 BotFather 建立的 bot token。
 - `TELEGRAM_CHAT_ID`：單一 Telegram 群組 ID；把 bot 加入群組並授權傳送訊息。
 
