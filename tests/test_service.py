@@ -21,7 +21,7 @@ async def allow_official_usage(service: MonitorService) -> None:
 
     async def fake_serpapi_profile(url):
         return SerpApiProfileResult(
-            {"id": "100", "name": "Watched", "url": url, "profile_intro_text": "Public profile"},
+            {"id": "pfbid0internal", "name": "Watched", "url": url, "profile_intro_text": "Public profile"},
             SerpApiAccount("Free Plan", 250, 250, 0, "2026-08-31", 0, 50),
         )
 
@@ -61,6 +61,7 @@ schedule:
     await service.visit_profile(1)
     profile = service.db.row("SELECT * FROM profiles WHERE id=1")
     assert profile["public_state"] == "public"
+    assert profile["fb_id"] == "100"
     counts = {row["kind"]: row["count"] for row in service.db.rows("SELECT kind,COUNT(*) count FROM entities GROUP BY kind")}
     assert counts == {"comment": 1, "post": 1, "profile": 1}
     # Initial baseline is summarized later rather than generating one notification per item.

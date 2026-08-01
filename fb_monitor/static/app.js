@@ -32,6 +32,31 @@
     document.body.classList.remove("lightbox-open");
   }
 
+  async function copyProfile(button) {
+    const card = button.closest("[data-profile-id]")?.querySelector(".profile-card");
+    if (!card) return;
+    const content = card.innerText.trim();
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(content);
+      } else {
+        const textarea = document.createElement("textarea");
+        textarea.value = content;
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand("copy");
+        textarea.remove();
+      }
+      const original = button.textContent;
+      button.textContent = "已複製";
+      setTimeout(() => { button.textContent = original; }, 1200);
+    } catch (error) {
+      window.alert(`複製失敗：${error.message}`);
+    }
+  }
+
   function initExpandable(root = document) {
     root.querySelectorAll("[data-expandable]").forEach((block) => {
       const toggle = block.nextElementSibling;
@@ -71,7 +96,7 @@
       let changed = false;
 
       container.addEventListener("dragstart", (event) => {
-        if (event.target.closest(".card-admin-actions")) {
+        if (!event.target.closest(".drag-handle")) {
           event.preventDefault();
           return;
         }
@@ -125,6 +150,11 @@
   }
 
   document.addEventListener("click", (event) => {
+    const copyButton = event.target.closest("[data-copy-profile]");
+    if (copyButton) {
+      copyProfile(copyButton);
+      return;
+    }
     const preview = event.target.closest("[data-lightbox-src]");
     if (preview) {
       event.preventDefault();

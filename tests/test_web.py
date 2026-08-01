@@ -44,17 +44,26 @@ def test_dashboard_shows_official_usage_reset_countdown(tmp_path: Path, monkeypa
 
 def test_dashboard_card_shows_serpapi_profile_details(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
-    config.write_text("profiles:\n  - name: FB-100\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n", encoding="utf-8")
+    config.write_text("profiles:\n  - name: FB-100\n    url: https://www.facebook.com/100\nstorage:\n  data_dir: data\n", encoding="utf-8")
     monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
     app = create_app(load_settings(config))
-    details = '{"name":"吳佳欣","url":"https://www.facebook.com/100","profile_intro_text":"公開簡介","followers":"1.2K","current_city":"Taipei","works":[{"title":"Engineer"}],"educations":[{"title":"Example University"}]}'
-    app.state.db.execute("UPDATE profiles SET display_name='吳佳欣',fb_id='100',public_state='public',profile_details_json=? WHERE id=1", (details,))
+    details = '{"name":"吳佳欣","id":"pfbid0example","url":"https://www.facebook.com/wu.jia.xin","profile_intro_text":"公開簡介","followers":"1.2K","current_city":"Taipei","works":[{"title":"Engineer"}],"educations":[{"title":"Example University"}]}'
+    app.state.db.execute(
+        "UPDATE profiles SET display_name='吳佳欣',fb_id='pfbid0example',public_state='public',profile_details_json=?,last_success_at='2026-08-01T00:10:00+00:00',next_visit_at='2026-08-01T00:10:59+00:00' WHERE id=1",
+        (details,),
+    )
 
     with TestClient(app) as client:
         dashboard = client.get("/")
         assert dashboard.status_code == 200
         for expected in ("吳佳欣", "公開簡介", "1.2K", "Taipei", "Engineer", "Example University"):
             assert expected in dashboard.text
+        assert "Facebook ID：100" in dashboard.text
+        assert "https://www.facebook.com/100" in dashboard.text
+        assert "pfbid0example" not in dashboard.text
+        assert "2026-08-01 08:10" in dashboard.text
+        assert '<div class="profile-card">' in dashboard.text
+        assert "data-copy-profile" in dashboard.text
 
 
 def test_profile_cards_render_media_and_thumbnail_cache(tmp_path: Path, monkeypatch):

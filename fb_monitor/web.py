@@ -19,6 +19,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from .config import MAX_PROFILES, Settings, add_profile_to_config, load_settings, remove_profile_from_config
 from .db import Database, utcnow
 from .service import MonitorService
+from .serpapi import profile_id_from_url
 from .timeutil import display_time, parse_time
 
 PACKAGE = Path(__file__).parent
@@ -142,6 +143,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         for profile in profiles:
             profile["last_success_display"] = display_time(profile.get("last_success_at"), cfg.timezone)
             profile["next_visit_display"] = display_time(profile.get("next_visit_at"), cfg.timezone)
+            configured_id = profile_id_from_url(str(profile["url"]))
+            stored_id = str(profile.get("fb_id") or "")
+            profile["display_fb_id"] = next((value for value in (configured_id, stored_id) if value.isdigit()), "")
             profile["details"] = _json(profile.get("profile_details_json"))
             details = profile["details"]
             profile["work_labels"] = [str(item.get("title") or item.get("name")) for item in details.get("works", []) if isinstance(item, dict) and (item.get("title") or item.get("name"))]

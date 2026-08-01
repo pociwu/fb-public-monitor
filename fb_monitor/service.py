@@ -16,7 +16,7 @@ from .db import Database, utcnow
 from .ingest import Ingester, external_id
 from .media import MediaStore
 from .telegram import TelegramSender
-from .serpapi import SerpApiError, SerpApiGateway, SerpApiQuotaExceeded
+from .serpapi import SerpApiError, SerpApiGateway, SerpApiQuotaExceeded, profile_id_from_url
 
 log = logging.getLogger(__name__)
 PRICES = {"profile": 5.40 / 1000, "posts": 4.99 / 1000, "comments": 1.40 / 1000}
@@ -433,7 +433,12 @@ class MonitorService:
         item = result.item
         previous_state = str(profile.get("public_state") or "unknown")
         state = "private" if bool(item.get("private")) else "public"
-        fb_id = str(item.get("id") or profile.get("fb_id") or external_id(item, "profile"))
+        configured_id = profile_id_from_url(str(profile["url"]))
+        serpapi_id = str(item.get("id") or "")
+        previous_id = str(profile.get("fb_id") or "")
+        # SerpApi may return a pfbid token. Keep numeric Facebook IDs from the
+        # monitored URL instead; pfbid is not a useful account identifier here.
+        fb_id = next((value for value in (configured_id, serpapi_id, previous_id) if value.isdigit()), "")
         await self.ingester.ingest(int(profile["id"]), "profile", item, notify=previous_state != "unknown")
         self.db.execute(
             """UPDATE profiles SET fb_id=?,public_state=?,profile_details_json=?,serp_last_checked_at=?,

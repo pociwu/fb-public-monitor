@@ -18,21 +18,23 @@
   <div><input id="profile-url" name="url" type="url" required autocomplete="url" placeholder="https://www.facebook.com/使用者名稱或數字ID"><button class="button" type="submit">驗證並新增</button></div>
   <small>接受 Facebook 個人檔案首頁網址；新增後會立即排程，由個人檔案 Actor 驗證公開可讀性。</small>
 </form>
-<div class="cards" data-profile-cards>{% for p in profiles %}<div class="profile-card-wrap" draggable="true" data-profile-id="{{ p.id }}">
-  <span class="drag-handle" aria-hidden="true" title="拖曳調整順序">⠿</span>
-  <a class="profile-card" href="/profiles/{{ p.id }}">
+<div class="cards" data-profile-cards>{% for p in profiles %}<div class="profile-card-wrap" data-profile-id="{{ p.id }}">
+  <span class="drag-handle" draggable="true" aria-label="拖曳調整順序" title="拖曳調整順序">⠿</span>
+  <div class="profile-card">
   {% if p.cover_media_id %}<div class="card-cover"><img src="/media/{{ p.cover_media_id }}/thumbnail" alt="{{ p.display_name or p.name }} 封面照"></div>{% endif %}
   <div class="profile-head">{% if p.avatar_media_id %}<img class="avatar" src="/media/{{ p.avatar_media_id }}" alt="">{% else %}<span class="avatar placeholder">FB</span>{% endif %}<div><span class="dot {{ p.public_state }}"></span><strong>{{ p.display_name or p.name }}</strong>{% if p.display_name and p.name != p.display_name %}<small class="alias">別名：{{ p.name }}</small>{% endif %}</div></div>
-  <small>{{ p.public_state }} · Facebook ID：{{ p.fb_id or '尚未解析' }}</small>
+  <small>{{ p.public_state }} · Facebook ID：{{ p.display_fb_id or '尚未解析' }}</small>
   {% if p.details %}<div class="profile-details">
     {% if p.details.profile_intro_text %}<p>{{ p.details.profile_intro_text }}</p>{% endif %}
-    <small>{% if p.details.followers %}追蹤者：{{ p.details.followers }}{% endif %}{% if p.details.current_city %}<br>居住地：{{ p.details.current_city }}{% endif %}{% if p.details.hometown %}<br>家鄉：{{ p.details.hometown }}{% endif %}{% if p.work_labels %}<br>工作：{{ p.work_labels[0] }}{% endif %}{% if p.education_labels %}<br>學歷：{{ p.education_labels[0] }}{% endif %}<br><span class="break-all">{{ p.details.url or p.url }}</span></small>
+    <small>{% if p.details.followers %}追蹤者：{{ p.details.followers }}{% endif %}{% if p.details.current_city %}<br>居住地：{{ p.details.current_city }}{% endif %}{% if p.details.hometown %}<br>家鄉：{{ p.details.hometown }}{% endif %}{% if p.work_labels %}<br>工作：{{ p.work_labels[0] }}{% endif %}{% if p.education_labels %}<br>學歷：{{ p.education_labels[0] }}{% endif %}<br><span class="break-all">{{ p.url }}</span></small>
   </div>{% endif %}
   {% if p.public_photo_ids %}<div class="card-photo-strip">{% for media_id in p.public_photo_ids %}<img src="/media/{{ media_id }}/thumbnail" alt="公開照片">{% endfor %}</div>{% endif %}
   <p>{{ p.post_count }} 篇貼文 · {{ p.comment_count }} 則留言</p>
-  <small>最近成功：{{ p.last_success_at or '—' }}<br>下次拜訪：{{ p.next_visit_at or '佇列中' }}</small>
-  </a>
+  <small>最近成功：{{ p.last_success_display if p.last_success_at else '—' }}<br>下次拜訪：{{ p.next_visit_display if p.next_visit_at else '佇列中' }}</small>
+  </div>
   <div class="card-admin-actions">
+    <a class="button secondary" href="/profiles/{{ p.id }}">查看資料</a>
+    <button class="button secondary" type="button" data-copy-profile>複製內容</button>
     <form method="post" action="/profiles/{{ p.id }}/scan" onsubmit="return confirm('立即排程拜訪 {{ p.display_name or p.name }}？')"><button class="button secondary" type="submit">立即拜訪</button></form>
     <form method="post" action="/profiles/{{ p.id }}/remove" onsubmit="return confirm('停止監控 {{ p.display_name or p.name }}？歷史貼文與留言會保留。')"><button class="button danger" type="submit">移除</button></form>
   </div>
