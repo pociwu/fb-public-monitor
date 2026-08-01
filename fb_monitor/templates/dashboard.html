@@ -10,6 +10,7 @@
   <article><span>待送通知</span><strong>{{ outbox.count or 0 }}</strong></article>
   <article><span>媒體</span><strong>{{ media.ready or 0 }} / {{ media.total or 0 }}</strong></article>
   <article><span>Apify 官方用量</span><strong>{% if official_usage %}${{ "%.2f"|format(official_usage.used_usd) }} / ${{ "%.2f"|format(budget) }}{% else %}尚未查詢{% endif %}</strong>{% if official_usage %}<small>重置倒數：<b data-usage-countdown data-cycle-end="{{ official_usage.cycle_end_at }}">計算中…</b><br>帳期：{{ official_usage.cycle_start_display }} ～ {{ official_usage.cycle_end_display }}<br>查詢：{{ official_usage.fetched_display }}</small>{% endif %}</article>
+  <article><span>SerpApi 查詢額度</span><strong>{% if serpapi_usage %}{{ serpapi_usage.searches_left }} / {{ serpapi_usage.searches_per_month }}{% else %}尚未查詢{% endif %}</strong>{% if serpapi_usage %}<small>{{ serpapi_usage.plan_name }}<br>重置：{{ serpapi_usage.renewal_date or '—' }}</small>{% endif %}</article>
 </section>
 <section class="panel"><div class="panel-heading"><h2>Facebook 帳號</h2><div class="panel-actions"><small class="sort-hint">拖曳卡片可調整順序</small><form method="post" action="/profiles/scan-all" onsubmit="return confirm('將全部啟用帳號排到拜訪佇列最前端？仍會遵守間隔與預算限制。')"><button class="button" type="submit">立即拜訪（全部）</button></form></div></div>
 <form class="add-profile-form" method="post" action="/profiles">
@@ -20,8 +21,14 @@
 <div class="cards" data-profile-cards>{% for p in profiles %}<div class="profile-card-wrap" draggable="true" data-profile-id="{{ p.id }}">
   <span class="drag-handle" aria-hidden="true" title="拖曳調整順序">⠿</span>
   <a class="profile-card" href="/profiles/{{ p.id }}">
+  {% if p.cover_media_id %}<div class="card-cover"><img src="/media/{{ p.cover_media_id }}/thumbnail" alt="{{ p.display_name or p.name }} 封面照"></div>{% endif %}
   <div class="profile-head">{% if p.avatar_media_id %}<img class="avatar" src="/media/{{ p.avatar_media_id }}" alt="">{% else %}<span class="avatar placeholder">FB</span>{% endif %}<div><span class="dot {{ p.public_state }}"></span><strong>{{ p.display_name or p.name }}</strong>{% if p.display_name and p.name != p.display_name %}<small class="alias">別名：{{ p.name }}</small>{% endif %}</div></div>
   <small>{{ p.public_state }} · Facebook ID：{{ p.fb_id or '尚未解析' }}</small>
+  {% if p.details %}<div class="profile-details">
+    {% if p.details.profile_intro_text %}<p>{{ p.details.profile_intro_text }}</p>{% endif %}
+    <small>{% if p.details.followers %}追蹤者：{{ p.details.followers }}{% endif %}{% if p.details.current_city %}<br>居住地：{{ p.details.current_city }}{% endif %}{% if p.details.hometown %}<br>家鄉：{{ p.details.hometown }}{% endif %}{% if p.work_labels %}<br>工作：{{ p.work_labels[0] }}{% endif %}{% if p.education_labels %}<br>學歷：{{ p.education_labels[0] }}{% endif %}<br><span class="break-all">{{ p.details.url or p.url }}</span></small>
+  </div>{% endif %}
+  {% if p.public_photo_ids %}<div class="card-photo-strip">{% for media_id in p.public_photo_ids %}<img src="/media/{{ media_id }}/thumbnail" alt="公開照片">{% endfor %}</div>{% endif %}
   <p>{{ p.post_count }} 篇貼文 · {{ p.comment_count }} 則留言</p>
   <small>最近成功：{{ p.last_success_at or '—' }}<br>下次拜訪：{{ p.next_visit_at or '佇列中' }}</small>
   </a>

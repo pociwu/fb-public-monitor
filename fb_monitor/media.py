@@ -25,7 +25,7 @@ class MediaRef:
 
 
 MEDIA_WORDS = ("media", "image", "photo", "picture", "profilepic", "avatar", "cover", "video", "attachment", "playable")
-GENERIC_URL_KEYS = {"url", "uri", "source", "src", "downloadurl", "sourceurl"}
+GENERIC_URL_KEYS = {"url", "uri", "source", "src", "link", "downloadurl", "sourceurl"}
 
 
 def _role_for(path: list[str], kind: str) -> str:

@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS profiles (
   last_attempt_at TEXT, last_success_at TEXT, next_visit_at TEXT, last_full_audit_at TEXT,
   backfill_cursor TEXT, backfill_done INTEGER NOT NULL DEFAULT 0, audit_cursor TEXT, audit_token TEXT,
   consecutive_failures INTEGER NOT NULL DEFAULT 0, sort_order INTEGER,
-  last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  last_error TEXT, profile_details_json TEXT, serp_last_checked_at TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS entities (
   id INTEGER PRIMARY KEY, profile_id INTEGER NOT NULL REFERENCES profiles(id), kind TEXT NOT NULL,
@@ -77,6 +78,13 @@ CREATE TABLE IF NOT EXISTS apify_usage_snapshot (
   id INTEGER PRIMARY KEY CHECK(id=1), used_usd REAL NOT NULL,
   cycle_start_at TEXT NOT NULL, cycle_end_at TEXT NOT NULL, fetched_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS serpapi_usage_snapshot (
+  id INTEGER PRIMARY KEY CHECK(id=1), plan_name TEXT NOT NULL,
+  searches_per_month INTEGER NOT NULL, searches_left INTEGER NOT NULL,
+  this_month_usage INTEGER NOT NULL, renewal_date TEXT,
+  this_hour_searches INTEGER NOT NULL, rate_limit_per_hour INTEGER NOT NULL,
+  fetched_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS audit_seen (
   profile_id INTEGER NOT NULL REFERENCES profiles(id), audit_token TEXT NOT NULL,
   kind TEXT NOT NULL, external_id TEXT NOT NULL,
@@ -131,7 +139,7 @@ class Database:
             conn.executescript(SCHEMA)
             # Lightweight forward migrations for existing installations.
             columns = {row[1] for row in conn.execute("PRAGMA table_info(profiles)")}
-            for name in ("audit_cursor", "audit_token", "display_name"):
+            for name in ("audit_cursor", "audit_token", "display_name", "profile_details_json", "serp_last_checked_at"):
                 if name not in columns:
                     conn.execute(f"ALTER TABLE profiles ADD COLUMN {name} TEXT")
             if "sort_order" not in columns:
@@ -356,6 +364,23 @@ class Database:
 
     def apify_usage_snapshot(self) -> dict[str, Any] | None:
         return self.row("SELECT used_usd,cycle_start_at,cycle_end_at,fetched_at FROM apify_usage_snapshot WHERE id=1")
+
+    def save_serpapi_usage(self, account: Any) -> None:
+        self.execute(
+            """INSERT INTO serpapi_usage_snapshot(
+              id,plan_name,searches_per_month,searches_left,this_month_usage,renewal_date,
+              this_hour_searches,rate_limit_per_hour,fetched_at
+            ) VALUES(1,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+              plan_name=excluded.plan_name,searches_per_month=excluded.searches_per_month,
+              searches_left=excluded.searches_left,this_month_usage=excluded.this_month_usage,
+              renewal_date=excluded.renewal_date,this_hour_searches=excluded.this_hour_searches,
+              rate_limit_per_hour=excluded.rate_limit_per_hour,fetched_at=excluded.fetched_at""",
+            (account.plan_name, account.searches_per_month, account.searches_left, account.this_month_usage,
+             account.renewal_date, account.this_hour_searches, account.rate_limit_per_hour, utcnow()),
+        )
+
+    def serpapi_usage_snapshot(self) -> dict[str, Any] | None:
+        return self.row("SELECT * FROM serpapi_usage_snapshot WHERE id=1")
 
     def migration_applied(self, name: str) -> bool:
         return self.row("SELECT name FROM schema_migrations WHERE name=?", (name,)) is not None

@@ -134,11 +134,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
              ORDER BY em.version_id DESC,
                CASE WHEN LOWER(COALESCE(em.discovery_path,'')) LIKE '%large%' THEN 0
                     WHEN LOWER(COALESCE(em.discovery_path,'')) LIKE '%medium%' THEN 1 ELSE 2 END,
-               m.id DESC LIMIT 1) avatar_media_id
+               m.id DESC LIMIT 1) avatar_media_id,
+            (SELECT m.id FROM media m JOIN entity_media em ON em.media_id=m.id JOIN entities e ON e.id=em.entity_id
+             WHERE e.profile_id=p.id AND e.kind='profile' AND m.status='ready' AND em.role='cover_photo'
+             ORDER BY em.version_id DESC,m.id DESC LIMIT 1) cover_media_id
             FROM profiles p WHERE p.enabled=1 ORDER BY COALESCE(p.sort_order,p.id),p.id""")
         for profile in profiles:
             profile["last_success_display"] = display_time(profile.get("last_success_at"), cfg.timezone)
             profile["next_visit_display"] = display_time(profile.get("next_visit_at"), cfg.timezone)
+            profile["details"] = _json(profile.get("profile_details_json"))
+            details = profile["details"]
+            profile["work_labels"] = [str(item.get("title") or item.get("name")) for item in details.get("works", []) if isinstance(item, dict) and (item.get("title") or item.get("name"))]
+            profile["education_labels"] = [str(item.get("title") or item.get("name")) for item in details.get("educations", []) if isinstance(item, dict) and (item.get("title") or item.get("name"))]
+            for section in details.get("about_details", []):
+                if not isinstance(section, dict):
+                    continue
+                labels = [str(item.get("title") or item.get("name")) for item in section.get("items", []) if isinstance(item, dict) and (item.get("title") or item.get("name"))]
+                if section.get("section_type") == "work":
+                    profile["work_labels"].extend(labels)
+                elif section.get("section_type") in {"college", "secondary_school", "education"}:
+                    profile["education_labels"].extend(labels)
+            profile["public_photo_ids"] = [row["id"] for row in db.rows(
+                """SELECT DISTINCT m.id FROM media m JOIN entity_media em ON em.media_id=m.id
+                JOIN entities e ON e.id=em.entity_id WHERE e.profile_id=? AND e.kind='profile'
+                AND m.status='ready' AND em.role='image' ORDER BY em.version_id DESC,m.id DESC LIMIT 4""",
+                (profile["id"],),
+            )]
         usage = db.rows("SELECT * FROM usage ORDER BY month DESC,category")
         pending = db.row("SELECT COUNT(*) count FROM jobs WHERE status IN ('pending','running')")
         outbox = db.row("SELECT COUNT(*) count FROM outbox WHERE status='pending'")
@@ -159,11 +180,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         media = db.row("SELECT COUNT(*) total,SUM(CASE WHEN status='ready' THEN 1 ELSE 0 END) ready FROM media")
         monitored = db.row("SELECT COUNT(*) count FROM profiles WHERE enabled=1")
         official_usage = db.apify_usage_snapshot()
+        serpapi_usage = db.serpapi_usage_snapshot()
         if official_usage:
             official_usage["cycle_start_display"] = display_time(official_usage.get("cycle_start_at"), cfg.timezone)
             official_usage["cycle_end_display"] = display_time(official_usage.get("cycle_end_at"), cfg.timezone)
             official_usage["fetched_display"] = display_time(official_usage.get("fetched_at"), cfg.timezone)
-        return templates.TemplateResponse(request, "dashboard.html", {"profiles": profiles, "usage": usage, "official_usage": official_usage, "pending": pending, "outbox": outbox, "outbox_counts": outbox_counts, "outbox_rows": outbox_rows, "maintenance_runs": maintenance_runs, "media": media, "budget": cfg.monthly_budget_usd, "monitored": monitored, "max_profiles": MAX_PROFILES, "notice": notice, "error": error})
+        return templates.TemplateResponse(request, "dashboard.html", {"profiles": profiles, "usage": usage, "official_usage": official_usage, "serpapi_usage": serpapi_usage, "pending": pending, "outbox": outbox, "outbox_counts": outbox_counts, "outbox_rows": outbox_rows, "maintenance_runs": maintenance_runs, "media": media, "budget": cfg.monthly_budget_usd, "monitored": monitored, "max_profiles": MAX_PROFILES, "notice": notice, "error": error})
 
     @app.post("/profiles")
     async def add_profile(request: Request):

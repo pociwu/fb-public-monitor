@@ -118,6 +118,7 @@ class Settings:
     recent_posts: int = 10
     backfill_posts: int = 20
     full_audit_days: int = 7
+    serpapi_profile_refresh_hours: float = 48
     low_disk_gb: float = 10
     media_retry_days: int = 30
     monthly_budget_usd: float = 5
@@ -133,6 +134,7 @@ class Settings:
     actors: ActorConfig = field(default_factory=ActorConfig)
     profiles: list[ProfileConfig] = field(default_factory=list)
     apify_token: str = ""
+    serpapi_key: str = ""
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     scheduler_enabled: bool = True
@@ -187,6 +189,7 @@ def load_settings(path: str | Path | None = None) -> Settings:
         recent_posts=int(schedule.get("recent_posts", 10)),
         backfill_posts=int(schedule.get("backfill_posts", 20)),
         full_audit_days=int(schedule.get("full_audit_days", 7)),
+        serpapi_profile_refresh_hours=float(schedule.get("serpapi_profile_refresh_hours", 48)),
         low_disk_gb=float(storage.get("low_disk_gb", 10)),
         media_retry_days=int(storage.get("media_retry_days", 30)),
         monthly_budget_usd=float(budget.get("monthly_usd", 5)),
@@ -202,6 +205,7 @@ def load_settings(path: str | Path | None = None) -> Settings:
         actors=actors,
         profiles=profiles,
         apify_token=os.getenv("APIFY_TOKEN", ""),
+        serpapi_key=os.getenv("SERPAPI_KEY", ""),
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
         scheduler_enabled=os.getenv("FB_MONITOR_SCHEDULER", "1") not in {"0", "false", "False"},

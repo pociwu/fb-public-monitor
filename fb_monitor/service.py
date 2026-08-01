@@ -5,7 +5,6 @@ import hashlib
 import json
 import logging
 import random
-from calendar import monthrange
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -14,9 +13,10 @@ from zoneinfo import ZoneInfo
 from .apify import ActorResult, ApifyGateway, MonthlyUsage
 from .config import Settings, actor_input, load_settings
 from .db import Database, utcnow
-from .ingest import Ingester, embedded_posts, external_id
+from .ingest import Ingester, external_id
 from .media import MediaStore
 from .telegram import TelegramSender
+from .serpapi import SerpApiError, SerpApiGateway, SerpApiQuotaExceeded
 
 log = logging.getLogger(__name__)
 PRICES = {"profile": 5.40 / 1000, "posts": 4.99 / 1000, "comments": 1.40 / 1000}
@@ -55,6 +55,7 @@ class MonitorService:
         self.db = Database(settings.db_path)
         self.db.sync_profiles(settings.profiles)
         self.apify = ApifyGateway(settings.apify_token)
+        self.serpapi = SerpApiGateway(settings.serpapi_key)
         self.media = MediaStore(self.db, settings.data_dir, settings.low_disk_gb, settings.media_retry_days)
         self.ingester = Ingester(self.db, settings.data_dir, self.media)
         self.telegram = TelegramSender(
@@ -276,16 +277,10 @@ class MonitorService:
         return datetime(now.year, now.month + 1, 1, 0, 5, tzinfo=UTC)
 
     def _available_for(self, category: str) -> float:
-        remaining = self._remaining_budget()
-        if category == "profile":
-            return remaining
-        now = datetime.now(UTC)
-        enabled = self.db.row("SELECT COUNT(*) count FROM profiles WHERE enabled=1") or {"count": 0}
-        visits_per_month = int(enabled["count"]) * (24 / ((self.settings.visit_min_hours + self.settings.visit_max_hours) / 2)) * monthrange(now.year, now.month)[1]
-        reserve_total = min(self.settings.monthly_budget_usd, visits_per_month * PRICES["profile"])
-        profile_used = self.db.row("SELECT estimated_usd FROM usage WHERE month=? AND category='profile'", (now.strftime("%Y-%m"),))
-        reserve_left = max(0.0, reserve_total - float(profile_used["estimated_usd"] if profile_used else 0))
-        return max(0.0, remaining - reserve_left)
+        # Personal-profile retrieval is handled by SerpApi, so all Apify budget
+        # is available to posts and comments instead of being reserved for the
+        # retired Apify profile Actor.
+        return self._remaining_budget()
 
     @staticmethod
     def _usage_cycle_resume(usage: MonthlyUsage) -> datetime:
@@ -356,43 +351,35 @@ class MonitorService:
             return
         now = utcnow()
         self.db.execute("UPDATE profiles SET last_attempt_at=? WHERE id=?", (now, profile_id))
-        profile_payload = {"startUrls": [{"url": profile["url"]}]}
-        profile_payload.update(actor_input(self.settings.actors.profile_input, profile_url=profile["url"]))
-        result = await self._actor("profile", self.settings.actors.profile, profile_payload, profile_id, "profile_url")
-        if result.items and all(item.get("error") for item in result.items):
-            raise RuntimeError(f"個人檔案 Actor 回報錯誤：{result.items[0].get('error')}")
-        valid = [item for item in result.items if (any(item.get(k) for k in ("id", "profileId", "pageId", "name", "title")) or isinstance(item.get("personalProfile"), dict)) and not item.get("error")]
-        if not valid:
-            if result.items and result.diagnostic_id:
-                self.db.finish_actor_run(result.diagnostic_id, status="import_failed", run_id=result.run_id, result_count=len(result.items), charged_usd=result.charged_usd, summary=result.summary, error="個人檔案 Actor schema 無可辨識欄位", samples=result.items)
-            self._record_profile_missing(profile)
+        if self._serpapi_profile_due(profile):
+            try:
+                await self._refresh_serpapi_profile(profile)
+                profile = self.db.row("SELECT * FROM profiles WHERE id=?", (profile_id,)) or profile
+            except SerpApiQuotaExceeded as exc:
+                if exc.account is not None:
+                    self.db.save_serpapi_usage(exc.account)
+                day = datetime.now(UTC).date().isoformat()
+                self.db.add_event(
+                    f"serpapi:{day}:quota",
+                    "serpapi_quota",
+                    {"title": "SerpApi 免費查詢額度已用完", "text": f"{exc}；個人檔案暫停更新，貼文仍依 Apify 額度執行。"},
+                )
+            except SerpApiError as exc:
+                hour = datetime.now(UTC).strftime("%Y-%m-%dT%H")
+                self.db.add_event(
+                    f"serpapi:{hour}:failed",
+                    "serpapi_error",
+                    {"title": "SerpApi 個人檔案查詢失敗", "text": str(exc)[:1000]},
+                    profile_id,
+                )
+        if profile.get("public_state") != "public":
             self._schedule_next(profile_id)
             return
-        item = valid[0]
-        previous_state = profile["public_state"]
-        prior_failures = int(profile["consecutive_failures"])
-        fb_id = external_id(item, "profile")
-        notify = previous_state != "unknown"
-        await self.ingester.ingest(profile_id, "profile", item, notify=notify)
-        self.db.execute(
-            "UPDATE profiles SET fb_id=?,public_state='public',missing_successes=0,last_success_at=?,consecutive_failures=0,last_error=NULL WHERE id=?",
-            (fb_id, utcnow(), profile_id),
-        )
-        if previous_state not in {"unknown", "public"}:
-            self.db.add_event(f"profile:{profile_id}:opened:{utcnow()}", "profile_opened", {"title": f"{profile['name']} 已公開", "source_url": profile["url"]}, profile_id)
-        if prior_failures:
-            self.db.add_event(f"profile:{profile_id}:recovered:{utcnow()[:13]}", "system_recovered", {"title": f"{profile['name']} 已恢復", "text": f"先前連續失敗 {prior_failures} 次"}, profile_id)
         try:
             posts = await self._fetch_posts(profile, self.settings.recent_posts)
         except BudgetExceeded:
             self._schedule_next(profile_id)
             return
-        if not posts.items:
-            fallback_items = embedded_posts(item)
-            for post in fallback_items:
-                post.setdefault("ingest_source", "profile_actor_fallback")
-            if fallback_items:
-                posts = ActorResult(fallback_items, {"source": "profile_actor_fallback"}, result.run_id, 0.0, result.diagnostic_id)
         if not posts.items:
             summary_error = actor_summary_error(posts.summary)
             if summary_error:
@@ -422,6 +409,48 @@ class MonitorService:
             if (not last_audit or datetime.now(UTC) - last_audit >= timedelta(days=self.settings.full_audit_days)) and not self.db.row("SELECT id FROM jobs WHERE profile_id=? AND job_type='audit' AND status IN ('pending','running')", (profile_id,)):
                 self._enqueue(profile_id, "audit", 40, datetime.now(UTC) + timedelta(minutes=self.settings.spacing_max_minutes))
         self._schedule_next(profile_id)
+
+    def _serpapi_profile_due(self, profile: dict[str, Any]) -> bool:
+        checked_at = profile.get("serp_last_checked_at")
+        if not checked_at:
+            return True
+        try:
+            checked = datetime.fromisoformat(str(checked_at))
+            if checked.tzinfo is None:
+                checked = checked.replace(tzinfo=UTC)
+        except ValueError:
+            return True
+        return datetime.now(UTC) - checked >= timedelta(hours=self.settings.serpapi_profile_refresh_hours)
+
+    async def _refresh_serpapi_profile(self, profile: dict[str, Any]) -> None:
+        result = await self.serpapi.profile(str(profile["url"]))
+        account = result.account
+        # Account API is queried immediately before the successful search, so
+        # reflect the just-consumed search in the local dashboard snapshot.
+        account.searches_left = max(0, account.searches_left - 1)
+        account.this_month_usage += 1
+        self.db.save_serpapi_usage(account)
+        item = result.item
+        previous_state = str(profile.get("public_state") or "unknown")
+        state = "private" if bool(item.get("private")) else "public"
+        fb_id = str(item.get("id") or profile.get("fb_id") or external_id(item, "profile"))
+        await self.ingester.ingest(int(profile["id"]), "profile", item, notify=previous_state != "unknown")
+        self.db.execute(
+            """UPDATE profiles SET fb_id=?,public_state=?,profile_details_json=?,serp_last_checked_at=?,
+            missing_successes=0,last_success_at=?,consecutive_failures=0,last_error=NULL WHERE id=?""",
+            (fb_id, state, json.dumps(item, ensure_ascii=False), utcnow(), utcnow(), profile["id"]),
+        )
+        display = str(item.get("name") or profile.get("display_name") or profile.get("name"))
+        if state == "public" and previous_state not in {"unknown", "public"}:
+            self.db.add_event(f"profile:{profile['id']}:opened:{utcnow()}", "profile_opened", {"title": f"{display} 已公開", "source_url": profile["url"]}, int(profile["id"]))
+        if state == "private" and previous_state != "private":
+            self.db.add_event(f"profile:{profile['id']}:private:{utcnow()[:13]}", "profile_private", {"title": f"{display} 目前為私人帳號", "source_url": profile["url"]}, int(profile["id"]))
+        if account.searches_left in {50, 10, 0}:
+            self.db.add_event(
+                f"serpapi:{account.renewal_date}:{account.searches_left}",
+                "serpapi_usage_warning",
+                {"title": f"SerpApi 剩餘 {account.searches_left} 次", "text": f"{account.plan_name}：已用 {account.this_month_usage} / {account.searches_per_month}；重置日 {account.renewal_date or '-'}。"},
+            )
 
     async def _fetch_posts(self, profile: dict[str, Any], maximum: int, cursor: str | None = None) -> ActorResult:
         original = str(profile["url"])
@@ -629,17 +658,27 @@ class MonitorService:
             local = datetime.now(tz)
             if local.hour == self.settings.health_hour:
                 key = f"health:{local.date().isoformat()}"
-                profiles = self.db.rows("SELECT name,public_state,last_success_at,next_visit_at,consecutive_failures FROM profiles WHERE enabled=1 ORDER BY id")
+                profiles = self.db.rows("SELECT COALESCE(display_name,name) name,public_state,last_success_at,next_visit_at,consecutive_failures FROM profiles WHERE enabled=1 ORDER BY id")
                 free_gb = __import__("shutil").disk_usage(self.settings.data_dir).free / 1024**3
                 official = self.db.apify_usage_snapshot()
                 used = float(official["used_usd"]) if official else self.settings.monthly_budget_usd - self._remaining_budget()
                 usage_label = "官方" if official else "本地估算"
-                lines = [f"{p['name']}: {p['public_state']} · 最近成功 {p['last_success_at'] or '-'}" for p in profiles]
+                lines = self._health_profile_lines(profiles)
                 self.db.add_event(key, "health", {"title": "每日 08:00 健康摘要", "text": "\n".join(lines) + f"\n磁碟剩餘：{free_gb:.1f} GB\nApify（{usage_label}）：${used:.2f}/${self.settings.monthly_budget_usd:.2f}"})
             try:
                 await asyncio.wait_for(self.stop_event.wait(), timeout=60)
             except TimeoutError:
                 pass
+
+    @staticmethod
+    def _health_profile_lines(profiles: list[dict[str, Any]]) -> list[str]:
+        lines = []
+        for profile in profiles:
+            name = str(profile["name"])
+            if name.startswith("FB-") and name[3:].isdigit():
+                name = "姓名待確認"
+            lines.append(f"{name}: {profile['public_state']} · 最近成功 {profile['last_success_at'] or '-'}")
+        return lines
 
     async def _media_retry_loop(self) -> None:
         while not self.stop_event.is_set():

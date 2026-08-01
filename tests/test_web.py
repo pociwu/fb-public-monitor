@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from fb_monitor.config import load_settings
+from fb_monitor.serpapi import SerpApiAccount
 from fb_monitor.web import create_app
 
 
@@ -29,6 +30,7 @@ def test_dashboard_shows_official_usage_reset_countdown(tmp_path: Path, monkeypa
     monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
     app = create_app(load_settings(config))
     app.state.db.save_apify_usage(4.25, "2026-07-09T00:00:00+00:00", "2026-08-08T23:59:59+00:00")
+    app.state.db.save_serpapi_usage(SerpApiAccount("Free Plan", 250, 40, 210, "2026-08-31", 2, 50))
 
     with TestClient(app) as client:
         dashboard = client.get("/")
@@ -36,6 +38,23 @@ def test_dashboard_shows_official_usage_reset_countdown(tmp_path: Path, monkeypa
         assert "$4.25 / $5.00" in dashboard.text
         assert "重置倒數" in dashboard.text
         assert 'data-cycle-end="2026-08-08T23:59:59+00:00"' in dashboard.text
+        assert "40 / 250" in dashboard.text
+        assert "Free Plan" in dashboard.text
+
+
+def test_dashboard_card_shows_serpapi_profile_details(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text("profiles:\n  - name: FB-100\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n", encoding="utf-8")
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    app = create_app(load_settings(config))
+    details = '{"name":"吳佳欣","url":"https://www.facebook.com/100","profile_intro_text":"公開簡介","followers":"1.2K","current_city":"Taipei","works":[{"title":"Engineer"}],"educations":[{"title":"Example University"}]}'
+    app.state.db.execute("UPDATE profiles SET display_name='吳佳欣',fb_id='100',public_state='public',profile_details_json=? WHERE id=1", (details,))
+
+    with TestClient(app) as client:
+        dashboard = client.get("/")
+        assert dashboard.status_code == 200
+        for expected in ("吳佳欣", "公開簡介", "1.2K", "Taipei", "Engineer", "Example University"):
+            assert expected in dashboard.text
 
 
 def test_profile_cards_render_media_and_thumbnail_cache(tmp_path: Path, monkeypatch):

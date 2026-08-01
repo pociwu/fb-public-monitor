@@ -4,6 +4,7 @@ import pytest
 
 from fb_monitor.apify import ActorResult, MonthlyUsage
 from fb_monitor.config import load_settings
+from fb_monitor.serpapi import SerpApiAccount, SerpApiProfileResult
 from fb_monitor.service import MonitorService, actor_summary_error
 
 
@@ -17,6 +18,14 @@ async def allow_official_usage(service: MonitorService) -> None:
         return MonthlyUsage(1.0, "2026-07-09T00:00:00+00:00", "2026-08-08T23:59:59+00:00")
 
     service.apify.monthly_usage = fake_monthly_usage
+
+    async def fake_serpapi_profile(url):
+        return SerpApiProfileResult(
+            {"id": "100", "name": "Watched", "url": url, "profile_intro_text": "Public profile"},
+            SerpApiAccount("Free Plan", 250, 250, 0, "2026-08-31", 0, 50),
+        )
+
+    service.serpapi.profile = fake_serpapi_profile
 
 
 @pytest.mark.asyncio
@@ -99,7 +108,7 @@ actors:
 
 
 @pytest.mark.asyncio
-async def test_profile_embedded_posts_are_used_only_after_all_retries_are_empty(tmp_path: Path, monkeypatch):
+async def test_serpapi_profile_does_not_replace_empty_apify_posts_with_profile_data(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text(
         """profiles:
@@ -127,8 +136,7 @@ schedule:
 
     service.apify.call = fake_call
     await service.visit_profile(1)
-    post = service.db.row("SELECT external_id FROM entities WHERE kind='post'")
-    assert post["external_id"] == "fallback"
+    assert service.db.row("SELECT external_id FROM entities WHERE kind='post'") is None
     assert service.db.row("SELECT COUNT(*) count FROM actor_runs WHERE category='posts'")["count"] == 2
 
 
@@ -142,3 +150,14 @@ def test_unseenuser_wrapper_is_flattened_to_posts():
     assert [item["id"] for item in result.items] == ["p1"]
     assert result.items[0]["ingest_source"] == "posts_actor_embedded"
     assert result.summary["profiles"][0]["coverageStatus"] == "complete"
+
+
+def test_health_summary_uses_resolved_display_name():
+    lines = MonitorService._health_profile_lines([
+        {"name": "吳佳欣", "public_state": "public", "last_success_at": "2026-08-01T00:00:00+00:00"},
+        {"name": "FB-100027675104517", "public_state": "unknown", "last_success_at": None},
+    ])
+    assert lines == [
+        "吳佳欣: public · 最近成功 2026-08-01T00:00:00+00:00",
+        "姓名待確認: unknown · 最近成功 -",
+    ]

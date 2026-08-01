@@ -68,4 +68,6 @@ def test_legacy_profiles_get_stable_sort_order(tmp_path: Path):
     db = Database(path)
 
     assert db.has_column("profiles", "sort_order")
+    assert db.has_column("profiles", "profile_details_json")
+    assert db.has_column("profiles", "serp_last_checked_at")
     assert [row["sort_order"] for row in db.rows("SELECT sort_order FROM profiles ORDER BY id")] == [4, 9]

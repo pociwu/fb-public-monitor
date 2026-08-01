@@ -7,7 +7,7 @@ from fb_monitor.config import load_settings
 from fb_monitor.service import BudgetExceeded, MonitorService
 
 
-def test_budget_reserves_profile_checks(tmp_path: Path, monkeypatch):
+def test_apify_budget_is_available_to_posts_after_profile_moves_to_serpapi(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text(
         """profiles:
@@ -25,7 +25,7 @@ budget:
     monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
     service = MonitorService(load_settings(config))
     assert service._available_for("profile") == 5
-    assert 0 < service._available_for("posts") < 5
+    assert service._available_for("posts") == 5
 
 
 @pytest.mark.asyncio

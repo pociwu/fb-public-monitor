@@ -50,14 +50,22 @@ def comment_dedupe_key(item: dict[str, Any], parent_external_id: str | None) -> 
 def monitored_projection(item: dict[str, Any], kind: str, refs: list[MediaRef]) -> dict[str, Any]:
     """Only fields whose change is meaningful enough to notify about."""
     author = first(item, ("authorName", "author_name", "name", "profileName", "source_profile_name")) or ""
-    text = first(item, ("raw_text", "text", "message", "postText", "description", "caption", "bio", "about")) or ""
+    text = first(item, ("raw_text", "text", "message", "postText", "description", "caption", "bio", "about", "profile_intro_text")) or ""
     published = display_time(first(item, ("created_at", "date", "timestamp", "publishTime", "time")))
     if kind == "profile":
         author = profile_display_name(item)
-    return {
+    projection = {
         "authorName": normalize_text(author), "text": normalize_text(text), "publishTime": published,
         "attachments": sorted({(ref.role, normalize_url(ref.url)) for ref in refs}),
     }
+    if kind == "profile":
+        projection["profileDetails"] = stable_projection({
+            key: item.get(key) for key in (
+                "alternate_name", "verified", "followers", "following", "likes", "profile_type",
+                "category", "current_city", "hometown", "relationship", "educations", "works", "about_details",
+            ) if item.get(key) not in (None, "", [], {})
+        })
+    return projection
 
 
 def safe_part(value: str) -> str:
@@ -67,7 +75,7 @@ def safe_part(value: str) -> str:
 def markdown_for(item: dict[str, Any], kind: str) -> str:
     title = profile_display_name(item) if kind == "profile" else first(item, ("name", "profileName", "source_profile_name", "postTitle", "authorName"))
     title = title or kind.title()
-    text = first(item, ("raw_text", "text", "message", "postText", "description")) or ""
+    text = first(item, ("raw_text", "text", "message", "postText", "description", "profile_intro_text")) or ""
     url = first(item, URL_KEYS[kind]) or ""
     date = first(item, ("created_at", "date", "timestamp", "publishTime")) or ""
     return f"# {normalize_text(title)}\n\n- 類型：{kind}\n- 時間：{date}\n- 來源：{url}\n\n{normalize_text(text)}\n"
@@ -95,7 +103,7 @@ def _event_payload(db: Database, profile_id: int, kind: str, change_type: str, i
     display = display or profile.get("display_name") or profile.get("name") or f"Facebook {profile.get('fb_id') or profile_id}"
     labels = {"created": "新增", "updated": "更新", "restored": "恢復"}
     label = labels.get(change_type, change_type)
-    text = normalize_text(str(first(item, ("raw_text", "text", "message", "postText", "description", "bio", "about")) or ""))
+    text = normalize_text(str(first(item, ("raw_text", "text", "message", "postText", "description", "bio", "about", "profile_intro_text")) or ""))
     published = display_time(first(item, ("created_at", "date", "timestamp", "publishTime", "time")))
     roles = {ref.role for ref in media}
     if kind == "profile":

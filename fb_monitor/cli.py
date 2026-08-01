@@ -37,7 +37,7 @@ def main() -> None:
     elif args.command == "status":
         profiles = db.rows("SELECT id,name,display_name,fb_id,public_state,last_success_at,next_visit_at,consecutive_failures,last_error FROM profiles ORDER BY id")
         month = datetime.now(UTC).strftime("%Y-%m")
-        print(json.dumps({"profiles": profiles, "apify_official_usage": db.apify_usage_snapshot(), "apify_month": month, "apify_estimated_usd": db.usage_total(month)}, ensure_ascii=False, indent=2))
+        print(json.dumps({"profiles": profiles, "serpapi_usage": db.serpapi_usage_snapshot(), "apify_official_usage": db.apify_usage_snapshot(), "apify_month": month, "apify_estimated_usd": db.usage_total(month)}, ensure_ascii=False, indent=2))
     elif args.command == "diagnose":
         profile = None
         if args.profile:
