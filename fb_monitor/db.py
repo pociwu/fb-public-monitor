@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS profiles (
   fb_id TEXT, display_name TEXT, public_state TEXT NOT NULL DEFAULT 'unknown', missing_successes INTEGER NOT NULL DEFAULT 0,
   last_attempt_at TEXT, last_success_at TEXT, next_visit_at TEXT, last_full_audit_at TEXT,
   backfill_cursor TEXT, backfill_done INTEGER NOT NULL DEFAULT 0, audit_cursor TEXT, audit_token TEXT,
-  consecutive_failures INTEGER NOT NULL DEFAULT 0, sort_order INTEGER,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0, sort_order INTEGER, last_manual_visit_at TEXT,
   last_error TEXT, profile_details_json TEXT, serp_last_checked_at TEXT,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
@@ -144,6 +144,8 @@ class Database:
                     conn.execute(f"ALTER TABLE profiles ADD COLUMN {name} TEXT")
             if "sort_order" not in columns:
                 conn.execute("ALTER TABLE profiles ADD COLUMN sort_order INTEGER")
+            if "last_manual_visit_at" not in columns:
+                conn.execute("ALTER TABLE profiles ADD COLUMN last_manual_visit_at TEXT")
             conn.execute("UPDATE profiles SET sort_order=id WHERE sort_order IS NULL")
             entity_columns = {row[1] for row in conn.execute("PRAGMA table_info(entities)")}
             if "dedupe_key" not in entity_columns:
@@ -234,7 +236,7 @@ class Database:
                     (profile_id,),
                 ).fetchone()
                 if pending:
-                    conn.execute("UPDATE jobs SET priority=0,available_at=? WHERE id=?", (now, pending["id"]))
+                    conn.execute("UPDATE jobs SET priority=MIN(priority,0),available_at=? WHERE id=?", (now, pending["id"]))
                 else:
                     conn.execute(
                         "INSERT INTO jobs(profile_id,job_type,priority,payload_json,available_at,created_at) VALUES(?,'visit',0,'{}',?,?)",
@@ -242,6 +244,41 @@ class Database:
                     )
                 queued += 1
         return queued
+
+    def queue_manual_visit(self, profile_id: int, cooldown_minutes: int = 10) -> tuple[bool, datetime]:
+        now = datetime.now(UTC)
+        with self.connect() as conn:
+            profile = conn.execute("SELECT last_manual_visit_at FROM profiles WHERE id=? AND enabled=1", (profile_id,)).fetchone()
+            if not profile:
+                raise ValueError("找不到啟用中的監控帳號")
+            if profile["last_manual_visit_at"]:
+                try:
+                    last = datetime.fromisoformat(str(profile["last_manual_visit_at"]))
+                    if last.tzinfo is None:
+                        last = last.replace(tzinfo=UTC)
+                    available = last + timedelta(minutes=cooldown_minutes)
+                    if available > now:
+                        return False, available
+                except ValueError:
+                    pass
+            now_text = now.isoformat()
+            pending = conn.execute(
+                "SELECT id FROM jobs WHERE profile_id=? AND job_type='visit' AND status='pending' ORDER BY id LIMIT 1",
+                (profile_id,),
+            ).fetchone()
+            payload = json.dumps({"manual": True}, separators=(",", ":"))
+            if pending:
+                conn.execute(
+                    "UPDATE jobs SET priority=-100,available_at=?,payload_json=? WHERE id=?",
+                    (now_text, payload, pending["id"]),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO jobs(profile_id,job_type,priority,payload_json,available_at,created_at) VALUES(?,'visit',-100,?,?,?)",
+                    (profile_id, payload, now_text, now_text),
+                )
+            conn.execute("UPDATE profiles SET last_manual_visit_at=?,updated_at=? WHERE id=?", (now_text, now_text, profile_id))
+            return True, now + timedelta(minutes=cooldown_minutes)
 
     def rows(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         with self.connect() as conn:

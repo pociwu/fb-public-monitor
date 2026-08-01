@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import threading
+from datetime import datetime, timedelta
 from difflib import unified_diff
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -24,6 +25,7 @@ from .timeutil import display_time, parse_time
 
 PACKAGE = Path(__file__).parent
 templates = Jinja2Templates(directory=str(PACKAGE / "templates"))
+MANUAL_VISIT_COOLDOWN_MINUTES = 10
 
 
 def _json(value: str | None) -> Any:
@@ -143,6 +145,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         for profile in profiles:
             profile["last_success_display"] = display_time(profile.get("last_success_at"), cfg.timezone)
             profile["next_visit_display"] = display_time(profile.get("next_visit_at"), cfg.timezone)
+            profile["manual_available_at"] = ""
+            if profile.get("last_manual_visit_at"):
+                try:
+                    manual_at = parse_time(profile["last_manual_visit_at"])
+                    available_at = manual_at + timedelta(minutes=MANUAL_VISIT_COOLDOWN_MINUTES) if manual_at else None
+                    if available_at and available_at > datetime.now(available_at.tzinfo):
+                        profile["manual_available_at"] = available_at.isoformat()
+                except (TypeError, ValueError):
+                    pass
             configured_id = profile_id_from_url(str(profile["url"]))
             stored_id = str(profile.get("fb_id") or "")
             profile["display_fb_id"] = next((value for value in (configured_id, stored_id) if value.isdigit()), "")
@@ -234,8 +245,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         profile = db.row("SELECT id FROM profiles WHERE id=? AND enabled=1", (profile_id,))
         if not profile:
             raise HTTPException(404)
-        db.queue_profile_visits([profile_id])
-        return RedirectResponse(url="/", status_code=303)
+        queued, available_at = db.queue_manual_visit(profile_id, MANUAL_VISIT_COOLDOWN_MINUTES)
+        if not queued:
+            message = f"此帳號仍在立即拜訪冷卻時間內，可再次執行：{display_time(available_at.isoformat(), cfg.timezone)}"
+            return RedirectResponse(url=f"/?error={quote(message)}", status_code=303)
+        return RedirectResponse(url=f"/?notice={quote('已排入立即拜訪，將於目前工作完成後執行')}", status_code=303)
 
     @app.post("/profiles/{profile_id}/remove")
     def remove_profile(request: Request, profile_id: int):

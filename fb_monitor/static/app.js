@@ -85,6 +85,25 @@
     });
   }
 
+  function updateManualCooldowns(root = document) {
+    root.querySelectorAll("[data-manual-cooldown]").forEach((button) => {
+      const availableAt = Date.parse(button.dataset.manualCooldown);
+      const label = button.querySelector("[data-manual-label]");
+      if (!Number.isFinite(availableAt)) return;
+      const remainingSeconds = Math.max(0, Math.ceil((availableAt - Date.now()) / 1000));
+      if (remainingSeconds === 0) {
+        button.disabled = false;
+        button.removeAttribute("data-manual-cooldown");
+        if (label) label.textContent = "立即拜訪";
+        return;
+      }
+      button.disabled = true;
+      const minutes = Math.floor(remainingSeconds / 60);
+      const seconds = remainingSeconds % 60;
+      if (label) label.textContent = `冷卻 ${minutes}:${String(seconds).padStart(2, "0")}`;
+    });
+  }
+
   function initProfileSorting(root = document) {
     const containers = [];
     if (root.matches?.("[data-profile-cards]")) containers.push(root);
@@ -187,11 +206,16 @@
     initExpandable(event.target);
     initProfileSorting(event.target);
     updateUsageCountdowns(event.target);
+    updateManualCooldowns(event.target);
   });
   window.addEventListener("load", () => {
     initExpandable();
     initProfileSorting();
     updateUsageCountdowns();
-    window.setInterval(() => updateUsageCountdowns(), 1000);
+    updateManualCooldowns();
+    window.setInterval(() => {
+      updateUsageCountdowns();
+      updateManualCooldowns();
+    }, 1000);
   });
 })();

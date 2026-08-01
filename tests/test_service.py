@@ -208,3 +208,40 @@ schedule:
     assert profile["serp_last_checked_at"] is not None
     assert '"profile_data_source": "Bright Data"' in profile["profile_details_json"]
     assert service.db.row("SELECT COUNT(*) count FROM events WHERE event_type='brightdata_fallback'")["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_visit_bypasses_global_spacing(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """profiles:
+  - name: watched
+    url: https://facebook.com/100
+storage:
+  data_dir: data
+schedule:
+  spacing_min_minutes: 30
+  spacing_max_minutes: 30
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    service = MonitorService(load_settings(config))
+    service.db.execute("DELETE FROM jobs")
+    now = __import__("datetime").datetime.now(__import__("datetime").UTC).isoformat()
+    service.db.execute(
+        """INSERT INTO jobs(profile_id,job_type,priority,status,payload_json,available_at,attempts,created_at,started_at,finished_at)
+        VALUES(1,'visit',10,'done','{}',?,1,?,?,?)""",
+        (now, now, now, now),
+    )
+    queued, _ = service.db.queue_manual_visit(1)
+    assert queued is True
+    called = []
+
+    async def fake_visit(profile_id):
+        called.append(profile_id)
+
+    service.visit_profile = fake_visit
+    await service._run_next_job()
+    assert called == [1]
+    assert service.db.row("SELECT status FROM jobs WHERE priority=-100")["status"] == "done"

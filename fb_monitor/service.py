@@ -183,8 +183,13 @@ class MonitorService:
         job = self.db.row("SELECT * FROM jobs WHERE status='pending' AND available_at<=? ORDER BY priority,id LIMIT 1", (utcnow(),))
         if not job:
             return
+        try:
+            job_payload = json.loads(job.get("payload_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            job_payload = {}
+        is_manual_visit = isinstance(job_payload, dict) and job["job_type"] == "visit" and job_payload.get("manual") is True
         last = self.db.row("SELECT started_at FROM jobs WHERE profile_id IS NOT NULL AND started_at IS NOT NULL AND id<>? ORDER BY started_at DESC LIMIT 1", (job["id"],))
-        if job["profile_id"] is not None and last and last["started_at"]:
+        if not is_manual_visit and job["profile_id"] is not None and last and last["started_at"]:
             earliest = datetime.fromisoformat(last["started_at"]) + timedelta(minutes=random.uniform(self.settings.spacing_min_minutes, self.settings.spacing_max_minutes))
             if earliest > datetime.now(UTC):
                 self.db.execute("UPDATE jobs SET available_at=? WHERE id=?", (earliest.isoformat(), job["id"]))

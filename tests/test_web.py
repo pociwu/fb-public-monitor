@@ -181,10 +181,23 @@ storage:
         single = client.post("/profiles/1/scan", follow_redirects=False)
         assert single.status_code == 303
         assert db.row("SELECT COUNT(*) count FROM jobs WHERE job_type='visit' AND status='pending'")["count"] == 1
+        manual_job = db.row("SELECT * FROM jobs WHERE profile_id=1 AND job_type='visit' AND status='pending'")
+        assert manual_job["priority"] == -100
+        assert '"manual":true' in manual_job["payload_json"]
+        assert db.row("SELECT last_manual_visit_at FROM profiles WHERE id=1")["last_manual_visit_at"] is not None
+
+        cooling_dashboard = client.get("/")
+        assert 'data-manual-cooldown=' in cooling_dashboard.text
+        assert "冷卻中" in cooling_dashboard.text
+        repeated = client.post("/profiles/1/scan", follow_redirects=False)
+        assert repeated.status_code == 303
+        assert "error=" in repeated.headers["location"]
+        assert db.row("SELECT COUNT(*) count FROM jobs WHERE profile_id=1 AND job_type='visit' AND status='pending'")["count"] == 1
 
         all_profiles = client.post("/profiles/scan-all", follow_redirects=False)
         assert all_profiles.status_code == 303
         assert db.row("SELECT COUNT(*) count FROM jobs WHERE job_type='visit' AND status='pending'")["count"] == 2
+        assert db.row("SELECT priority FROM jobs WHERE profile_id=1 AND status='pending'")["priority"] == -100
 
 
 def test_dashboard_can_add_and_remove_validated_profile_urls(tmp_path: Path, monkeypatch):

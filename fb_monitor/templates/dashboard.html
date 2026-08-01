@@ -35,7 +35,7 @@
   <div class="card-admin-actions">
     <a class="button secondary" href="/profiles/{{ p.id }}">查看資料</a>
     <button class="button secondary" type="button" data-copy-profile>複製內容</button>
-    <form method="post" action="/profiles/{{ p.id }}/scan" onsubmit="return confirm('立即排程拜訪 {{ p.display_name or p.name }}？')"><button class="button secondary" type="submit">立即拜訪</button></form>
+    <form method="post" action="/profiles/{{ p.id }}/scan" onsubmit="return confirm('立即執行拜訪 {{ p.display_name or p.name }}？同一帳號 10 分鐘內不可重複執行。')"><button class="button secondary" type="submit"{% if p.manual_available_at %} disabled data-manual-cooldown="{{ p.manual_available_at }}"{% endif %}><span data-manual-label>{% if p.manual_available_at %}冷卻中{% else %}立即拜訪{% endif %}</span></button></form>
     <form method="post" action="/profiles/{{ p.id }}/remove" onsubmit="return confirm('停止監控 {{ p.display_name or p.name }}？歷史貼文與留言會保留。')"><button class="button danger" type="submit">移除</button></form>
   </div>
 </div>{% endfor %}</div></section>
