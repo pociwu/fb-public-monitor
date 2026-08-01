@@ -125,7 +125,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.mount("/static", StaticFiles(directory=str(PACKAGE / "static")), name="static")
 
     @app.get("/")
-    async def dashboard(request: Request, notice: str = "", error: str = ""):
+    def dashboard(request: Request, notice: str = "", error: str = ""):
         db: Database = request.app.state.db
         profiles = db.rows("""SELECT p.*,
             (SELECT COUNT(*) FROM entities e WHERE e.profile_id=p.id AND e.kind='post') post_count,
@@ -185,14 +185,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         monitored = db.row("SELECT COUNT(*) count FROM profiles WHERE enabled=1")
         official_usage = db.apify_usage_snapshot()
         serpapi_usage = db.serpapi_usage_snapshot()
-        brightdata_balance = await service.refresh_brightdata_balance()
         if official_usage:
             official_usage["cycle_start_display"] = display_time(official_usage.get("cycle_start_at"), cfg.timezone)
             official_usage["cycle_end_display"] = display_time(official_usage.get("cycle_end_at"), cfg.timezone)
             official_usage["fetched_display"] = display_time(official_usage.get("fetched_at"), cfg.timezone)
-        if brightdata_balance:
-            brightdata_balance["fetched_display"] = display_time(brightdata_balance.get("fetched_at"), cfg.timezone)
-        return templates.TemplateResponse(request, "dashboard.html", {"profiles": profiles, "usage": usage, "official_usage": official_usage, "serpapi_usage": serpapi_usage, "brightdata_balance": brightdata_balance, "brightdata_configured": bool(cfg.brightdata_api_token), "pending": pending, "outbox": outbox, "outbox_counts": outbox_counts, "outbox_rows": outbox_rows, "maintenance_runs": maintenance_runs, "media": media, "budget": cfg.monthly_budget_usd, "monitored": monitored, "max_profiles": MAX_PROFILES, "notice": notice, "error": error})
+        return templates.TemplateResponse(request, "dashboard.html", {"profiles": profiles, "usage": usage, "official_usage": official_usage, "serpapi_usage": serpapi_usage, "pending": pending, "outbox": outbox, "outbox_counts": outbox_counts, "outbox_rows": outbox_rows, "maintenance_runs": maintenance_runs, "media": media, "budget": cfg.monthly_budget_usd, "monitored": monitored, "max_profiles": MAX_PROFILES, "notice": notice, "error": error})
 
     @app.post("/profiles")
     async def add_profile(request: Request):

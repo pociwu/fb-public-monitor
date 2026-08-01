@@ -42,19 +42,3 @@ async def test_profile_uses_official_dataset_and_bearer_token(monkeypatch):
 async def test_profile_requires_token():
     with pytest.raises(BrightDataError, match="BRIGHTDATA_API_TOKEN"):
         await BrightDataGateway("").profile("https://www.facebook.com/123")
-
-
-@pytest.mark.asyncio
-async def test_balance_uses_official_account_endpoint(monkeypatch):
-    seen = {}
-
-    async def fake_get(self, url, **kwargs):
-        seen.update(url=url, **kwargs)
-        return httpx.Response(200, json={"balance": 1.75, "pending_balance": 0.25})
-
-    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
-    result = await BrightDataGateway("secret").balance()
-    assert result.balance == 1.75
-    assert result.pending_balance == 0.25
-    assert seen["url"] == "https://api.brightdata.com/customer/balance"
-    assert seen["headers"]["Authorization"] == "Bearer secret"

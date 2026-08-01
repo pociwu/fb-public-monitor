@@ -85,10 +85,6 @@ CREATE TABLE IF NOT EXISTS serpapi_usage_snapshot (
   this_hour_searches INTEGER NOT NULL, rate_limit_per_hour INTEGER NOT NULL,
   fetched_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS brightdata_balance_snapshot (
-  id INTEGER PRIMARY KEY CHECK(id=1), balance REAL, pending_balance REAL,
-  error TEXT, fetched_at TEXT NOT NULL
-);
 CREATE TABLE IF NOT EXISTS audit_seen (
   profile_id INTEGER NOT NULL REFERENCES profiles(id), audit_token TEXT NOT NULL,
   kind TEXT NOT NULL, external_id TEXT NOT NULL,
@@ -385,17 +381,6 @@ class Database:
 
     def serpapi_usage_snapshot(self) -> dict[str, Any] | None:
         return self.row("SELECT * FROM serpapi_usage_snapshot WHERE id=1")
-
-    def save_brightdata_balance(self, balance: float | None, pending_balance: float | None, error: str | None = None) -> None:
-        self.execute(
-            """INSERT INTO brightdata_balance_snapshot(id,balance,pending_balance,error,fetched_at)
-            VALUES(1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET balance=excluded.balance,
-            pending_balance=excluded.pending_balance,error=excluded.error,fetched_at=excluded.fetched_at""",
-            (balance, pending_balance, error, utcnow()),
-        )
-
-    def brightdata_balance_snapshot(self) -> dict[str, Any] | None:
-        return self.row("SELECT balance,pending_balance,error,fetched_at FROM brightdata_balance_snapshot WHERE id=1")
 
     def migration_applied(self, name: str) -> bool:
         return self.row("SELECT name FROM schema_migrations WHERE name=?", (name,)) is not None

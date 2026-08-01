@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -10,40 +9,12 @@ class BrightDataError(RuntimeError):
     pass
 
 
-@dataclass(slots=True)
-class BrightDataBalance:
-    balance: float
-    pending_balance: float
-
-
 class BrightDataGateway:
     API_URL = "https://api.brightdata.com/datasets/v3/scrape"
 
     def __init__(self, api_token: str, dataset_id: str = "gd_mf0urb782734ik94dz"):
         self.api_token = api_token
         self.dataset_id = dataset_id
-
-    async def balance(self) -> BrightDataBalance:
-        if not self.api_token:
-            raise BrightDataError("BRIGHTDATA_API_TOKEN 未設定")
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.get(
-                    "https://api.brightdata.com/customer/balance",
-                    headers={"Authorization": f"Bearer {self.api_token}"},
-                )
-        except httpx.RequestError as exc:
-            raise BrightDataError(f"Bright Data 餘額查詢連線失敗：{exc.__class__.__name__}") from exc
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise BrightDataError(f"Bright Data 餘額回傳非 JSON 資料（HTTP {response.status_code}）") from exc
-        if response.status_code >= 400:
-            message = data.get("error") if isinstance(data, dict) else None
-            raise BrightDataError(str(message or f"Bright Data 餘額查詢 HTTP {response.status_code}"))
-        if not isinstance(data, dict) or not isinstance(data.get("balance"), (int, float)):
-            raise BrightDataError("Bright Data 餘額回傳格式不正確")
-        return BrightDataBalance(float(data["balance"]), float(data.get("pending_balance") or 0))
 
     async def profile(self, profile_url: str) -> dict[str, Any]:
         if not self.api_token:

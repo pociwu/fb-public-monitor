@@ -69,7 +69,6 @@ class MonitorService:
         )
         self.stop_event = asyncio.Event()
         self._maintenance_lock = asyncio.Lock()
-        self._brightdata_balance_lock = asyncio.Lock()
         self._config_mtime = settings.config_path.stat().st_mtime
 
     async def start(self) -> None:
@@ -449,7 +448,6 @@ class MonitorService:
     async def _try_brightdata_fallback(self, profile: dict[str, Any], primary_error: str) -> bool:
         if not self.settings.brightdata_api_token:
             return False
-        await self.refresh_brightdata_balance()
         try:
             item = await self.brightdata.profile(str(profile["url"]))
             await self._store_profile_details(profile, item)
@@ -469,42 +467,6 @@ class MonitorService:
             int(profile["id"]),
         )
         return True
-
-    async def refresh_brightdata_balance(self, force: bool = False) -> dict[str, Any] | None:
-        """Refresh the official monetary balance, capped at once per 15 minutes."""
-        if not self.settings.brightdata_api_token:
-            return None
-        snapshot = self.db.brightdata_balance_snapshot()
-        if not force and snapshot and snapshot.get("fetched_at"):
-            try:
-                fetched = datetime.fromisoformat(str(snapshot["fetched_at"]))
-                if fetched.tzinfo is None:
-                    fetched = fetched.replace(tzinfo=UTC)
-                if datetime.now(UTC) - fetched < timedelta(minutes=15):
-                    return snapshot
-            except ValueError:
-                pass
-        async with self._brightdata_balance_lock:
-            snapshot = self.db.brightdata_balance_snapshot()
-            if not force and snapshot and snapshot.get("fetched_at"):
-                try:
-                    fetched = datetime.fromisoformat(str(snapshot["fetched_at"]))
-                    if fetched.tzinfo is None:
-                        fetched = fetched.replace(tzinfo=UTC)
-                    if datetime.now(UTC) - fetched < timedelta(minutes=15):
-                        return snapshot
-                except ValueError:
-                    pass
-            try:
-                official = await self.brightdata.balance()
-                self.db.save_brightdata_balance(official.balance, official.pending_balance)
-            except BrightDataError as exc:
-                self.db.save_brightdata_balance(
-                    float(snapshot["balance"]) if snapshot and snapshot.get("balance") is not None else None,
-                    float(snapshot["pending_balance"]) if snapshot and snapshot.get("pending_balance") is not None else None,
-                    str(exc)[:1000],
-                )
-            return self.db.brightdata_balance_snapshot()
 
     async def _store_profile_details(self, profile: dict[str, Any], item: dict[str, Any]) -> None:
         previous_state = str(profile.get("public_state") or "unknown")
