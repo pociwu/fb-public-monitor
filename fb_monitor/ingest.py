@@ -9,7 +9,7 @@ from typing import Any
 from .db import Database, utcnow
 from .media import MediaRef, MediaStore, extract_media
 from .normalize import content_hash, normalize_text, normalize_url, stable_projection
-from .timeutil import display_time
+from .timeutil import display_time, telegram_time
 
 
 ID_KEYS = {
@@ -104,7 +104,7 @@ def _event_payload(db: Database, profile_id: int, kind: str, change_type: str, i
     labels = {"created": "新增", "updated": "更新", "restored": "恢復"}
     label = labels.get(change_type, change_type)
     text = normalize_text(str(first(item, ("raw_text", "text", "message", "postText", "description", "bio", "about", "profile_intro_text")) or ""))
-    published = display_time(first(item, ("created_at", "date", "timestamp", "publishTime", "time")))
+    published = telegram_time(first(item, ("created_at", "date", "timestamp", "publishTime", "time")))
     roles = {ref.role for ref in media}
     if kind == "profile":
         changes = []

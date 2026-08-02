@@ -18,6 +18,7 @@ from .ingest import Ingester, external_id
 from .media import MediaStore
 from .telegram import TelegramSender
 from .serpapi import SerpApiError, SerpApiGateway, SerpApiQuotaExceeded, profile_id_from_url
+from .timeutil import telegram_time
 
 log = logging.getLogger(__name__)
 PRICES = {"profile": 5.40 / 1000, "posts": 4.99 / 1000, "comments": 1.40 / 1000}
@@ -705,7 +706,7 @@ class MonitorService:
                 official = self.db.apify_usage_snapshot()
                 used = float(official["used_usd"]) if official else self.settings.monthly_budget_usd - self._remaining_budget()
                 usage_label = "官方" if official else "本地估算"
-                lines = self._health_profile_lines(profiles)
+                lines = self._health_profile_lines(profiles, self.settings.timezone)
                 self.db.add_event(key, "health", {"title": "每日 08:00 健康摘要", "text": "\n".join(lines) + f"\n磁碟剩餘：{free_gb:.1f} GB\nApify（{usage_label}）：${used:.2f}/${self.settings.monthly_budget_usd:.2f}"})
             try:
                 await asyncio.wait_for(self.stop_event.wait(), timeout=60)
@@ -713,13 +714,14 @@ class MonitorService:
                 pass
 
     @staticmethod
-    def _health_profile_lines(profiles: list[dict[str, Any]]) -> list[str]:
+    def _health_profile_lines(profiles: list[dict[str, Any]], timezone: str = "Asia/Taipei") -> list[str]:
         lines = []
         for profile in profiles:
             name = str(profile["name"])
             if name.startswith("FB-") and name[3:].isdigit():
                 name = "姓名待確認"
-            lines.append(f"{name}: {profile['public_state']} · 最近成功 {profile['last_success_at'] or '-'}")
+            last_success = telegram_time(profile.get("last_success_at"), timezone)
+            lines.append(f"{name}: {profile['public_state']} · 最近成功 {last_success}")
         return lines
 
     async def _media_retry_loop(self) -> None:

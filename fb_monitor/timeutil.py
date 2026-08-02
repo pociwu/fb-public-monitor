@@ -32,5 +32,18 @@ def display_time(value: object, timezone: str = "Asia/Taipei") -> str:
     return parsed.astimezone(target).strftime("%Y-%m-%d %H:%M")
 
 
+def telegram_time(value: object, timezone: str = "Asia/Taipei") -> str:
+    """Format a timestamp for Telegram using local time without zero-padded dates."""
+    parsed = parse_time(value)
+    if not parsed:
+        return "-"
+    try:
+        target = ZoneInfo(timezone)
+    except ZoneInfoNotFoundError:
+        target = timezone_module_fallback(timezone)
+    local = parsed.astimezone(target)
+    return f"{local.year}/{local.month}/{local.day} {local:%H:%M}"
+
+
 def timezone_module_fallback(name: str):
     return timezone(timedelta(hours=8), name) if name == "Asia/Taipei" else UTC

@@ -159,7 +159,7 @@ def test_health_summary_uses_resolved_display_name():
         {"name": "FB-100027675104517", "public_state": "unknown", "last_success_at": None},
     ])
     assert lines == [
-        "吳佳欣: public · 最近成功 2026-08-01T00:00:00+00:00",
+        "吳佳欣: public · 最近成功 2026/8/1 08:00",
         "姓名待確認: unknown · 最近成功 -",
     ]
 

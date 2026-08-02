@@ -7,7 +7,7 @@ from fb_monitor.config import load_settings
 from fb_monitor.db import Database
 from fb_monitor.ingest import Ingester
 from fb_monitor.media import MediaStore
-from fb_monitor.timeutil import display_time
+from fb_monitor.timeutil import display_time, telegram_time
 from fb_monitor.web import create_app
 from fb_monitor.apify import ActorResult
 from fb_monitor.service import MonitorService
@@ -47,6 +47,7 @@ async def test_comment_fallback_fingerprint_avoids_actor_id_duplicates(tmp_path:
 
 def test_time_display_and_dashboard_cancel(tmp_path: Path, monkeypatch):
     assert display_time(1760534325) == "2025-10-15 21:18"
+    assert telegram_time("2026-08-02T03:35:59+00:00") == "2026/8/2 11:35"
     config = tmp_path / "config.yaml"
     config.write_text("profiles: []\nstorage:\n  data_dir: data\n", encoding="utf-8")
     monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
