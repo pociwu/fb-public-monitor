@@ -19,6 +19,7 @@ from .facebook_browser import (
     FacebookBrowserError,
     FacebookBrowserGateway,
     FacebookBrowserLoginRequired,
+    is_facebook_ui_heading,
 )
 from .ingest import Ingester, external_id
 from .media import MediaStore
@@ -31,6 +32,7 @@ PRICES = {"profile": 5.40 / 1000, "posts": 4.99 / 1000, "comments": 1.40 / 1000}
 REPAIR_MIGRATION = "schema_media_v2_20260719"
 PROFILE_PIC_MIGRATION = "profile_pic_fields_v3_20260719"
 NOTIFICATION_HYGIENE_MIGRATION = "notification_hygiene_v5_20260723"
+BROWSER_NAME_REPAIR_MIGRATION = "browser_name_heading_v1_20260803"
 
 
 class BudgetExceeded(RuntimeError):
@@ -84,11 +86,28 @@ class MonitorService:
         self._config_mtime = settings.config_path.stat().st_mtime
 
     async def start(self) -> None:
+        self._seed_browser_name_repair()
         self._seed_notification_hygiene()
         self._seed_profile_pic_migration()
         self._seed_upgrade_repair()
         self._seed_initial_jobs()
         await asyncio.gather(self._scheduler_loop(), self._outbox_loop(), self._health_loop(), self._media_retry_loop(), self._daily_media_dedupe_loop())
+
+    def _seed_browser_name_repair(self) -> None:
+        if self.db.migration_applied(BROWSER_NAME_REPAIR_MIGRATION):
+            return
+        repaired = 0
+        for profile in self.db.rows("SELECT id,display_name,profile_details_json FROM profiles WHERE enabled=1"):
+            if "Facebook 直接瀏覽器" not in str(profile.get("profile_details_json") or ""):
+                continue
+            if not is_facebook_ui_heading(profile.get("display_name")):
+                continue
+            profile_id = int(profile["id"])
+            self.db.execute("UPDATE profiles SET display_name=NULL,serp_last_checked_at=NULL WHERE id=?", (profile_id,))
+            if not self.db.row("SELECT id FROM jobs WHERE profile_id=? AND job_type='visit' AND status IN ('pending','running')", (profile_id,)):
+                self._enqueue(profile_id, "visit", -50, datetime.now(UTC))
+            repaired += 1
+        self.db.mark_migration(BROWSER_NAME_REPAIR_MIGRATION, {"profiles_reset": repaired})
 
     def stop(self) -> None:
         self.stop_event.set()

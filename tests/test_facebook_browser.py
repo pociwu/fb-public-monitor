@@ -27,3 +27,19 @@ def test_normalize_browser_profile_extracts_card_fields():
     assert item["works"] == [{"title": "Example Inc."}]
     assert item["photos"] == [{"url": "https://scontent.example.fbcdn.net/photo.jpg"}]
     assert item["profile_data_source"] == "Facebook 直接瀏覽器"
+
+
+def test_normalize_browser_profile_ignores_notification_overlay_heading():
+    item = normalize_browser_profile(
+        {
+            "heading": "通知",
+            "main_heading": "林小華",
+            "headings": ["通知", "林小華"],
+            "og_title": "林小華 | Facebook",
+            "title": "通知 | Facebook",
+            "text": "通知\n林小華\n2,115 位追蹤者\n來自\n台南市",
+            "images": [],
+        },
+        "https://www.facebook.com/100000063131907",
+    )
+    assert item["name"] == "林小華"

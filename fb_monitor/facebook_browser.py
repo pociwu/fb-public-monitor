@@ -20,6 +20,12 @@ class FacebookBrowserChallengeRequired(FacebookBrowserLoginRequired):
     pass
 
 
+_FACEBOOK_UI_HEADINGS = {
+    "facebook", "notifications", "notification", "通知", "menu", "功能表",
+    "search", "搜尋", "chats", "聊天室", "settings & privacy", "設定和隱私權",
+}
+
+
 def _numeric_profile_id(url: str) -> str:
     parsed = urlsplit(url)
     if parsed.path.rstrip("/").lower() == "/profile.php":
@@ -41,16 +47,38 @@ def _first_labeled_value(lines: list[str], labels: tuple[str, ...]) -> str:
     return ""
 
 
+def _clean_name_candidate(value: object) -> str:
+    candidate = re.sub(r"\s*[|\-]‎?\s*Facebook\s*$", "", str(value or ""), flags=re.IGNORECASE).strip()
+    return "" if candidate.casefold() in _FACEBOOK_UI_HEADINGS else candidate
+
+
+def is_facebook_ui_heading(value: object) -> bool:
+    candidate = re.sub(r"\s*[|\-]‎?\s*Facebook\s*$", "", str(value or ""), flags=re.IGNORECASE).strip()
+    return candidate.casefold() in _FACEBOOK_UI_HEADINGS
+
+
+def _name_from_profile_image(images: list[dict[str, Any]]) -> str:
+    patterns = (
+        r"^(?:查看\s*)?(.+?)的(?:個人)?大頭貼(?:照片|照)?$",
+        r"^(.+?)(?:'s|’s) profile picture$",
+    )
+    for image in images:
+        alt = str(image.get("alt") or "").strip()
+        for pattern in patterns:
+            match = re.match(pattern, alt, flags=re.IGNORECASE)
+            if match and (candidate := _clean_name_candidate(match.group(1))):
+                return candidate
+    return ""
+
+
 def normalize_browser_profile(raw: dict[str, Any], profile_url: str) -> dict[str, Any]:
     """Map the rendered Facebook page into the dashboard's profile fields."""
     text = str(raw.get("text") or "")
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    title = str(raw.get("heading") or raw.get("og_title") or raw.get("title") or "")
-    name = re.sub(r"\s*[|\-]‎?\s*Facebook\s*$", "", title, flags=re.IGNORECASE).strip()
-    if name.casefold() in {"facebook", "log into facebook"}:
-        name = ""
-
     images = [item for item in raw.get("images", []) if isinstance(item, dict) and item.get("src")]
+    headings = raw.get("headings") if isinstance(raw.get("headings"), list) else []
+    name_candidates = [raw.get("main_heading"), raw.get("og_title"), *headings, _name_from_profile_image(images), raw.get("heading"), raw.get("title")]
+    name = next((candidate for value in name_candidates if (candidate := _clean_name_candidate(value))), "")
 
     def image_score(item: dict[str, Any]) -> int:
         return int(item.get("natural_width") or 0) * int(item.get("natural_height") or 0)
@@ -188,6 +216,8 @@ class FacebookBrowserGateway:
                 const text = (document.body?.innerText || '').slice(0, 200000);
                 return {
                     title: document.title || '', heading: document.querySelector('h1')?.innerText || '',
+                    main_heading: document.querySelector('[role="main"] h1, main h1')?.innerText || '',
+                    headings: [...document.querySelectorAll('h1')].map((node) => node.innerText || '').filter(Boolean),
                     og_title: meta('og:title'), og_description: meta('og:description'),
                     og_image: meta('og:image'), og_url: meta('og:url'), text, images,
                     private: /profile is locked|this profile is locked|這份個人檔案已鎖定|已鎖定個人檔案/i.test(text),

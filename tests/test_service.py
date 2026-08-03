@@ -288,6 +288,31 @@ schedule:
     assert service.db.row("SELECT COUNT(*) count FROM events WHERE event_type='facebook_browser_login_required'")["count"] == 1
 
 
+def test_browser_heading_repair_resets_bad_name_and_queues_refresh(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """profiles:
+  - name: FB-100
+    url: https://facebook.com/100
+storage:
+  data_dir: data
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    service = MonitorService(load_settings(config))
+    service.db.execute(
+        "UPDATE profiles SET display_name='通知',serp_last_checked_at='2026-08-03T04:00:00+00:00',profile_details_json=? WHERE id=1",
+        ('{"profile_data_source":"Facebook 直接瀏覽器"}',),
+    )
+
+    service._seed_browser_name_repair()
+
+    profile = service.db.row("SELECT display_name,serp_last_checked_at FROM profiles WHERE id=1")
+    assert profile == {"display_name": None, "serp_last_checked_at": None}
+    assert service.db.row("SELECT COUNT(*) count FROM jobs WHERE profile_id=1 AND job_type='visit' AND priority=-50")["count"] == 1
+
+
 @pytest.mark.asyncio
 async def test_manual_visit_bypasses_global_spacing(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
