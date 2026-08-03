@@ -372,6 +372,57 @@ def test_historical_name_repair_restores_latest_known_name(tmp_path: Path, monke
     assert service.db.row("SELECT display_name FROM profiles WHERE id=1")["display_name"] == "吳佳欣"
 
 
+def test_duplicate_profile_preview_cleanup_deletes_database_file_and_thumbnail(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    service = MonitorService(load_settings(config))
+    entity_id = service.db.execute(
+        """INSERT INTO entities(profile_id,kind,external_id,current_hash,present,first_seen_at,last_seen_at)
+        VALUES(1,'profile','100','current',1,'2026-08-01','2026-08-03')"""
+    )
+    version_id = service.db.execute(
+        """INSERT INTO versions(entity_id,content_hash,normalized_json,raw_path,seen_at,change_type)
+        VALUES(?,?,?,?,?,?)""",
+        (entity_id, "current", '{"authorName":"Alice"}', "current.json", "2026-08-03", "created"),
+    )
+    service.db.execute("UPDATE entities SET current_version_id=? WHERE id=?", (version_id, entity_id))
+    stored = []
+    for sha, source_url, role in (
+        ("a" * 64, "https://scontent.example.fbcdn.net/v/cover.jpg?quality=high", "cover_photo"),
+        ("b" * 64, "https://scontent.example.fbcdn.net/v/cover.jpg?quality=blurred", "image"),
+        ("c" * 64, "https://scontent.example.fbcdn.net/v/photo.jpg", "image"),
+    ):
+        path = service.settings.data_dir / "media" / f"{sha}.jpg"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(sha.encode())
+        media_id = service.db.execute(
+            """INSERT INTO media(sha256,source_url,mime_type,path,status,first_seen_at)
+            VALUES(?,?,?,?,?,?)""",
+            (sha, source_url, "image/jpeg", str(path), "ready", "2026-08-03"),
+        )
+        service.db.execute(
+            "INSERT INTO entity_media(entity_id,version_id,media_id,role,position) VALUES(?,?,?,?,?)",
+            (entity_id, version_id, media_id, role, len(stored)),
+        )
+        stored.append((media_id, path, sha))
+    thumbnail = service.settings.data_dir / "cache" / "thumbnails" / f"{stored[1][2]}-640.webp"
+    thumbnail.parent.mkdir(parents=True, exist_ok=True)
+    thumbnail.write_bytes(b"preview")
+
+    counts = service._purge_duplicate_profile_previews()
+
+    assert counts == {"links_removed": 1, "files_removed": 1}
+    assert service.db.row("SELECT id FROM media WHERE id=?", (stored[1][0],)) is None
+    assert not stored[1][1].exists()
+    assert not thumbnail.exists()
+    assert service.db.row("SELECT id FROM media WHERE id=?", (stored[0][0],)) is not None
+    assert service.db.row("SELECT id FROM media WHERE id=?", (stored[2][0],)) is not None
+
+
 @pytest.mark.asyncio
 async def test_manual_visit_bypasses_global_spacing(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"

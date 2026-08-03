@@ -23,6 +23,7 @@ from .facebook_browser import (
 )
 from .ingest import Ingester, external_id, is_placeholder_profile_name
 from .media import MediaStore
+from .normalize import normalize_url
 from .telegram import TelegramSender
 from .serpapi import SerpApiError, SerpApiGateway, SerpApiQuotaExceeded, profile_id_from_url
 from .timeutil import telegram_time
@@ -89,6 +90,7 @@ class MonitorService:
     async def start(self) -> None:
         self._seed_browser_name_repair()
         self._seed_historical_name_repair()
+        self._purge_duplicate_profile_previews()
         self._seed_notification_hygiene()
         self._seed_profile_pic_migration()
         self._seed_upgrade_repair()
@@ -138,6 +140,61 @@ class MonitorService:
                 self.db.execute("UPDATE profiles SET display_name=? WHERE id=?", (recovered, profile["id"]))
                 repaired += 1
         self.db.mark_migration(HISTORICAL_NAME_REPAIR_MIGRATION, {"profiles_recovered": repaired})
+
+    def _purge_duplicate_profile_previews(self) -> dict[str, int]:
+        """Remove downloaded image previews that duplicate an avatar or cover asset."""
+        rows = self.db.rows(
+            """SELECT e.profile_id,em.entity_id,em.version_id,em.media_id,em.role,
+            m.source_url,m.path,m.sha256
+            FROM entity_media em
+            JOIN entities e ON e.id=em.entity_id
+            JOIN media m ON m.id=em.media_id
+            WHERE e.kind='profile' AND em.role IN ('profile_picture','cover_photo','image')"""
+        )
+        protected_assets: dict[int, set[str]] = {}
+        for row in rows:
+            if row["role"] in {"profile_picture", "cover_photo"}:
+                protected_assets.setdefault(int(row["profile_id"]), set()).add(
+                    normalize_url(str(row["source_url"]))
+                )
+
+        duplicate_links = [
+            row for row in rows
+            if row["role"] == "image"
+            and normalize_url(str(row["source_url"])) in protected_assets.get(int(row["profile_id"]), set())
+        ]
+        counts = {"links_removed": 0, "files_removed": 0}
+        affected_media: dict[int, dict[str, Any]] = {}
+        for row in duplicate_links:
+            self.db.execute(
+                "DELETE FROM entity_media WHERE entity_id=? AND version_id=? AND media_id=? AND role='image'",
+                (row["entity_id"], row["version_id"], row["media_id"]),
+            )
+            counts["links_removed"] += 1
+            affected_media[int(row["media_id"])] = row
+
+        media_root = self.media.root.resolve()
+        thumbnail_root = (self.settings.data_dir / "cache" / "thumbnails").resolve()
+        for media_id, row in affected_media.items():
+            if self.db.row("SELECT 1 present FROM entity_media WHERE media_id=? LIMIT 1", (media_id,)):
+                continue
+            self.db.execute("DELETE FROM media WHERE id=?", (media_id,))
+            path = Path(str(row.get("path") or ""))
+            try:
+                resolved = path.resolve()
+                if path.is_file() and (resolved == media_root or media_root in resolved.parents):
+                    path.unlink()
+                    counts["files_removed"] += 1
+            except OSError:
+                pass
+            sha = str(row.get("sha256") or "")
+            if sha and thumbnail_root.is_dir():
+                for thumbnail in thumbnail_root.glob(f"{sha}-*.webp"):
+                    try:
+                        thumbnail.unlink()
+                    except OSError:
+                        pass
+        return counts
 
     def stop(self) -> None:
         self.stop_event.set()
