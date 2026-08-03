@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from fb_monitor.facebook_browser import FacebookBrowserGateway, normalize_browser_canary_posts, normalize_browser_profile
+from fb_monitor.normalize import normalize_url
 
 
 def test_normalize_browser_profile_extracts_card_fields():
@@ -157,7 +158,7 @@ def test_normalize_browser_profile_combines_primary_name_alias_and_svg_avatar():
     assert item["profile_picture"] == "https://scontent.example.fbcdn.net/v/avatar.jpg"
 
 
-def test_normalize_browser_canary_posts_limits_posts_photos_and_requires_permalink():
+def test_normalize_browser_canary_posts_limits_posts_but_keeps_all_photos():
     raw_posts = [
         {
             "url": f"https://www.facebook.com/example/posts/p{i}?fbclid=tracking",
@@ -175,12 +176,71 @@ def test_normalize_browser_canary_posts_limits_posts_photos_and_requires_permali
     ]
     raw_posts.append({"url": "https://www.facebook.com/example", "text": "not a post"})
 
-    posts = normalize_browser_canary_posts(raw_posts, max_posts=2, max_photos_per_post=9)
+    posts = normalize_browser_canary_posts(raw_posts, max_posts=2)
 
     assert [post["source_post_id"] for post in posts] == ["p0", "p1"]
     assert all(post["ingest_source"] == "facebook_browser_canary" for post in posts)
-    assert all(len(post["images"]) == 9 for post in posts)
+    assert all(len(post["images"]) == 10 for post in posts)
     assert all("fbclid" not in post["source_url"] for post in posts)
+
+
+@pytest.mark.asyncio
+async def test_album_walker_keeps_advancing_until_photo_repeats(tmp_path: Path, monkeypatch):
+    class Response:
+        status = 200
+
+    class Links:
+        async def evaluate_all(self, expression: str):
+            return ["https://www.facebook.com/photo/?fbid=1"]
+
+    class FakePage:
+        def __init__(self):
+            self.visited = []
+
+        async def goto(self, url: str, **kwargs):
+            self.visited.append(url)
+            return Response()
+
+        async def wait_for_timeout(self, milliseconds: int):
+            return None
+
+        def locator(self, selector: str):
+            return Links()
+
+    gateway = FacebookBrowserGateway(True, tmp_path)
+    page = FakePage()
+    viewer = [
+        "https://scontent.example.fbcdn.net/v/photo-b.jpg?token=1",
+        "https://scontent.example.fbcdn.net/v/photo-c.jpg?token=2",
+        "https://scontent.example.fbcdn.net/v/photo-b.jpg?token=3",
+    ]
+    state = {"index": 0}
+
+    async def visible_images(current_page, selector):
+        return ["https://scontent.example.fbcdn.net/v/photo-a.jpg"]
+
+    async def current_viewer_image(current_page):
+        return viewer[state["index"]]
+
+    async def click_next(current_page):
+        state["index"] = min(state["index"] + 1, len(viewer) - 1)
+        return True
+
+    monkeypatch.setattr(gateway, "_large_facebook_images", visible_images)
+    monkeypatch.setattr(gateway, "_largest_viewer_image", current_viewer_image)
+    monkeypatch.setattr(gateway, "_click_next_photo", click_next)
+
+    photos = await gateway._collect_post_album_photos(page, "https://www.facebook.com/example/posts/p1")
+
+    assert page.visited == [
+        "https://www.facebook.com/example/posts/p1",
+        "https://www.facebook.com/photo/?fbid=1",
+    ]
+    assert [normalize_url(url) for url in photos] == [
+        "facebook-cdn:/v/photo-a.jpg",
+        "facebook-cdn:/v/photo-b.jpg",
+        "facebook-cdn:/v/photo-c.jpg",
+    ]
 
 
 @pytest.mark.asyncio

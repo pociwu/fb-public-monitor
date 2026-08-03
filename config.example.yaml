@@ -18,7 +18,6 @@ schedule:
 browser_canary:
   enabled: true
   max_posts: 2
-  max_photos_per_post: 9
   cooldown_hours: 72
 
 storage:

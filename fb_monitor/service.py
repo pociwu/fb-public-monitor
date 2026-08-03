@@ -74,7 +74,6 @@ class MonitorService:
             settings.facebook_browser_data_dir,
             settings.facebook_browser_timeout_seconds,
             settings.browser_canary_max_posts,
-            settings.browser_canary_max_photos_per_post,
         )
         self.media = MediaStore(self.db, settings.data_dir, settings.low_disk_gb, settings.media_retry_days)
         self.ingester = Ingester(self.db, settings.data_dir, self.media)
@@ -605,7 +604,9 @@ class MonitorService:
             )
             profile["browser_canary_last_attempt_at"] = attempted_at
         try:
-            items = cached if cached is not None else await self.facebook_browser.canary_posts(profile_url, str(profile["id"]))
+            # canary_posts reuses cached profile-page parsing, then opens only
+            # the selected permalinks to complete their photo viewers.
+            items = await self.facebook_browser.canary_posts(profile_url, str(profile["id"]))
         except (FacebookBrowserChallengeRequired, FacebookBrowserLoginRequired, FacebookBrowserError) as exc:
             self.db.add_event(
                 f"browser-canary:{profile['id']}:{utcnow()[:13]}:failed",
@@ -624,7 +625,11 @@ class MonitorService:
             "browser_canary",
             {
                 "title": "Chromium 金絲雀補抓完成",
-                "text": f"Apify {api_result_count} 篇；補抓 {len(items)} 篇；{'沿用同頁' if reused_page else '新開頁面'}",
+                "text": (
+                    f"Apify {api_result_count} 篇；補抓 {len(items)} 篇、"
+                    f"{sum(len(item.get('images') or []) for item in items)} 張照片；"
+                    f"{'沿用個人頁解析結果' if reused_page else '重新載入個人頁'}"
+                ),
                 "source_url": profile_url,
             },
             int(profile["id"]),

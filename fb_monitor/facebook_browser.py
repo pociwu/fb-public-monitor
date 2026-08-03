@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import re
 import time
 from pathlib import Path
@@ -199,7 +200,6 @@ def normalize_browser_profile(raw: dict[str, Any], profile_url: str) -> dict[str
 def normalize_browser_canary_posts(
     raw_posts: object,
     max_posts: int = 2,
-    max_photos_per_post: int = 9,
 ) -> list[dict[str, Any]]:
     """Normalize only visible posts that expose a stable Facebook permalink."""
     if not isinstance(raw_posts, list) or max_posts <= 0:
@@ -243,8 +243,6 @@ def normalize_browser_canary_posts(
                 continue
             photos.append({"url": src})
             seen_assets.add(asset)
-            if len(photos) >= max_photos_per_post:
-                break
         item: dict[str, Any] = {
             "source_url": source_url,
             "text": str(raw.get("text") or "")[:8000],
@@ -268,14 +266,13 @@ class FacebookBrowserGateway:
         data_dir: Path,
         timeout_seconds: int = 60,
         canary_max_posts: int = 2,
-        canary_max_photos_per_post: int = 9,
     ):
         self.enabled = enabled
         self.data_dir = data_dir
         self.timeout_ms = max(10, timeout_seconds) * 1000
         self.canary_max_posts = max(0, min(2, canary_max_posts))
-        self.canary_max_photos_per_post = max(0, min(9, canary_max_photos_per_post))
         self._canary_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+        self._expanded_canary_cache: set[str] = set()
 
     def cached_canary_posts(self, profile_url: str, max_age_seconds: int = 600) -> list[dict[str, Any]] | None:
         cached = self._canary_cache.get(profile_url.rstrip("/"))
@@ -285,10 +282,143 @@ class FacebookBrowserGateway:
 
     async def canary_posts(self, profile_url: str, diagnostic_key: str | None = None) -> list[dict[str, Any]]:
         cached = self.cached_canary_posts(profile_url)
-        if cached is not None:
+        cache_key = profile_url.rstrip("/")
+        if cached is None:
+            try:
+                await self.profile(profile_url, diagnostic_key)
+            except FacebookBrowserError:
+                # The profile name may be unparseable even though its rendered
+                # timeline already yielded stable post permalinks.
+                if self.cached_canary_posts(profile_url) is None:
+                    raise
+            cached = self.cached_canary_posts(profile_url) or []
+        if not cached or cache_key in self._expanded_canary_cache:
             return cached
-        await self.profile(profile_url, diagnostic_key)
-        return self.cached_canary_posts(profile_url) or []
+        expanded = await self._expand_canary_albums(cached)
+        self._canary_cache[cache_key] = (time.monotonic(), expanded)
+        self._expanded_canary_cache.add(cache_key)
+        return [dict(post) for post in expanded]
+
+    async def _expand_canary_albums(self, posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Open each selected permalink and walk its photo viewer until it ends."""
+        expanded = [dict(post) for post in posts]
+        async with async_playwright() as playwright:
+            try:
+                context = await playwright.chromium.launch_persistent_context(
+                    str(self.data_dir),
+                    headless=True,
+                    locale="zh-TW",
+                    timezone_id="Asia/Taipei",
+                    viewport={"width": 1365, "height": 900},
+                    args=["--disable-dev-shm-usage"],
+                )
+            except Exception as exc:
+                raise FacebookBrowserError(f"無法啟動 Chromium 相簿補抓：{exc}") from exc
+            try:
+                self._require_login(await context.cookies("https://www.facebook.com"))
+                page = context.pages[0] if context.pages else await context.new_page()
+                for post in expanded:
+                    try:
+                        discovered = await self._collect_post_album_photos(page, str(post.get("source_url") or ""))
+                    except Exception:
+                        discovered = []
+                    images = [item for item in post.get("images") or [] if isinstance(item, dict) and item.get("url")]
+                    seen = {normalize_url(str(item["url"])) for item in images}
+                    for url in discovered:
+                        asset = normalize_url(url)
+                        if asset and asset not in seen:
+                            images.append({"url": url})
+                            seen.add(asset)
+                    if images:
+                        post["images"] = images
+            finally:
+                await context.close()
+        return expanded
+
+    async def _collect_post_album_photos(self, page: Page, post_url: str) -> list[str]:
+        if not post_url:
+            return []
+        response = await page.goto(post_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+        if response and response.status >= 400:
+            raise FacebookBrowserError(f"Facebook 貼文頁面 HTTP {response.status}")
+        await page.wait_for_timeout(round(random.uniform(2200, 3800)))
+        photos = await self._large_facebook_images(page, "[role='main'] [role='article'] img, main [role='article'] img")
+        seen = {normalize_url(url) for url in photos}
+
+        photo_links = await page.locator(
+            "[role='main'] [role='article'] a[href*='/photo'], main [role='article'] a[href*='/photo']"
+        ).evaluate_all("nodes => nodes.map(node => node.href || '').filter(Boolean)")
+        first_photo_url = next((str(url) for url in photo_links if "/photo" in str(url)), "")
+        if not first_photo_url:
+            return photos
+
+        await page.goto(first_photo_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+        await page.wait_for_timeout(round(random.uniform(1800, 3200)))
+        previous_asset = ""
+        viewer_seen: set[str] = set()
+        # This is a loop-safety circuit breaker, not a configured photo limit.
+        # Normal termination is no next button or returning to a seen photo.
+        for _ in range(500):
+            current = await self._largest_viewer_image(page)
+            asset = normalize_url(current)
+            if not current or (asset and asset in viewer_seen):
+                break
+            viewer_seen.add(asset)
+            if asset not in seen:
+                photos.append(current)
+                seen.add(asset)
+            previous_asset = asset
+            if not await self._click_next_photo(page):
+                break
+            changed = False
+            for _ in range(8):
+                await page.wait_for_timeout(round(random.uniform(300, 550)))
+                next_asset = normalize_url(await self._largest_viewer_image(page))
+                if next_asset and next_asset != previous_asset:
+                    changed = True
+                    break
+            if not changed:
+                break
+            await page.wait_for_timeout(round(random.uniform(1200, 2600)))
+        return photos
+
+    @staticmethod
+    async def _large_facebook_images(page: Page, selector: str) -> list[str]:
+        return await page.evaluate(
+            r"""selector => [...document.querySelectorAll(selector)]
+                .map((image) => ({
+                    src: image.currentSrc || image.src || '',
+                    width: image.naturalWidth || image.getBoundingClientRect().width || 0,
+                    height: image.naturalHeight || image.getBoundingClientRect().height || 0,
+                }))
+                .filter((image) => image.src.includes('fbcdn.net') && image.width >= 180 && image.height >= 180)
+                .sort((left, right) => (right.width * right.height) - (left.width * left.height))
+                .map((image) => image.src)""",
+            selector,
+        )
+
+    async def _largest_viewer_image(self, page: Page) -> str:
+        candidates = await self._large_facebook_images(
+            page,
+            "[role='dialog'] img, [role='main'] img, main img",
+        )
+        return candidates[0] if candidates else ""
+
+    @staticmethod
+    async def _click_next_photo(page: Page) -> bool:
+        controls = page.locator(
+            "[aria-label='下一張相片'], [aria-label='Next photo'], "
+            "[aria-label='下一張'], [aria-label='Next']"
+        )
+        for index in range(await controls.count()):
+            control = controls.nth(index)
+            if await control.is_visible():
+                try:
+                    await control.click(timeout=5000)
+                    return True
+                except PlaywrightTimeoutError:
+                    continue
+        return False
 
     async def profile(self, profile_url: str, diagnostic_key: str | None = None) -> dict[str, Any]:
         if not self.enabled:
@@ -418,9 +548,10 @@ class FacebookBrowserGateway:
         canary_posts = normalize_browser_canary_posts(
             raw.get("posts"),
             self.canary_max_posts,
-            self.canary_max_photos_per_post,
         )
-        self._canary_cache[profile_url.rstrip("/")] = (time.monotonic(), canary_posts)
+        cache_key = profile_url.rstrip("/")
+        self._canary_cache[cache_key] = (time.monotonic(), canary_posts)
+        self._expanded_canary_cache.discard(cache_key)
         unavailable = any(marker in folded for marker in ("this content isn't available", "content not found", "這則內容目前無法顯示", "找不到這個頁面"))
         if unavailable or not item.get("name"):
             await self._save_failure(page, diagnostic_key)

@@ -24,7 +24,6 @@ def test_browser_canary_defaults_are_conservative(tmp_path: Path):
 
     assert settings.browser_canary_enabled is True
     assert settings.browser_canary_max_posts == 2
-    assert settings.browser_canary_max_photos_per_post == 9
     assert settings.browser_canary_cooldown_hours == 72
 
 

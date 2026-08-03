@@ -121,7 +121,6 @@ class Settings:
     serpapi_profile_refresh_hours: float = 48
     browser_canary_enabled: bool = True
     browser_canary_max_posts: int = 2
-    browser_canary_max_photos_per_post: int = 9
     browser_canary_cooldown_hours: float = 72
     low_disk_gb: float = 10
     media_retry_days: int = 30
@@ -204,7 +203,6 @@ def load_settings(path: str | Path | None = None) -> Settings:
         serpapi_profile_refresh_hours=float(schedule.get("serpapi_profile_refresh_hours", 48)),
         browser_canary_enabled=bool(browser_canary.get("enabled", True)),
         browser_canary_max_posts=max(0, min(2, int(browser_canary.get("max_posts", 2)))),
-        browser_canary_max_photos_per_post=max(0, min(9, int(browser_canary.get("max_photos_per_post", 9)))),
         browser_canary_cooldown_hours=max(24, float(browser_canary.get("cooldown_hours", 72))),
         low_disk_gb=float(storage.get("low_disk_gb", 10)),
         media_retry_days=int(storage.get("media_retry_days", 30)),
