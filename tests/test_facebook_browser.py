@@ -1,4 +1,8 @@
-from fb_monitor.facebook_browser import normalize_browser_profile
+from pathlib import Path
+
+import pytest
+
+from fb_monitor.facebook_browser import FacebookBrowserGateway, normalize_browser_profile
 
 
 def test_normalize_browser_profile_extracts_card_fields():
@@ -89,3 +93,16 @@ def test_normalize_browser_profile_uses_name_before_combined_follow_summary():
     )
     assert item["name"] == "吳佳蓉"
     assert item["followers"] == "503"
+
+
+@pytest.mark.asyncio
+async def test_browser_capture_is_saved_per_profile(tmp_path: Path):
+    class FakePage:
+        async def screenshot(self, *, path: str, full_page: bool):
+            Path(path).write_bytes(b"png")
+
+    gateway = FacebookBrowserGateway(True, tmp_path)
+    saved = await gateway._save_capture(FakePage(), "profile/1")
+
+    assert saved == tmp_path / "screenshots" / "profile-profile_1.png"
+    assert saved.read_bytes() == b"png"

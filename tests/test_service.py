@@ -238,8 +238,9 @@ schedule:
 
     browser_calls = []
 
-    async def browser_profile(url):
+    async def browser_profile(url, diagnostic_key=None):
         browser_calls.append(url)
+        assert diagnostic_key == "1"
         return {"id": "100", "name": "Alice", "url": url, "profile_data_source": "Facebook 直接瀏覽器"}
 
     service.serpapi.profile = failed_serpapi
@@ -276,7 +277,7 @@ schedule:
     async def failed_serpapi(url):
         raise SerpApiError("no results")
 
-    async def login_required(url):
+    async def login_required(url, diagnostic_key=None):
         raise FacebookBrowserLoginRequired("login required")
 
     service.serpapi.profile = failed_serpapi
@@ -310,7 +311,7 @@ storage:
     service = MonitorService(load_settings(config))
     profile = service.db.row("SELECT * FROM profiles WHERE id=1")
 
-    async def failed_browser(url):
+    async def failed_browser(url, diagnostic_key=None):
         raise FacebookBrowserError("no profile data")
 
     service.facebook_browser.profile = failed_browser

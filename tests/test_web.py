@@ -75,6 +75,42 @@ def test_dashboard_card_shows_serpapi_profile_details(tmp_path: Path, monkeypatc
         assert "data-copy-profile" in dashboard.text
 
 
+def test_profile_card_links_to_latest_browser_screenshot(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """profiles:
+  - name: watched
+    url: https://facebook.com/100
+storage:
+  data_dir: data
+""",
+        encoding="utf-8",
+    )
+    browser_data = tmp_path / "browser-data"
+    screenshot = browser_data / "screenshots" / "profile-1.png"
+    screenshot.parent.mkdir(parents=True)
+    Image.new("RGB", (320, 200), (20, 80, 140)).save(screenshot)
+    monkeypatch.setenv("FACEBOOK_BROWSER_DATA_DIR", str(browser_data))
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    app = create_app(load_settings(config))
+
+    with TestClient(app) as client:
+        dashboard = client.get("/")
+        assert dashboard.status_code == 200
+        assert '瀏覽器擷取畫面' in dashboard.text
+        assert 'href="/profiles/1/browser-screenshot"' in dashboard.text
+
+        profile = client.get("/profiles/1")
+        assert profile.status_code == 200
+        assert '瀏覽器擷取畫面' in profile.text
+
+        capture = client.get("/profiles/1/browser-screenshot")
+        assert capture.status_code == 200
+        assert capture.headers["content-type"] == "image/png"
+        assert capture.headers["cache-control"] == "no-store"
+        assert client.get("/profiles/999/browser-screenshot").status_code == 404
+
+
 def test_profile_cards_render_media_and_thumbnail_cache(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text(

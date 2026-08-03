@@ -77,6 +77,12 @@ def _has_column(db: Database, table: str, column: str) -> bool:
     return column in {str(row["name"]) for row in db.rows(f"PRAGMA table_info({table})")}
 
 
+def _attach_browser_capture(profile: dict[str, Any], cfg: Settings) -> None:
+    path = cfg.facebook_browser_data_dir / "screenshots" / f"profile-{int(profile['id'])}.png"
+    profile["browser_capture_available"] = path.is_file()
+    profile["browser_capture_display"] = display_time(path.stat().st_mtime, cfg.timezone) if path.is_file() else ""
+
+
 def _attach_current_media(db: Database, entities: list[dict[str, Any]]) -> None:
     if not entities:
         return
@@ -143,6 +149,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
              ORDER BY em.version_id DESC,m.id DESC LIMIT 1) cover_media_id
             FROM profiles p WHERE p.enabled=1 ORDER BY COALESCE(p.sort_order,p.id),p.id""")
         for profile in profiles:
+            _attach_browser_capture(profile, cfg)
             profile["last_success_display"] = display_time(profile.get("last_success_at"), cfg.timezone)
             profile["next_visit_display"] = display_time(profile.get("next_visit_at"), cfg.timezone)
             profile["manual_available_at"] = ""
@@ -304,6 +311,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         profile = db.row("SELECT * FROM profiles WHERE id=?", (profile_id,))
         if not profile:
             raise HTTPException(404)
+        _attach_browser_capture(profile, cfg)
         size, offset = 20, (page - 1) * 20
         params: tuple[Any, ...] = (profile_id, kind)
         where = "e.profile_id=? AND e.kind=?"
@@ -336,6 +344,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             entity["published_display"] = display_time(entity.get("published_at"), cfg.timezone)
         _attach_current_media(db, entities)
         return templates.TemplateResponse(request, "profile.html", {"profile": profile, "entities": entities, "kind": kind, "q": q, "media_filter": media_filter, "page": page, "pages": max(1, ((count or {"count": 0})["count"] + size - 1) // size)})
+
+    @app.get("/profiles/{profile_id}/browser-screenshot")
+    def browser_screenshot(request: Request, profile_id: int):
+        db: Database = request.app.state.db
+        if not db.row("SELECT id FROM profiles WHERE id=?", (profile_id,)):
+            raise HTTPException(404)
+        path = cfg.facebook_browser_data_dir / "screenshots" / f"profile-{profile_id}.png"
+        if not path.is_file():
+            raise HTTPException(404, "尚無直接瀏覽器擷取畫面")
+        return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-store"})
 
     @app.get("/entities/{entity_id}")
     def entity_page(request: Request, entity_id: int):

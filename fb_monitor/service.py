@@ -520,7 +520,7 @@ class MonitorService:
             )
             return False
         try:
-            item = await self.facebook_browser.profile(str(profile["url"]))
+            item = await self.facebook_browser.profile(str(profile["url"]), str(profile["id"]))
             await self._store_profile_details(profile, item)
         except FacebookBrowserChallengeRequired as exc:
             day = datetime.now(UTC).date().isoformat()

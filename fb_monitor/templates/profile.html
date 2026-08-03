@@ -2,7 +2,7 @@
 {% block content %}
 <section class="profile-titlebar">
   <div><a href="/">← 返回儀表板</a><h1>{{ profile.display_name or profile.name }}</h1>{% if profile.display_name and profile.display_name != profile.name %}<p class="muted">設定別名：{{ profile.name }}</p>{% endif %}</div>
-  <a class="button secondary" href="{{ profile.url }}" target="_blank" rel="noreferrer">Facebook 來源</a>
+  <div class="panel-actions"><a class="button secondary" href="{{ profile.url }}" target="_blank" rel="noreferrer">Facebook 來源</a>{% if profile.browser_capture_available %}<a class="button secondary" href="/profiles/{{ profile.id }}/browser-screenshot" target="_blank" title="最後擷取：{{ profile.browser_capture_display }}">瀏覽器擷取畫面</a>{% endif %}</div>
 </section>
 <div class="tabs">{% for tab,label in [('post','貼文'),('comment','留言'),('profile','個人檔案')] %}<a class="{% if kind==tab %}active{% endif %}" href="?kind={{tab}}" hx-get="?kind={{tab}}" hx-target="#profile-content" hx-select="#profile-content" hx-swap="outerHTML" hx-push-url="true">{{label}}</a>{% endfor %}</div>
 

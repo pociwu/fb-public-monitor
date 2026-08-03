@@ -172,7 +172,7 @@ class FacebookBrowserGateway:
         self.data_dir = data_dir
         self.timeout_ms = max(10, timeout_seconds) * 1000
 
-    async def profile(self, profile_url: str) -> dict[str, Any]:
+    async def profile(self, profile_url: str, diagnostic_key: str | None = None) -> dict[str, Any]:
         if not self.enabled:
             raise FacebookBrowserError("Facebook 直接瀏覽器備援未啟用")
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -192,11 +192,11 @@ class FacebookBrowserGateway:
                 self._require_login(await context.cookies("https://www.facebook.com"))
                 page = context.pages[0] if context.pages else await context.new_page()
                 try:
-                    return await self._read_profile(page, profile_url)
+                    return await self._read_profile(page, profile_url, diagnostic_key)
                 except FacebookBrowserError:
                     raise
                 except Exception as exc:
-                    await self._save_failure(page)
+                    await self._save_failure(page, diagnostic_key)
                     raise FacebookBrowserError(f"Facebook 頁面解析失敗：{exc.__class__.__name__}") from exc
             finally:
                 await context.close()
@@ -206,26 +206,27 @@ class FacebookBrowserGateway:
         if not any(cookie.get("name") == "c_user" and cookie.get("value") for cookie in cookies):
             raise FacebookBrowserLoginRequired("尚未建立 Facebook 瀏覽器登入狀態")
 
-    async def _read_profile(self, page: Page, profile_url: str) -> dict[str, Any]:
+    async def _read_profile(self, page: Page, profile_url: str, diagnostic_key: str | None) -> dict[str, Any]:
         try:
             response = await page.goto(profile_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
             await page.wait_for_timeout(2500)
         except PlaywrightTimeoutError as exc:
-            await self._save_failure(page)
+            await self._save_failure(page, diagnostic_key)
             raise FacebookBrowserError("Facebook 頁面載入逾時") from exc
+        await self._save_capture(page, diagnostic_key)
         current_url = page.url.casefold()
         body = (await page.locator("body").inner_text(timeout=10_000))[:200_000]
         folded = body.casefold()
         if any(part in current_url for part in ("/checkpoint/", "/challenge/", "/recover/")) or any(
             marker in folded for marker in ("security check", "confirm your identity", "確認你的身分", "安全檢查")
         ):
-            await self._save_failure(page)
+            await self._save_failure(page, diagnostic_key)
             raise FacebookBrowserChallengeRequired("Facebook 要求安全驗證，需重新進行互動式登入")
         if "/login" in current_url or await page.locator("input[name='email'], input[type='password']").count():
-            await self._save_failure(page)
+            await self._save_failure(page, diagnostic_key)
             raise FacebookBrowserLoginRequired("Facebook 登入狀態已失效，需重新進行互動式登入")
         if response and response.status >= 400:
-            await self._save_failure(page)
+            await self._save_failure(page, diagnostic_key)
             raise FacebookBrowserError(f"Facebook 頁面 HTTP {response.status}")
 
         raw = await page.evaluate(
@@ -251,12 +252,28 @@ class FacebookBrowserGateway:
         item = normalize_browser_profile(raw, profile_url)
         unavailable = any(marker in folded for marker in ("this content isn't available", "content not found", "這則內容目前無法顯示", "找不到這個頁面"))
         if unavailable or not item.get("name"):
-            await self._save_failure(page)
+            await self._save_failure(page, diagnostic_key)
             raise FacebookBrowserError("Facebook 直接瀏覽器未取得可用的個人檔案資料")
         return item
 
-    async def _save_failure(self, page: Page) -> None:
+    def screenshot_path(self, diagnostic_key: str) -> Path:
+        safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", diagnostic_key)[:80] or "unknown"
+        return self.data_dir / "screenshots" / f"profile-{safe_key}.png"
+
+    async def _save_capture(self, page: Page, diagnostic_key: str | None) -> Path | None:
+        if not diagnostic_key:
+            return None
+        target = self.screenshot_path(diagnostic_key)
         try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            await page.screenshot(path=str(target), full_page=False)
+            return target
+        except Exception:
+            return None
+
+    async def _save_failure(self, page: Page, diagnostic_key: str | None) -> None:
+        try:
+            await self._save_capture(page, diagnostic_key)
             await page.screenshot(path=str(self.data_dir / "last-failure.png"), full_page=False)
         except Exception:
             pass
