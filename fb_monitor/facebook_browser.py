@@ -199,7 +199,7 @@ def normalize_browser_profile(raw: dict[str, Any], profile_url: str) -> dict[str
 def normalize_browser_canary_posts(
     raw_posts: object,
     max_posts: int = 2,
-    max_photos_per_post: int = 3,
+    max_photos_per_post: int = 9,
 ) -> list[dict[str, Any]]:
     """Normalize only visible posts that expose a stable Facebook permalink."""
     if not isinstance(raw_posts, list) or max_posts <= 0:
@@ -268,13 +268,13 @@ class FacebookBrowserGateway:
         data_dir: Path,
         timeout_seconds: int = 60,
         canary_max_posts: int = 2,
-        canary_max_photos_per_post: int = 3,
+        canary_max_photos_per_post: int = 9,
     ):
         self.enabled = enabled
         self.data_dir = data_dir
         self.timeout_ms = max(10, timeout_seconds) * 1000
         self.canary_max_posts = max(0, min(2, canary_max_posts))
-        self.canary_max_photos_per_post = max(0, min(3, canary_max_photos_per_post))
+        self.canary_max_photos_per_post = max(0, min(9, canary_max_photos_per_post))
         self._canary_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
     def cached_canary_posts(self, profile_url: str, max_age_seconds: int = 600) -> list[dict[str, Any]] | None:
