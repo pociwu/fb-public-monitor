@@ -43,3 +43,32 @@ def test_normalize_browser_profile_ignores_notification_overlay_heading():
         "https://www.facebook.com/100000063131907",
     )
     assert item["name"] == "林小華"
+
+
+def test_normalize_browser_profile_ignores_unread_count_facebook_title():
+    item = normalize_browser_profile(
+        {
+            "heading": "",
+            "main_heading": "",
+            "headings": [],
+            "role_headings": ["謝球球"],
+            "og_title": "(4) Facebook",
+            "title": "(4) Facebook",
+            "text": "首頁\n通知\n謝球球\n446 位朋友\n貼文\n關於",
+            "images": [],
+        },
+        "https://www.facebook.com/100000288843407",
+    )
+    assert item["name"] == "謝球球"
+
+    item_without_role_heading = normalize_browser_profile(
+        {
+            "role_headings": [],
+            "og_title": "(4) Facebook",
+            "title": "(4) Facebook",
+            "text": "首頁\n通知\n謝球球\n446 位朋友\n貼文\n關於",
+            "images": [],
+        },
+        "https://www.facebook.com/100000288843407",
+    )
+    assert item_without_role_heading["name"] == "謝球球"

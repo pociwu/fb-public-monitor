@@ -302,7 +302,7 @@ storage:
     monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
     service = MonitorService(load_settings(config))
     service.db.execute(
-        "UPDATE profiles SET display_name='通知',serp_last_checked_at='2026-08-03T04:00:00+00:00',profile_details_json=? WHERE id=1",
+        "UPDATE profiles SET display_name='(4) Facebook',serp_last_checked_at='2026-08-03T04:00:00+00:00',profile_details_json=? WHERE id=1",
         ('{"profile_data_source":"Facebook 直接瀏覽器"}',),
     )
 

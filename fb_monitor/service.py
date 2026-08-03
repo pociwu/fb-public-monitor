@@ -32,7 +32,7 @@ PRICES = {"profile": 5.40 / 1000, "posts": 4.99 / 1000, "comments": 1.40 / 1000}
 REPAIR_MIGRATION = "schema_media_v2_20260719"
 PROFILE_PIC_MIGRATION = "profile_pic_fields_v3_20260719"
 NOTIFICATION_HYGIENE_MIGRATION = "notification_hygiene_v5_20260723"
-BROWSER_NAME_REPAIR_MIGRATION = "browser_name_heading_v1_20260803"
+BROWSER_NAME_REPAIR_MIGRATION = "browser_name_heading_v2_20260803"
 
 
 class BudgetExceeded(RuntimeError):
