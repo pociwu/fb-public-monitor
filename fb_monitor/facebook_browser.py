@@ -213,10 +213,34 @@ class FacebookBrowserGateway:
         if not any(cookie.get("name") == "c_user" and cookie.get("value") for cookie in cookies):
             raise FacebookBrowserLoginRequired("尚未建立 Facebook 瀏覽器登入狀態")
 
+    async def _wait_for_profile_content(self, page: Page) -> None:
+        """Allow Facebook's client-rendered heading and useful images to settle."""
+        await page.wait_for_timeout(3000)
+        try:
+            await page.wait_for_function(
+                """() => {
+                    const heading = document.querySelector('[role="main"] h1, main h1, h1, [role="heading"][aria-level="1"]');
+                    if (!heading || !(heading.innerText || '').trim()) return false;
+                    const visibleImages = [...document.images].filter((image) => {
+                        const src = image.currentSrc || image.src || '';
+                        const rect = image.getBoundingClientRect();
+                        return src.includes('fbcdn.net') && rect.width > 0 && rect.height > 0;
+                    });
+                    return visibleImages.length === 0 || visibleImages.some(
+                        (image) => image.complete && image.naturalWidth >= 180 && image.naturalHeight >= 180
+                    );
+                }""",
+                timeout=5000,
+            )
+        except PlaywrightTimeoutError:
+            # Continue with best-effort parsing; the overall navigation timeout
+            # and the existing login/challenge checks still govern failure.
+            pass
+
     async def _read_profile(self, page: Page, profile_url: str, diagnostic_key: str | None) -> dict[str, Any]:
         try:
             response = await page.goto(profile_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
-            await page.wait_for_timeout(2500)
+            await self._wait_for_profile_content(page)
         except PlaywrightTimeoutError as exc:
             await self._save_failure(page, diagnostic_key)
             raise FacebookBrowserError("Facebook 頁面載入逾時") from exc

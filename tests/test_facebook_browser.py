@@ -139,3 +139,28 @@ async def test_browser_capture_is_saved_per_profile(tmp_path: Path):
 
     assert saved == tmp_path / "screenshots" / "profile-profile_1.png"
     assert saved.read_bytes() == b"png"
+
+
+@pytest.mark.asyncio
+async def test_browser_waits_for_profile_heading_and_loaded_media(tmp_path: Path):
+    class FakePage:
+        def __init__(self):
+            self.base_wait = 0
+            self.condition_timeout = 0
+            self.condition = ""
+
+        async def wait_for_timeout(self, milliseconds: int):
+            self.base_wait = milliseconds
+
+        async def wait_for_function(self, condition: str, *, timeout: int):
+            self.condition = condition
+            self.condition_timeout = timeout
+
+    page = FakePage()
+    gateway = FacebookBrowserGateway(True, tmp_path)
+
+    await gateway._wait_for_profile_content(page)
+
+    assert page.base_wait == 3000
+    assert page.condition_timeout == 5000
+    assert "naturalWidth >= 180" in page.condition
