@@ -248,6 +248,24 @@ async def test_album_walker_keeps_advancing_until_photo_repeats(tmp_path: Path, 
 
 
 @pytest.mark.asyncio
+async def test_browser_waits_randomly_between_canary_posts(tmp_path: Path, monkeypatch):
+    class FakePage:
+        def __init__(self):
+            self.waits = []
+
+        async def wait_for_timeout(self, milliseconds: int):
+            self.waits.append(milliseconds)
+
+    page = FakePage()
+    gateway = FacebookBrowserGateway(True, tmp_path)
+    monkeypatch.setattr("fb_monitor.facebook_browser.random.uniform", lambda minimum, maximum: 12_345.4)
+
+    await gateway._wait_between_canary_posts(page)
+
+    assert page.waits == [12_345]
+
+
+@pytest.mark.asyncio
 async def test_album_walker_saves_resume_state_when_batch_limit_is_reached(tmp_path: Path, monkeypatch):
     class Response:
         status = 200

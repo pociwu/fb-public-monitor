@@ -324,6 +324,7 @@ class FacebookBrowserGateway:
         """Open each selected permalink and walk its photo viewer until it ends."""
         expanded = [dict(post) for post in posts]
         progress = self._load_album_progress()
+        attempted_post = False
         async with async_playwright() as playwright:
             try:
                 context = await playwright.chromium.launch_persistent_context(
@@ -347,6 +348,9 @@ class FacebookBrowserGateway:
                         discovered = []
                         next_state = state
                     else:
+                        if attempted_post:
+                            await self._wait_between_canary_posts(page)
+                        attempted_post = True
                         try:
                             discovered, next_state = await self._collect_post_album_photos(page, post_url, state)
                         except Exception:
@@ -367,6 +371,11 @@ class FacebookBrowserGateway:
             finally:
                 await context.close()
         return expanded
+
+    @staticmethod
+    async def _wait_between_canary_posts(page: Page) -> None:
+        """Pause between separate post visits to avoid bursty browser activity."""
+        await page.wait_for_timeout(round(random.uniform(8000, 18000)))
 
     async def _collect_post_album_photos(
         self,
