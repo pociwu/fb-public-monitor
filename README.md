@@ -9,6 +9,7 @@
 - 個人檔案每 48 小時最多更新一次姓名、ID、網址、公開狀態、簡介、地點、學歷、工作、追蹤者、大頭照、封面與最多 6 張公開照片；查詢順序為 SerpApi → Bright Data → 已登入 Chromium。
 - Chromium 遇到登入牆、驗證碼或安全檢查時只會發 Telegram 通知，不會將帳號誤判為 `private`。
 - Chromium 每次直接擷取會先等待 3 秒，再依姓名區塊與圖片載入狀態最多等待 5 秒；並依帳號覆寫保存最新畫面，首頁個人卡片與個人詳細頁的「瀏覽器擷取畫面」可直接開啟查看。
+- Chromium 金絲雀模式會沿用個人檔案頁面解析結果，或在 Apify 貼文不足／失敗時每個帳號最多 72 小時新開一次頁面；每次最多補抓 2 篇有固定連結的貼文、每篇 3 張照片。這些資料只補足內容，不參與貼文消失或刪除判定，也不另外抓留言。
 - 內容消失需連續兩次成功核對才確認；Actor 失敗不會改變 Facebook 狀態。
 - 所有公開留言及最多三層回覆；留言附件依官方 Actor 回傳內容 best-effort 下載。
 - SQLite 保存實體、版本、事件、排程、通知 outbox、SerpApi 額度、本地費用估算與 Apify 官方用量快照。JSON、Markdown 和媒體保存在 `/data`。
@@ -105,6 +106,16 @@ docker compose logs --tail=100 monitor
 ## 管理
 
 編輯 `config.yaml` 可新增、停用或移除網址，服務會自動重新載入；最多 16 個。移除只停止監控，不刪除歷史資料。
+
+金絲雀模式的預設值如下；即使舊版 `config.yaml` 沒有這段，也會自動採用相同設定：
+
+```yaml
+browser_canary:
+  enabled: true
+  max_posts: 2
+  max_photos_per_post: 3
+  cooldown_hours: 72
+```
 
 ```bash
 docker compose exec monitor fb-monitor status

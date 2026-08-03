@@ -73,6 +73,8 @@ class MonitorService:
             settings.facebook_browser_enabled,
             settings.facebook_browser_data_dir,
             settings.facebook_browser_timeout_seconds,
+            settings.browser_canary_max_posts,
+            settings.browser_canary_max_photos_per_post,
         )
         self.media = MediaStore(self.db, settings.data_dir, settings.low_disk_gb, settings.media_retry_days)
         self.ingester = Ingester(self.db, settings.data_dir, self.media)
@@ -511,18 +513,20 @@ class MonitorService:
         if profile.get("public_state") != "public":
             self._schedule_next(profile_id)
             return
+        initial = not bool(self.db.row("SELECT id FROM entities WHERE profile_id=? AND kind='post' LIMIT 1", (profile_id,)))
         try:
             posts = await self._fetch_posts(profile, self.settings.recent_posts)
         except BudgetExceeded:
+            canary_items = await self._try_browser_canary(profile, 0, "apify_budget")
+            await self._ingest_browser_canary_posts(profile_id, canary_items, notify=not initial)
             self._schedule_next(profile_id)
             return
+        summary_error = actor_summary_error(posts.summary)
         if not posts.items:
-            summary_error = actor_summary_error(posts.summary)
-            if summary_error:
+            if summary_error and not self.settings.browser_canary_enabled:
                 raise RuntimeError(f"貼文 Actor 三種輸入格式均失敗：{summary_error}")
         seen_posts: set[str] = set()
         post_urls: list[str] = []
-        initial = not bool(self.db.row("SELECT id FROM entities WHERE profile_id=? AND kind='post' LIMIT 1", (profile_id,)))
         if initial and posts.items:
             self.db.execute("UPDATE profiles SET backfill_done=0,backfill_cursor=NULL,last_full_audit_at=NULL WHERE id=?", (profile_id,))
             profile["backfill_done"] = 0
@@ -532,7 +536,25 @@ class MonitorService:
             url = next((str(post.get(k)) for k in ("source_url", "postUrl", "post_url", "url", "facebookUrl") if post.get(k)), "")
             if url:
                 post_urls.append(url)
-        self.ingester.reconcile(profile_id, "post", seen_posts, self.settings.recent_posts, notify=not initial)
+        # A browser canary is supplementary evidence. It must never mark a
+        # post missing or deleted, so only successful Apify data is reconciled.
+        if not summary_error:
+            self.ingester.reconcile(profile_id, "post", seen_posts, self.settings.recent_posts, notify=not initial)
+
+        cached_canary = self.facebook_browser.cached_canary_posts(str(profile["url"]))
+        canary_items: list[dict[str, Any]] = []
+        if cached_canary is not None or summary_error or len(posts.items) < self.settings.recent_posts:
+            canary_items = await self._try_browser_canary(
+                profile,
+                len(posts.items),
+                "actor_error" if summary_error else "partial_actor_result",
+            )
+            if initial and canary_items and not posts.items:
+                self.db.execute("UPDATE profiles SET backfill_done=0,backfill_cursor=NULL,last_full_audit_at=NULL WHERE id=?", (profile_id,))
+                profile["backfill_done"] = 0
+            await self._ingest_browser_canary_posts(profile_id, canary_items, notify=not initial)
+        if summary_error and not canary_items:
+            raise RuntimeError(f"貼文 Actor 回傳錯誤：{summary_error}")
         if post_urls and self._remaining_budget() > 0:
             try:
                 await self._fetch_comments(profile_id, post_urls, notify=not initial)
@@ -545,6 +567,93 @@ class MonitorService:
             if (not last_audit or datetime.now(UTC) - last_audit >= timedelta(days=self.settings.full_audit_days)) and not self.db.row("SELECT id FROM jobs WHERE profile_id=? AND job_type='audit' AND status IN ('pending','running')", (profile_id,)):
                 self._enqueue(profile_id, "audit", 40, datetime.now(UTC) + timedelta(minutes=self.settings.spacing_max_minutes))
         self._schedule_next(profile_id)
+
+    def _browser_canary_due(self, profile: dict[str, Any]) -> bool:
+        if not self.settings.facebook_browser_enabled or not self.settings.browser_canary_enabled:
+            return False
+        if self.settings.browser_canary_max_posts <= 0:
+            return False
+        attempted_at = profile.get("browser_canary_last_attempt_at")
+        if not attempted_at:
+            return True
+        try:
+            attempted = datetime.fromisoformat(str(attempted_at))
+            if attempted.tzinfo is None:
+                attempted = attempted.replace(tzinfo=UTC)
+        except ValueError:
+            return True
+        return datetime.now(UTC) - attempted >= timedelta(hours=self.settings.browser_canary_cooldown_hours)
+
+    async def _try_browser_canary(
+        self,
+        profile: dict[str, Any],
+        api_result_count: int,
+        reason: str,
+    ) -> list[dict[str, Any]]:
+        if not self.settings.facebook_browser_enabled or not self.settings.browser_canary_enabled:
+            return []
+        profile_url = str(profile["url"])
+        cached = self.facebook_browser.cached_canary_posts(profile_url)
+        reused_page = cached is not None
+        if cached is None:
+            if not self._browser_canary_due(profile):
+                return []
+            attempted_at = utcnow()
+            self.db.execute(
+                "UPDATE profiles SET browser_canary_last_attempt_at=? WHERE id=?",
+                (attempted_at, profile["id"]),
+            )
+            profile["browser_canary_last_attempt_at"] = attempted_at
+        try:
+            items = cached if cached is not None else await self.facebook_browser.canary_posts(profile_url, str(profile["id"]))
+        except (FacebookBrowserChallengeRequired, FacebookBrowserLoginRequired, FacebookBrowserError) as exc:
+            self.db.add_event(
+                f"browser-canary:{profile['id']}:{utcnow()[:13]}:failed",
+                "browser_canary_failed",
+                {
+                    "title": "Chromium 金絲雀補抓失敗",
+                    "text": f"原因：{reason}；{str(exc)[:600]}",
+                    "source_url": profile_url,
+                },
+                int(profile["id"]),
+                notify=False,
+            )
+            return []
+        self.db.add_event(
+            f"browser-canary:{profile['id']}:{utcnow()[:13]}:done",
+            "browser_canary",
+            {
+                "title": "Chromium 金絲雀補抓完成",
+                "text": f"Apify {api_result_count} 篇；補抓 {len(items)} 篇；{'沿用同頁' if reused_page else '新開頁面'}",
+                "source_url": profile_url,
+            },
+            int(profile["id"]),
+            notify=False,
+        )
+        return items
+
+    async def _ingest_browser_canary_posts(
+        self,
+        profile_id: int,
+        items: list[dict[str, Any]],
+        notify: bool,
+    ) -> None:
+        existing = self.db.rows(
+            "SELECT external_id,source_url FROM entities WHERE profile_id=? AND kind='post' AND source_url IS NOT NULL",
+            (profile_id,),
+        )
+        ids_by_url = {
+            normalize_url(str(row["source_url"])): str(row["external_id"])
+            for row in existing
+            if row.get("source_url")
+        }
+        for raw_item in items:
+            item = dict(raw_item)
+            source_url = str(item.get("source_url") or "")
+            known_id = ids_by_url.get(normalize_url(source_url)) if source_url else None
+            if known_id:
+                item["source_post_id"] = known_id
+            await self.ingester.ingest(profile_id, "post", item, notify=notify)
 
     def _serpapi_profile_due(self, profile: dict[str, Any]) -> bool:
         checked_at = profile.get("serp_last_checked_at")
@@ -607,6 +716,12 @@ class MonitorService:
             )
             return False
         try:
+            attempted_at = utcnow()
+            self.db.execute(
+                "UPDATE profiles SET browser_canary_last_attempt_at=? WHERE id=?",
+                (attempted_at, profile["id"]),
+            )
+            profile["browser_canary_last_attempt_at"] = attempted_at
             item = await self.facebook_browser.profile(str(profile["url"]), str(profile["id"]))
             await self._store_profile_details(profile, item)
         except FacebookBrowserChallengeRequired as exc:

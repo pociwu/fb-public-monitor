@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -141,6 +142,91 @@ schedule:
     await service.visit_profile(1)
     assert service.db.row("SELECT external_id FROM entities WHERE kind='post'") is None
     assert service.db.row("SELECT COUNT(*) count FROM actor_runs WHERE category='posts'")["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_browser_canary_supplements_partial_posts_without_reconciling_them(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """profiles:
+  - name: watched
+    url: https://facebook.com/100
+storage:
+  data_dir: data
+  low_disk_gb: 0
+schedule:
+  spacing_min_minutes: 0
+  spacing_max_minutes: 0
+browser_canary:
+  enabled: true
+  cooldown_hours: 72
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("FACEBOOK_BROWSER_ENABLED", "1")
+    service = MonitorService(load_settings(config))
+    await service.ingester.ingest(
+        1,
+        "post",
+        {"postId": "old", "source_url": "https://facebook.com/100/posts/old", "text": "old"},
+        notify=False,
+    )
+    service.db.execute(
+        "UPDATE profiles SET public_state='public',serp_last_checked_at=?,backfill_done=1,last_full_audit_at=? WHERE id=1",
+        (datetime.now(UTC).isoformat(), datetime.now(UTC).isoformat()),
+    )
+
+    async def partial_posts(profile, maximum, cursor=None):
+        return ActorResult([{"postId": "api-post", "text": "from api"}], None, "posts")
+
+    async def canary_posts(url, diagnostic_key=None):
+        return [{
+            "source_post_id": "browser-post",
+            "source_url": "https://facebook.com/100/posts/browser-post",
+            "text": "from browser",
+            "ingest_source": "facebook_browser_canary",
+        }]
+
+    reconciled: list[set[str]] = []
+    service._fetch_posts = partial_posts
+    service.facebook_browser.cached_canary_posts = lambda url: None
+    service.facebook_browser.canary_posts = canary_posts
+    service.ingester.reconcile = lambda profile_id, kind, seen, *args, **kwargs: reconciled.append(set(seen))
+
+    await service.visit_profile(1)
+
+    assert {row["external_id"] for row in service.db.rows("SELECT external_id FROM entities WHERE kind='post'")} == {
+        "old", "api-post", "browser-post",
+    }
+    assert reconciled == [{"api-post"}]
+    assert service.db.row("SELECT browser_canary_last_attempt_at FROM profiles WHERE id=1")["browser_canary_last_attempt_at"]
+    assert service.db.row("SELECT COUNT(*) count FROM events WHERE event_type='browser_canary'")["count"] == 1
+
+
+def test_browser_canary_respects_persistent_cooldown(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\nbrowser_canary:\n  cooldown_hours: 72\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("FACEBOOK_BROWSER_ENABLED", "1")
+    service = MonitorService(load_settings(config))
+    profile = service.db.row("SELECT * FROM profiles WHERE id=1")
+    assert service._browser_canary_due(profile) is True
+
+    service.db.execute(
+        "UPDATE profiles SET browser_canary_last_attempt_at=? WHERE id=1",
+        ((datetime.now(UTC) - timedelta(hours=71)).isoformat(),),
+    )
+    assert service._browser_canary_due(service.db.row("SELECT * FROM profiles WHERE id=1")) is False
+
+    service.db.execute(
+        "UPDATE profiles SET browser_canary_last_attempt_at=? WHERE id=1",
+        ((datetime.now(UTC) - timedelta(hours=73)).isoformat(),),
+    )
+    assert service._browser_canary_due(service.db.row("SELECT * FROM profiles WHERE id=1")) is True
 
 
 def test_unseenuser_wrapper_is_flattened_to_posts():

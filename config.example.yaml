@@ -15,6 +15,12 @@ schedule:
   full_audit_days: 7
   serpapi_profile_refresh_hours: 48
 
+browser_canary:
+  enabled: true
+  max_posts: 2
+  max_photos_per_post: 3
+  cooldown_hours: 72
+
 storage:
   data_dir: /data
   low_disk_gb: 10

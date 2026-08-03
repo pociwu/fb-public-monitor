@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from fb_monitor.facebook_browser import FacebookBrowserGateway, normalize_browser_profile
+from fb_monitor.facebook_browser import FacebookBrowserGateway, normalize_browser_canary_posts, normalize_browser_profile
 
 
 def test_normalize_browser_profile_extracts_card_fields():
@@ -155,6 +155,32 @@ def test_normalize_browser_profile_combines_primary_name_alias_and_svg_avatar():
 
     assert item["name"] == "林純玉（林小黑）"
     assert item["profile_picture"] == "https://scontent.example.fbcdn.net/v/avatar.jpg"
+
+
+def test_normalize_browser_canary_posts_limits_posts_photos_and_requires_permalink():
+    raw_posts = [
+        {
+            "url": f"https://www.facebook.com/example/posts/p{i}?fbclid=tracking",
+            "text": f"post {i}",
+            "images": [
+                {
+                    "src": f"https://scontent.example.fbcdn.net/v/post-{i}-{photo}.jpg?token=x",
+                    "natural_width": 800,
+                    "natural_height": 800,
+                }
+                for photo in range(4)
+            ],
+        }
+        for i in range(3)
+    ]
+    raw_posts.append({"url": "https://www.facebook.com/example", "text": "not a post"})
+
+    posts = normalize_browser_canary_posts(raw_posts, max_posts=2, max_photos_per_post=3)
+
+    assert [post["source_post_id"] for post in posts] == ["p0", "p1"]
+    assert all(post["ingest_source"] == "facebook_browser_canary" for post in posts)
+    assert all(len(post["images"]) == 3 for post in posts)
+    assert all("fbclid" not in post["source_url"] for post in posts)
 
 
 @pytest.mark.asyncio

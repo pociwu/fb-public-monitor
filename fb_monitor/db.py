@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS profiles (
   last_attempt_at TEXT, last_success_at TEXT, next_visit_at TEXT, last_full_audit_at TEXT,
   backfill_cursor TEXT, backfill_done INTEGER NOT NULL DEFAULT 0, audit_cursor TEXT, audit_token TEXT,
   consecutive_failures INTEGER NOT NULL DEFAULT 0, sort_order INTEGER, last_manual_visit_at TEXT,
-  last_error TEXT, profile_details_json TEXT, serp_last_checked_at TEXT,
+  last_error TEXT, profile_details_json TEXT, serp_last_checked_at TEXT, browser_canary_last_attempt_at TEXT,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS entities (
@@ -142,6 +142,8 @@ class Database:
             for name in ("audit_cursor", "audit_token", "display_name", "profile_details_json", "serp_last_checked_at"):
                 if name not in columns:
                     conn.execute(f"ALTER TABLE profiles ADD COLUMN {name} TEXT")
+            if "browser_canary_last_attempt_at" not in columns:
+                conn.execute("ALTER TABLE profiles ADD COLUMN browser_canary_last_attempt_at TEXT")
             if "sort_order" not in columns:
                 conn.execute("ALTER TABLE profiles ADD COLUMN sort_order INTEGER")
             if "last_manual_visit_at" not in columns:

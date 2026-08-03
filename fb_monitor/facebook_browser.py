@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError, async_playwright
+
+from .normalize import normalize_url
 
 
 class FacebookBrowserError(RuntimeError):
@@ -193,11 +196,99 @@ def normalize_browser_profile(raw: dict[str, Any], profile_url: str) -> dict[str
     return item
 
 
+def normalize_browser_canary_posts(
+    raw_posts: object,
+    max_posts: int = 2,
+    max_photos_per_post: int = 3,
+) -> list[dict[str, Any]]:
+    """Normalize only visible posts that expose a stable Facebook permalink."""
+    if not isinstance(raw_posts, list) or max_posts <= 0:
+        return []
+    posts: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for raw in raw_posts:
+        if not isinstance(raw, dict):
+            continue
+        source_url = normalize_url(str(raw.get("url") or ""))
+        parsed = urlsplit(source_url)
+        host = (parsed.hostname or "").casefold()
+        if host != "facebook.com" and not host.endswith(".facebook.com"):
+            continue
+        permalink = any(
+            marker in parsed.path.casefold()
+            for marker in ("/posts/", "/photos/", "/videos/", "/reel/", "/share/p/")
+        ) or parsed.path.casefold().endswith("/permalink.php") or bool(parse_qs(parsed.query).get("story_fbid"))
+        if not permalink or source_url in seen_urls:
+            continue
+        post_id = (parse_qs(parsed.query).get("story_fbid") or [""])[0]
+        if not post_id:
+            match = re.search(r"/(?:posts|videos|reel)/([^/?#]+)", parsed.path, flags=re.IGNORECASE)
+            post_id = match.group(1) if match else ""
+        photos: list[dict[str, str]] = []
+        seen_assets: set[str] = set()
+        for image in raw.get("images") or []:
+            if not isinstance(image, dict):
+                continue
+            src = str(image.get("src") or image.get("url") or "")
+            width = int(image.get("natural_width") or image.get("rendered_width") or 0)
+            height = int(image.get("natural_height") or image.get("rendered_height") or 0)
+            asset = normalize_url(src)
+            if (
+                not src.startswith("http")
+                or "fbcdn.net" not in (urlsplit(src).hostname or "")
+                or width < 180
+                or height < 180
+                or asset in seen_assets
+            ):
+                continue
+            photos.append({"url": src})
+            seen_assets.add(asset)
+            if len(photos) >= max_photos_per_post:
+                break
+        item: dict[str, Any] = {
+            "source_url": source_url,
+            "text": str(raw.get("text") or "")[:8000],
+            "ingest_source": "facebook_browser_canary",
+        }
+        if post_id:
+            item["source_post_id"] = post_id
+        if photos:
+            item["images"] = photos
+        posts.append(item)
+        seen_urls.add(source_url)
+        if len(posts) >= max_posts:
+            break
+    return posts
+
+
 class FacebookBrowserGateway:
-    def __init__(self, enabled: bool, data_dir: Path, timeout_seconds: int = 60):
+    def __init__(
+        self,
+        enabled: bool,
+        data_dir: Path,
+        timeout_seconds: int = 60,
+        canary_max_posts: int = 2,
+        canary_max_photos_per_post: int = 3,
+    ):
         self.enabled = enabled
         self.data_dir = data_dir
         self.timeout_ms = max(10, timeout_seconds) * 1000
+        self.canary_max_posts = max(0, min(2, canary_max_posts))
+        self.canary_max_photos_per_post = max(0, min(3, canary_max_photos_per_post))
+        self._canary_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+
+    def cached_canary_posts(self, profile_url: str, max_age_seconds: int = 600) -> list[dict[str, Any]] | None:
+        cached = self._canary_cache.get(profile_url.rstrip("/"))
+        if not cached or time.monotonic() - cached[0] > max_age_seconds:
+            return None
+        return [dict(post) for post in cached[1]]
+
+    async def canary_posts(self, profile_url: str, diagnostic_key: str | None = None) -> list[dict[str, Any]]:
+        cached = self.cached_canary_posts(profile_url)
+        if cached is not None:
+            return cached
+        await self.profile(profile_url, diagnostic_key)
+        return self.cached_canary_posts(profile_url) or []
 
     async def profile(self, profile_url: str, diagnostic_key: str | None = None) -> dict[str, Any]:
         if not self.enabled:
@@ -285,9 +376,9 @@ class FacebookBrowserGateway:
             raise FacebookBrowserError(f"Facebook 頁面 HTTP {response.status}")
 
         raw = await page.evaluate(
-            """() => {
+            r"""() => {
                 const meta = (property) => document.querySelector(`meta[property="${property}"]`)?.content || '';
-                const images = [...document.querySelectorAll('img, svg image')].map((image) => {
+                const readImage = (image) => {
                     const rect = image.getBoundingClientRect();
                     return {
                         src: image.currentSrc || image.src || image.href?.baseVal || image.getAttribute('href') || '',
@@ -296,7 +387,20 @@ class FacebookBrowserGateway:
                         rendered_width: Math.round(rect.width), rendered_height: Math.round(rect.height),
                         x: Math.round(rect.x), y: Math.round(rect.y),
                     };
-                });
+                };
+                const images = [...document.querySelectorAll('img, svg image')].map(readImage);
+                const permalinkPattern = /\/posts\/|\/photos\/|\/videos\/|\/reel\/|\/share\/p\/|\/permalink\.php|story_fbid=/i;
+                const posts = [...document.querySelectorAll('[role="main"] [role="article"], main [role="article"]')]
+                    .map((article) => {
+                        const links = [...article.querySelectorAll('a[href]')].map((link) => link.href || '');
+                        const url = links.find((href) => permalinkPattern.test(href)) || '';
+                        return {
+                            url,
+                            text: (article.innerText || '').slice(0, 8000),
+                            images: [...article.querySelectorAll('img, svg image')].map(readImage),
+                        };
+                    })
+                    .filter((post) => post.url);
                 const text = (document.body?.innerText || '').slice(0, 200000);
                 return {
                     title: document.title || '', heading: document.querySelector('h1')?.innerText || '',
@@ -305,12 +409,18 @@ class FacebookBrowserGateway:
                     role_headings: [...document.querySelectorAll('[role="main"] [role="heading"], [role="heading"][aria-level="1"]')]
                         .map((node) => node.innerText || '').filter(Boolean),
                     og_title: meta('og:title'), og_description: meta('og:description'),
-                    og_image: meta('og:image'), og_url: meta('og:url'), text, images,
+                    og_image: meta('og:image'), og_url: meta('og:url'), text, images, posts,
                     private: /profile is locked|this profile is locked|這份個人檔案已鎖定|已鎖定個人檔案/i.test(text),
                 };
             }"""
         )
         item = normalize_browser_profile(raw, profile_url)
+        canary_posts = normalize_browser_canary_posts(
+            raw.get("posts"),
+            self.canary_max_posts,
+            self.canary_max_photos_per_post,
+        )
+        self._canary_cache[profile_url.rstrip("/")] = (time.monotonic(), canary_posts)
         unavailable = any(marker in folded for marker in ("this content isn't available", "content not found", "這則內容目前無法顯示", "找不到這個頁面"))
         if unavailable or not item.get("name"):
             await self._save_failure(page, diagnostic_key)

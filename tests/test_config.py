@@ -16,6 +16,18 @@ def test_actor_input_keeps_native_values():
     assert result == {"profileUrls": ["a", "b"], "limit": 20}
 
 
+def test_browser_canary_defaults_are_conservative(tmp_path: Path):
+    config = tmp_path / "config.yaml"
+    config.write_text("profiles: []\n", encoding="utf-8")
+
+    settings = load_settings(config)
+
+    assert settings.browser_canary_enabled is True
+    assert settings.browser_canary_max_posts == 2
+    assert settings.browser_canary_max_photos_per_post == 3
+    assert settings.browser_canary_cooldown_hours == 72
+
+
 def test_config_rejects_more_than_sixteen(tmp_path: Path):
     config = tmp_path / "config.yaml"
     profiles = "\n".join(f"  - name: p{i}\n    url: https://facebook.com/{i}" for i in range(17))
