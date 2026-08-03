@@ -1,10 +1,10 @@
 .git
 .venv
 data
+browser-data
 dist
 .pytest_cache
 __pycache__
 *.pyc
 .env
 tests
-

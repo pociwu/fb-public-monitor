@@ -4,6 +4,7 @@ import pytest
 
 from fb_monitor.apify import ActorResult, MonthlyUsage
 from fb_monitor.config import load_settings
+from fb_monitor.facebook_browser import FacebookBrowserLoginRequired
 from fb_monitor.serpapi import SerpApiAccount, SerpApiError, SerpApiProfileResult
 from fb_monitor.service import MonitorService, actor_summary_error
 
@@ -208,6 +209,83 @@ schedule:
     assert profile["serp_last_checked_at"] is not None
     assert '"profile_data_source": "Bright Data"' in profile["profile_details_json"]
     assert service.db.row("SELECT COUNT(*) count FROM events WHERE event_type='brightdata_fallback'")["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_logged_in_browser_is_final_profile_fallback(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """profiles:
+  - name: FB-100
+    url: https://facebook.com/100
+storage:
+  data_dir: data
+  low_disk_gb: 0
+schedule:
+  spacing_min_minutes: 0
+  spacing_max_minutes: 0
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("FACEBOOK_BROWSER_ENABLED", "1")
+    monkeypatch.delenv("BRIGHTDATA_API_TOKEN", raising=False)
+    service = MonitorService(load_settings(config))
+
+    async def failed_serpapi(url):
+        raise SerpApiError("no results")
+
+    browser_calls = []
+
+    async def browser_profile(url):
+        browser_calls.append(url)
+        return {"id": "100", "name": "Alice", "url": url, "profile_data_source": "Facebook 直接瀏覽器"}
+
+    service.serpapi.profile = failed_serpapi
+    service.facebook_browser.profile = browser_profile
+    await service.visit_profile(1)
+
+    profile = service.db.row("SELECT * FROM profiles WHERE id=1")
+    assert browser_calls == ["https://facebook.com/100"]
+    assert profile["public_state"] == "public"
+    assert '"profile_data_source": "Facebook 直接瀏覽器"' in profile["profile_details_json"]
+    assert service.db.row("SELECT COUNT(*) count FROM events WHERE event_type='facebook_browser_fallback'")["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_browser_login_wall_does_not_mark_profile_private(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """profiles:
+  - name: FB-100
+    url: https://facebook.com/100
+storage:
+  data_dir: data
+schedule:
+  spacing_min_minutes: 0
+  spacing_max_minutes: 0
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("FACEBOOK_BROWSER_ENABLED", "1")
+    monkeypatch.delenv("BRIGHTDATA_API_TOKEN", raising=False)
+    service = MonitorService(load_settings(config))
+
+    async def failed_serpapi(url):
+        raise SerpApiError("no results")
+
+    async def login_required(url):
+        raise FacebookBrowserLoginRequired("login required")
+
+    service.serpapi.profile = failed_serpapi
+    service.facebook_browser.profile = login_required
+    await service.visit_profile(1)
+
+    profile = service.db.row("SELECT * FROM profiles WHERE id=1")
+    assert profile["public_state"] == "unknown"
+    assert profile["serp_last_checked_at"] is None
+    assert service.db.row("SELECT COUNT(*) count FROM events WHERE event_type='facebook_browser_login_required'")["count"] == 1
 
 
 @pytest.mark.asyncio

@@ -1,12 +1,13 @@
 # FB Public Monitor
 
-在 Ubuntu 以 Docker Compose 長期監控最多 16 個公開 Facebook 個人帳號。服務透過 SerpApi 取得個人檔案，失敗時以 Bright Data 備援，並以 Apify 擷取貼文、公開留言與附件，保存完整版本歷史，並將變更送至單一 Telegram 群組。
+在 Ubuntu 以 Docker Compose 長期監控最多 16 個公開 Facebook 個人帳號。服務透過 SerpApi 取得個人檔案，失敗時依序以 Bright Data 與已登入 Chromium 備援，並以 Apify 擷取貼文、公開留言與附件，保存完整版本歷史，並將變更送至單一 Telegram 群組。
 
 ## 已實作行為
 
 - 每個帳號在上次完成後隨機 6–8 小時再次拜訪；全域工作間隔隨機 20–30 分鐘。
 - 首次完整回溯可用游標跨月接續；一般拜訪每次檢查最近 10 篇；每 7 天完整核對每批最多 20 篇。
-- 僅處理未登入可見資料。SerpApi Facebook Profile API 每 48 小時最多更新一次姓名、ID、網址、公開狀態、簡介、地點、學歷、工作、追蹤者、大頭照、封面與最多 6 張公開照片。
+- 個人檔案每 48 小時最多更新一次姓名、ID、網址、公開狀態、簡介、地點、學歷、工作、追蹤者、大頭照、封面與最多 6 張公開照片；查詢順序為 SerpApi → Bright Data → 已登入 Chromium。
+- Chromium 遇到登入牆、驗證碼或安全檢查時只會發 Telegram 通知，不會將帳號誤判為 `private`。
 - 內容消失需連續兩次成功核對才確認；Actor 失敗不會改變 Facebook 狀態。
 - 所有公開留言及最多三層回覆；留言附件依官方 Actor 回傳內容 best-effort 下載。
 - SQLite 保存實體、版本、事件、排程、通知 outbox、SerpApi 額度、本地費用估算與 Apify 官方用量快照。JSON、Markdown 和媒體保存在 `/data`。
@@ -40,6 +41,9 @@ docker compose logs -f monitor
 - `SERPAPI_KEY`：SerpApi 帳號 API key；程式先查免費 Account API，剩餘次數為 0 時不會執行個人檔案查詢。
 - `BRIGHTDATA_API_TOKEN`：Bright Data API token。設定後，SerpApi 額度用完、連線失敗或查無結果時，才呼叫 Facebook Profiles Scraper API 作備援。
 - `BRIGHTDATA_DATASET_ID`：Bright Data Facebook Profiles dataset ID，預設 `gd_mf0urb782734ik94dz`，通常不需修改。
+- `FACEBOOK_BROWSER_ENABLED=1`：啟用已登入 Chromium 個人檔案第三備援。
+- `FACEBOOK_BROWSER_DATA_DIR=/browser-data`：容器內持久化瀏覽器登入狀態的路徑。
+- `BROWSER_LOGIN_BIND_IP`：互動式登入 noVNC 網頁的主機綁定 IP；OCI 應設為 Tailscale IP。
 - `TELEGRAM_BOT_TOKEN`：由 BotFather 建立的 bot token。
 - `TELEGRAM_CHAT_ID`：單一 Telegram 群組 ID；把 bot 加入群組並授權傳送訊息。
 
@@ -58,6 +62,43 @@ WEB_BIND_IP=100.x.x.x
 ```
 
 實際 IP 可用 `tailscale ip -4` 查詢。重建容器後，即可從同一 tailnet 使用 `http://100.x.x.x:8080` 存取；此設定保存在不受 Git 管理的 `.env`，後續更新不會被覆寫。
+
+### 首次 Facebook 互動式登入
+
+先在 OCI 專案 `.env` 加入（IP 改為 `tailscale ip -4` 顯示的值）：
+
+```env
+FACEBOOK_BROWSER_ENABLED=1
+FACEBOOK_BROWSER_DATA_DIR=/browser-data
+FACEBOOK_BROWSER_TIMEOUT_SECONDS=60
+BROWSER_LOGIN_BIND_IP=100.x.x.x
+```
+
+建立只存在 OCI 的瀏覽器資料目錄，並先停止監控容器，避免兩個 Chromium 同時開啟同一登入檔案：
+
+```bash
+cd /home/ubuntu/fb-public-monitor
+mkdir -p browser-data
+chmod 700 browser-data
+docker compose stop monitor
+docker compose --profile browser-login up --build browser-login
+```
+
+從同一 Tailscale tailnet 的電腦開啟：
+
+```text
+http://100.x.x.x:6080/vnc.html?autoconnect=1&resize=scale
+```
+
+在畫面中手動完成 Facebook 帳密、雙重驗證與安全檢查。終端顯示「登入狀態：已登入」後，按 `Ctrl+C`，然後重啟長期監控：
+
+```bash
+docker compose --profile browser-login down
+docker compose up -d monitor
+docker compose logs --tail=100 monitor
+```
+
+帳密不會寫入 `.env` 或 GitHub；Cookie 及瀏覽器狀態只保留在 `/home/ubuntu/fb-public-monitor/browser-data/`。noVNC 沒有額外密碼，因此 `BROWSER_LOGIN_BIND_IP` 只能綁定 Tailscale IP，不要設成 `0.0.0.0`。日後 Telegram 通知登入失效時，重複本節流程即可。
 
 ## 管理
 
@@ -93,7 +134,7 @@ docker compose up -d --build
 docker compose ps
 ```
 
-`.env`、`config.yaml` 與 `/data` 不在 Git 版本控制中，更新程式不會覆寫權杖、監控帳號設定或既有資料。公開倉庫只保存不含真實帳號的 `config.example.yaml`。首頁新增或移除監控帳號時會直接更新私有 `config.yaml`，因此該檔案的容器掛載與主機權限必須允許 UID 1000 寫入。
+`.env`、`config.yaml`、`/data` 與 `browser-data/` 不在 Git 版本控制中，更新程式不會覆寫權杖、監控帳號設定、Facebook 登入狀態或既有資料。公開倉庫只保存不含真實帳號的 `config.example.yaml`。首頁新增或移除監控帳號時會直接更新私有 `config.yaml`，因此該檔案的容器掛載與主機權限必須允許 UID 1000 寫入。
 
 ## Actor 設定與限制
 

@@ -1,0 +1,208 @@
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, urlsplit
+
+from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError, async_playwright
+
+
+class FacebookBrowserError(RuntimeError):
+    pass
+
+
+class FacebookBrowserLoginRequired(FacebookBrowserError):
+    pass
+
+
+class FacebookBrowserChallengeRequired(FacebookBrowserLoginRequired):
+    pass
+
+
+def _numeric_profile_id(url: str) -> str:
+    parsed = urlsplit(url)
+    if parsed.path.rstrip("/").lower() == "/profile.php":
+        return (parse_qs(parsed.query).get("id") or [""])[0]
+    return next((part for part in reversed(parsed.path.split("/")) if part.isdigit()), "")
+
+
+def _first_labeled_value(lines: list[str], labels: tuple[str, ...]) -> str:
+    lowered = tuple(label.casefold() for label in labels)
+    for index, line in enumerate(lines):
+        folded = line.casefold()
+        for label, label_folded in zip(labels, lowered, strict=True):
+            if folded == label_folded and index + 1 < len(lines):
+                return lines[index + 1]
+            if folded.startswith(label_folded):
+                value = line[len(label):].lstrip(" ：:·-")
+                if value:
+                    return value
+    return ""
+
+
+def normalize_browser_profile(raw: dict[str, Any], profile_url: str) -> dict[str, Any]:
+    """Map the rendered Facebook page into the dashboard's profile fields."""
+    text = str(raw.get("text") or "")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    title = str(raw.get("heading") or raw.get("og_title") or raw.get("title") or "")
+    name = re.sub(r"\s*[|\-]‎?\s*Facebook\s*$", "", title, flags=re.IGNORECASE).strip()
+    if name.casefold() in {"facebook", "log into facebook"}:
+        name = ""
+
+    images = [item for item in raw.get("images", []) if isinstance(item, dict) and item.get("src")]
+
+    def image_score(item: dict[str, Any]) -> int:
+        return int(item.get("natural_width") or 0) * int(item.get("natural_height") or 0)
+
+    profile_candidates = [
+        item for item in images
+        if any(word in str(item.get("alt") or "").casefold() for word in ("profile picture", "個人大頭貼", "大頭貼照片", "頭像"))
+    ]
+    cover_candidates = [
+        item for item in images
+        if any(word in str(item.get("alt") or "").casefold() for word in ("cover photo", "封面相片", "封面照片"))
+    ]
+    profile_picture = str(max(profile_candidates, key=image_score).get("src")) if profile_candidates else str(raw.get("og_image") or "")
+    cover_photo = str(max(cover_candidates, key=image_score).get("src")) if cover_candidates else ""
+
+    excluded = {profile_picture, cover_photo}
+    photos = []
+    for image in sorted(images, key=image_score, reverse=True):
+        src = str(image.get("src") or "")
+        width = int(image.get("natural_width") or 0)
+        height = int(image.get("natural_height") or 0)
+        if src in excluded or not src.startswith("http") or width < 180 or height < 180:
+            continue
+        if "fbcdn.net" not in (urlsplit(src).hostname or ""):
+            continue
+        photos.append({"url": src})
+        excluded.add(src)
+        if len(photos) == 6:
+            break
+
+    followers = ""
+    follower_match = re.search(r"([\d,.]+(?:\s*[KMB萬億])?)\s*(?:followers|位追蹤者|追蹤者)", text, re.IGNORECASE)
+    if follower_match:
+        followers = follower_match.group(1).replace(" ", "")
+
+    intro = _first_labeled_value(lines, ("簡介", "Intro", "Bio"))
+    city = _first_labeled_value(lines, ("現居", "住在", "Lives in"))
+    hometown = _first_labeled_value(lines, ("來自", "From"))
+    work = _first_labeled_value(lines, ("任職於", "Works at"))
+    education = _first_labeled_value(lines, ("曾就讀", "就讀於", "Studied at", "Went to"))
+    canonical = str(raw.get("og_url") or profile_url)
+    item: dict[str, Any] = {
+        "id": _numeric_profile_id(canonical) or _numeric_profile_id(profile_url),
+        "name": name,
+        "url": canonical,
+        "private": bool(raw.get("private")),
+        "profile_data_source": "Facebook 直接瀏覽器",
+    }
+    optional = {
+        "profile_picture": profile_picture,
+        "cover_photo": cover_photo,
+        "profile_intro_text": intro,
+        "current_city": city,
+        "hometown": hometown,
+        "followers": followers,
+        "photos": photos,
+    }
+    item.update({key: value for key, value in optional.items() if value not in (None, "", [], {})})
+    if work:
+        item["works"] = [{"title": work}]
+    if education:
+        item["educations"] = [{"title": education}]
+    return item
+
+
+class FacebookBrowserGateway:
+    def __init__(self, enabled: bool, data_dir: Path, timeout_seconds: int = 60):
+        self.enabled = enabled
+        self.data_dir = data_dir
+        self.timeout_ms = max(10, timeout_seconds) * 1000
+
+    async def profile(self, profile_url: str) -> dict[str, Any]:
+        if not self.enabled:
+            raise FacebookBrowserError("Facebook 直接瀏覽器備援未啟用")
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        async with async_playwright() as playwright:
+            try:
+                context = await playwright.chromium.launch_persistent_context(
+                    str(self.data_dir),
+                    headless=True,
+                    locale="zh-TW",
+                    timezone_id="Asia/Taipei",
+                    viewport={"width": 1365, "height": 900},
+                    args=["--disable-dev-shm-usage"],
+                )
+            except Exception as exc:
+                raise FacebookBrowserError(f"無法啟動 Chromium：{exc}") from exc
+            try:
+                self._require_login(await context.cookies("https://www.facebook.com"))
+                page = context.pages[0] if context.pages else await context.new_page()
+                try:
+                    return await self._read_profile(page, profile_url)
+                except FacebookBrowserError:
+                    raise
+                except Exception as exc:
+                    await self._save_failure(page)
+                    raise FacebookBrowserError(f"Facebook 頁面解析失敗：{exc.__class__.__name__}") from exc
+            finally:
+                await context.close()
+
+    @staticmethod
+    def _require_login(cookies: list[dict[str, Any]]) -> None:
+        if not any(cookie.get("name") == "c_user" and cookie.get("value") for cookie in cookies):
+            raise FacebookBrowserLoginRequired("尚未建立 Facebook 瀏覽器登入狀態")
+
+    async def _read_profile(self, page: Page, profile_url: str) -> dict[str, Any]:
+        try:
+            response = await page.goto(profile_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+            await page.wait_for_timeout(2500)
+        except PlaywrightTimeoutError as exc:
+            await self._save_failure(page)
+            raise FacebookBrowserError("Facebook 頁面載入逾時") from exc
+        current_url = page.url.casefold()
+        body = (await page.locator("body").inner_text(timeout=10_000))[:200_000]
+        folded = body.casefold()
+        if any(part in current_url for part in ("/checkpoint/", "/challenge/", "/recover/")) or any(
+            marker in folded for marker in ("security check", "confirm your identity", "確認你的身分", "安全檢查")
+        ):
+            await self._save_failure(page)
+            raise FacebookBrowserChallengeRequired("Facebook 要求安全驗證，需重新進行互動式登入")
+        if "/login" in current_url or await page.locator("input[name='email'], input[type='password']").count():
+            await self._save_failure(page)
+            raise FacebookBrowserLoginRequired("Facebook 登入狀態已失效，需重新進行互動式登入")
+        if response and response.status >= 400:
+            await self._save_failure(page)
+            raise FacebookBrowserError(f"Facebook 頁面 HTTP {response.status}")
+
+        raw = await page.evaluate(
+            """() => {
+                const meta = (property) => document.querySelector(`meta[property="${property}"]`)?.content || '';
+                const images = [...document.images].map((image) => ({
+                    src: image.currentSrc || image.src || '', alt: image.alt || '',
+                    natural_width: image.naturalWidth || 0, natural_height: image.naturalHeight || 0,
+                }));
+                const text = (document.body?.innerText || '').slice(0, 200000);
+                return {
+                    title: document.title || '', heading: document.querySelector('h1')?.innerText || '',
+                    og_title: meta('og:title'), og_description: meta('og:description'),
+                    og_image: meta('og:image'), og_url: meta('og:url'), text, images,
+                    private: /profile is locked|this profile is locked|這份個人檔案已鎖定|已鎖定個人檔案/i.test(text),
+                };
+            }"""
+        )
+        item = normalize_browser_profile(raw, profile_url)
+        unavailable = any(marker in folded for marker in ("this content isn't available", "content not found", "這則內容目前無法顯示", "找不到這個頁面"))
+        if unavailable or not item.get("name"):
+            await self._save_failure(page)
+            raise FacebookBrowserError("Facebook 直接瀏覽器未取得可用的個人檔案資料")
+        return item
+
+    async def _save_failure(self, page: Page) -> None:
+        try:
+            await page.screenshot(path=str(self.data_dir / "last-failure.png"), full_page=False)
+        except Exception:
+            pass

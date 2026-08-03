@@ -14,6 +14,12 @@ from .apify import ActorResult, ApifyGateway, MonthlyUsage
 from .brightdata import BrightDataError, BrightDataGateway
 from .config import Settings, actor_input, load_settings
 from .db import Database, utcnow
+from .facebook_browser import (
+    FacebookBrowserChallengeRequired,
+    FacebookBrowserError,
+    FacebookBrowserGateway,
+    FacebookBrowserLoginRequired,
+)
 from .ingest import Ingester, external_id
 from .media import MediaStore
 from .telegram import TelegramSender
@@ -59,6 +65,11 @@ class MonitorService:
         self.apify = ApifyGateway(settings.apify_token)
         self.serpapi = SerpApiGateway(settings.serpapi_key)
         self.brightdata = BrightDataGateway(settings.brightdata_api_token, settings.brightdata_dataset_id)
+        self.facebook_browser = FacebookBrowserGateway(
+            settings.facebook_browser_enabled,
+            settings.facebook_browser_data_dir,
+            settings.facebook_browser_timeout_seconds,
+        )
         self.media = MediaStore(self.db, settings.data_dir, settings.low_disk_gb, settings.media_retry_days)
         self.ingester = Ingester(self.db, settings.data_dir, self.media)
         self.telegram = TelegramSender(
@@ -453,23 +464,77 @@ class MonitorService:
 
     async def _try_brightdata_fallback(self, profile: dict[str, Any], primary_error: str) -> bool:
         if not self.settings.brightdata_api_token:
-            return False
+            return await self._try_browser_fallback(profile, primary_error, "Bright Data API token 未設定")
         try:
             item = await self.brightdata.profile(str(profile["url"]))
             await self._store_profile_details(profile, item)
         except BrightDataError as exc:
-            hour = datetime.now(UTC).strftime("%Y-%m-%dT%H")
-            self.db.add_event(
-                f"brightdata:{profile['id']}:{hour}:failed",
-                "brightdata_error",
-                {"title": "Bright Data 備援查詢失敗", "text": f"SerpApi：{primary_error[:450]}\nBright Data：{str(exc)[:450]}"},
-                int(profile["id"]),
-            )
-            return False
+            return await self._try_browser_fallback(profile, primary_error, str(exc))
         self.db.add_event(
             f"brightdata:{profile['id']}:{utcnow()[:13]}:success",
             "brightdata_fallback",
             {"title": "Bright Data 備援查詢成功", "text": f"SerpApi 失敗後已由 Bright Data 更新個人檔案。\n原因：{primary_error[:700]}"},
+            int(profile["id"]),
+        )
+        return True
+
+    async def _try_browser_fallback(self, profile: dict[str, Any], primary_error: str, brightdata_error: str) -> bool:
+        if not self.settings.facebook_browser_enabled:
+            hour = datetime.now(UTC).strftime("%Y-%m-%dT%H")
+            self.db.add_event(
+                f"profile-fallback:{profile['id']}:{hour}:failed",
+                "profile_fallback_error",
+                {
+                    "title": "個人檔案備援查詢失敗",
+                    "text": f"SerpApi：{primary_error[:400]}\nBright Data：{brightdata_error[:400]}\n直接瀏覽器：未啟用",
+                },
+                int(profile["id"]),
+            )
+            return False
+        try:
+            item = await self.facebook_browser.profile(str(profile["url"]))
+            await self._store_profile_details(profile, item)
+        except FacebookBrowserChallengeRequired as exc:
+            day = datetime.now(UTC).date().isoformat()
+            self.db.add_event(
+                f"facebook-browser:{day}:challenge",
+                "facebook_browser_login_required",
+                {
+                    "title": "Facebook 瀏覽器需要安全驗證",
+                    "text": f"{exc}。請在 OCI 啟動 browser-login，透過 Tailscale 互動式完成驗證。",
+                },
+            )
+            return False
+        except FacebookBrowserLoginRequired as exc:
+            day = datetime.now(UTC).date().isoformat()
+            self.db.add_event(
+                f"facebook-browser:{day}:login-required",
+                "facebook_browser_login_required",
+                {
+                    "title": "Facebook 瀏覽器需重新登入",
+                    "text": f"{exc}。請在 OCI 啟動 browser-login，透過 Tailscale 完成互動式登入。",
+                },
+            )
+            return False
+        except FacebookBrowserError as exc:
+            hour = datetime.now(UTC).strftime("%Y-%m-%dT%H")
+            self.db.add_event(
+                f"profile-fallback:{profile['id']}:{hour}:failed",
+                "profile_fallback_error",
+                {
+                    "title": "個人檔案所有備援皆失敗",
+                    "text": f"SerpApi：{primary_error[:300]}\nBright Data：{brightdata_error[:300]}\n直接瀏覽器：{str(exc)[:300]}",
+                },
+                int(profile["id"]),
+            )
+            return False
+        self.db.add_event(
+            f"facebook-browser:{profile['id']}:{utcnow()[:13]}:success",
+            "facebook_browser_fallback",
+            {
+                "title": "Facebook 直接瀏覽器備援成功",
+                "text": "SerpApi 與 Bright Data 失敗後，已由登入中的 Chromium 更新個人檔案。",
+            },
             int(profile["id"]),
         )
         return True

@@ -1,15 +1,20 @@
 FROM python:3.12-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 WORKDIR /app
 
 RUN useradd --create-home --uid 1000 monitor
 COPY pyproject.toml README.md /app/
 COPY fb_monitor /app/fb_monitor
-RUN pip install --upgrade pip && pip install .
-RUN mkdir -p /data && chown -R monitor:monitor /app /data
+COPY scripts /app/scripts
+RUN pip install --upgrade pip && pip install . \
+    && python -m playwright install --with-deps chromium \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends novnc websockify x11vnc \
+    && rm -rf /var/lib/apt/lists/* \
+    && chmod 755 /app/scripts/browser-login.sh
+RUN mkdir -p /data /browser-data && chown -R monitor:monitor /app /data /browser-data /ms-playwright
 
 USER monitor
-EXPOSE 8080
+EXPOSE 8080 6080
 CMD ["fb-monitor", "run"]
-
