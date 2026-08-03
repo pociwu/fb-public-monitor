@@ -1,10 +1,11 @@
+import json
 from pathlib import Path
 
 import pytest
 
 from fb_monitor.apify import ActorResult, MonthlyUsage
 from fb_monitor.config import load_settings
-from fb_monitor.facebook_browser import FacebookBrowserLoginRequired
+from fb_monitor.facebook_browser import FacebookBrowserError, FacebookBrowserLoginRequired
 from fb_monitor.serpapi import SerpApiAccount, SerpApiError, SerpApiProfileResult
 from fb_monitor.service import MonitorService, actor_summary_error
 
@@ -286,6 +287,39 @@ schedule:
     assert profile["public_state"] == "unknown"
     assert profile["serp_last_checked_at"] is None
     assert service.db.row("SELECT COUNT(*) count FROM events WHERE event_type='facebook_browser_login_required'")["count"] == 1
+    event = service.db.row("SELECT payload_json FROM events WHERE event_type='facebook_browser_login_required'")
+    payload = json.loads(event["payload_json"])
+    assert "監控網址：https://facebook.com/100" in payload["text"]
+    assert payload["source_url"] == "https://facebook.com/100"
+
+
+@pytest.mark.asyncio
+async def test_all_profile_fallback_failure_includes_monitored_url(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """profiles:
+  - name: FB-100
+    url: https://facebook.com/100
+storage:
+  data_dir: data
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("FACEBOOK_BROWSER_ENABLED", "1")
+    service = MonitorService(load_settings(config))
+    profile = service.db.row("SELECT * FROM profiles WHERE id=1")
+
+    async def failed_browser(url):
+        raise FacebookBrowserError("no profile data")
+
+    service.facebook_browser.profile = failed_browser
+    assert await service._try_browser_fallback(profile, "serp failed", "bright failed") is False
+
+    event = service.db.row("SELECT payload_json FROM events WHERE event_type='profile_fallback_error'")
+    payload = json.loads(event["payload_json"])
+    assert "監控網址：https://facebook.com/100" in payload["text"]
+    assert payload["source_url"] == "https://facebook.com/100"
 
 
 def test_browser_heading_repair_resets_bad_name_and_queues_refresh(tmp_path: Path, monkeypatch):

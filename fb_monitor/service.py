@@ -400,15 +400,23 @@ class MonitorService:
                 self.db.add_event(
                     f"serpapi:{day}:quota",
                     "serpapi_quota",
-                    {"title": "SerpApi 免費查詢額度已用完", "text": f"{exc}；若已設定 Bright Data 將改用備援，貼文仍依 Apify 額度執行。"},
+                    {
+                        "title": "SerpApi 免費查詢額度已用完",
+                        "text": f"{exc}；若已設定 Bright Data 將改用備援，貼文仍依 Apify 額度執行。\n監控網址：{profile['url']}",
+                        "source_url": profile["url"],
+                    },
                 )
                 await self._try_brightdata_fallback(profile, str(exc))
             except SerpApiError as exc:
                 hour = datetime.now(UTC).strftime("%Y-%m-%dT%H")
                 self.db.add_event(
-                    f"serpapi:{hour}:failed",
+                    f"serpapi:{profile_id}:{hour}:failed",
                     "serpapi_error",
-                    {"title": "SerpApi 個人檔案查詢失敗", "text": str(exc)[:1000]},
+                    {
+                        "title": "SerpApi 個人檔案查詢失敗",
+                        "text": f"{str(exc)[:850]}\n監控網址：{profile['url']}",
+                        "source_url": profile["url"],
+                    },
                     profile_id,
                 )
                 await self._try_brightdata_fallback(profile, str(exc))
@@ -505,7 +513,8 @@ class MonitorService:
                 "profile_fallback_error",
                 {
                     "title": "個人檔案備援查詢失敗",
-                    "text": f"SerpApi：{primary_error[:400]}\nBright Data：{brightdata_error[:400]}\n直接瀏覽器：未啟用",
+                    "text": f"SerpApi：{primary_error[:350]}\nBright Data：{brightdata_error[:350]}\n直接瀏覽器：未啟用\n監控網址：{profile['url']}",
+                    "source_url": profile["url"],
                 },
                 int(profile["id"]),
             )
@@ -520,7 +529,8 @@ class MonitorService:
                 "facebook_browser_login_required",
                 {
                     "title": "Facebook 瀏覽器需要安全驗證",
-                    "text": f"{exc}。請在 OCI 啟動 browser-login，透過 Tailscale 互動式完成驗證。",
+                    "text": f"{exc}。請在 OCI 啟動 browser-login，透過 Tailscale 互動式完成驗證。\n監控網址：{profile['url']}",
+                    "source_url": profile["url"],
                 },
             )
             return False
@@ -531,7 +541,8 @@ class MonitorService:
                 "facebook_browser_login_required",
                 {
                     "title": "Facebook 瀏覽器需重新登入",
-                    "text": f"{exc}。請在 OCI 啟動 browser-login，透過 Tailscale 完成互動式登入。",
+                    "text": f"{exc}。請在 OCI 啟動 browser-login，透過 Tailscale 完成互動式登入。\n監控網址：{profile['url']}",
+                    "source_url": profile["url"],
                 },
             )
             return False
@@ -542,7 +553,8 @@ class MonitorService:
                 "profile_fallback_error",
                 {
                     "title": "個人檔案所有備援皆失敗",
-                    "text": f"SerpApi：{primary_error[:300]}\nBright Data：{brightdata_error[:300]}\n直接瀏覽器：{str(exc)[:300]}",
+                    "text": f"SerpApi：{primary_error[:260]}\nBright Data：{brightdata_error[:260]}\n直接瀏覽器：{str(exc)[:260]}\n監控網址：{profile['url']}",
+                    "source_url": profile["url"],
                 },
                 int(profile["id"]),
             )
@@ -762,7 +774,16 @@ class MonitorService:
         failures = int(profile["consecutive_failures"]) + 1
         self.db.execute("UPDATE profiles SET consecutive_failures=?,last_error=? WHERE id=?", (failures, str(exc)[:1000], profile_id))
         if failures in {1, 3}:
-            self.db.add_event(f"profile:{profile_id}:error:{failures}:{utcnow()[:13]}", "system_error", {"title": f"{profile['name']} 抓取失敗（連續 {failures} 次）", "text": str(exc)}, profile_id)
+            self.db.add_event(
+                f"profile:{profile_id}:error:{failures}:{utcnow()[:13]}",
+                "system_error",
+                {
+                    "title": f"{profile['name']} 抓取失敗（連續 {failures} 次）",
+                    "text": f"{str(exc)[:850]}\n監控網址：{profile['url']}",
+                    "source_url": profile["url"],
+                },
+                profile_id,
+            )
         self._schedule_next(profile_id)
 
     def _schedule_next(self, profile_id: int) -> None:
