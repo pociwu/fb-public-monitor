@@ -13,6 +13,10 @@ RUN pip install --upgrade pip && pip install . \
     && apt-get install -y --no-install-recommends novnc websockify x11vnc \
     && rm -rf /var/lib/apt/lists/* \
     && chmod 755 /app/scripts/browser-login.sh
+
+ARG APP_VERSION=development
+ARG APP_UPDATED_AT=
+ENV APP_VERSION=${APP_VERSION} APP_UPDATED_AT=${APP_UPDATED_AT}
 RUN mkdir -p /data /browser-data && chown -R monitor:monitor /app /data /browser-data /ms-playwright
 
 USER monitor

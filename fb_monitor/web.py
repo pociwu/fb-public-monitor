@@ -140,6 +140,8 @@ def _attach_current_media(db: Database, entities: list[dict[str, Any]]) -> None:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     cfg = settings or load_settings()
+    templates.env.globals["app_version"] = cfg.app_version
+    templates.env.globals["app_updated_display"] = display_time(cfg.app_updated_at, cfg.timezone) if cfg.app_updated_at else ""
     service = MonitorService(cfg)
 
     @asynccontextmanager

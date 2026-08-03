@@ -1,6 +1,10 @@
 services:
   monitor:
-    build: .
+    build:
+      context: .
+      args:
+        APP_VERSION: "${APP_VERSION:-development}"
+        APP_UPDATED_AT: "${APP_UPDATED_AT:-}"
     restart: unless-stopped
     env_file: .env
     volumes:
@@ -18,7 +22,11 @@ services:
       retries: 3
       start_period: 20s
   browser-login:
-    build: .
+    build:
+      context: .
+      args:
+        APP_VERSION: "${APP_VERSION:-development}"
+        APP_UPDATED_AT: "${APP_UPDATED_AT:-}"
     profiles: ["browser-login"]
     env_file: .env
     volumes:

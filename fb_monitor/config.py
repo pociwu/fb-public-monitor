@@ -143,6 +143,8 @@ class Settings:
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     scheduler_enabled: bool = True
+    app_version: str = "development"
+    app_updated_at: str = ""
 
     @property
     def db_path(self) -> Path:
@@ -219,6 +221,8 @@ def load_settings(path: str | Path | None = None) -> Settings:
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
         scheduler_enabled=os.getenv("FB_MONITOR_SCHEDULER", "1") not in {"0", "false", "False"},
+        app_version=os.getenv("APP_VERSION", "development"),
+        app_updated_at=os.getenv("APP_UPDATED_AT", ""),
     )
 
 

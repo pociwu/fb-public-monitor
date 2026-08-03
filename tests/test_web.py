@@ -30,6 +30,22 @@ def test_dashboard_health_and_diagnostics_routes(tmp_path: Path, monkeypatch):
         assert "請輸入 Facebook 個人檔案網址" in invalid_add.text
 
 
+def test_page_footer_shows_deployed_version_and_taipei_update_time(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text("profiles: []\nstorage:\n  data_dir: data\n", encoding="utf-8")
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("APP_VERSION", "331c1cd")
+    monkeypatch.setenv("APP_UPDATED_AT", "2026-08-03T04:05:00+00:00")
+    app = create_app(load_settings(config))
+
+    with TestClient(app) as client:
+        dashboard = client.get("/")
+
+    assert dashboard.status_code == 200
+    assert "版本：331c1cd" in dashboard.text
+    assert "更新時間：2026-08-03 12:05" in dashboard.text
+
+
 def test_dashboard_shows_official_usage_reset_countdown(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text("profiles: []\nstorage:\n  data_dir: data\nbudget:\n  monthly_usd: 5\n", encoding="utf-8")
