@@ -624,7 +624,7 @@ class MonitorService:
             f"browser-canary:{profile['id']}:{utcnow()[:13]}:done",
             "browser_canary",
             {
-                "title": "Chromium 金絲雀補抓完成",
+                "title": "Chromium 金絲雀本輪補抓完成",
                 "text": (
                     f"Apify {api_result_count} 篇；補抓 {len(items)} 篇、"
                     f"{sum(len(item.get('images') or []) for item in items)} 張照片；"

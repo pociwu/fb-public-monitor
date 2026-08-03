@@ -196,9 +196,11 @@ async def test_album_walker_keeps_advancing_until_photo_repeats(tmp_path: Path, 
     class FakePage:
         def __init__(self):
             self.visited = []
+            self.url = ""
 
         async def goto(self, url: str, **kwargs):
             self.visited.append(url)
+            self.url = url
             return Response()
 
         async def wait_for_timeout(self, milliseconds: int):
@@ -230,7 +232,7 @@ async def test_album_walker_keeps_advancing_until_photo_repeats(tmp_path: Path, 
     monkeypatch.setattr(gateway, "_largest_viewer_image", current_viewer_image)
     monkeypatch.setattr(gateway, "_click_next_photo", click_next)
 
-    photos = await gateway._collect_post_album_photos(page, "https://www.facebook.com/example/posts/p1")
+    photos, progress = await gateway._collect_post_album_photos(page, "https://www.facebook.com/example/posts/p1")
 
     assert page.visited == [
         "https://www.facebook.com/example/posts/p1",
@@ -241,6 +243,55 @@ async def test_album_walker_keeps_advancing_until_photo_repeats(tmp_path: Path, 
         "facebook-cdn:/v/photo-b.jpg",
         "facebook-cdn:/v/photo-c.jpg",
     ]
+    assert progress["completed"] is True
+    assert progress["resume_url"] == ""
+
+
+@pytest.mark.asyncio
+async def test_album_walker_saves_resume_state_when_batch_limit_is_reached(tmp_path: Path, monkeypatch):
+    class Response:
+        status = 200
+
+    class Links:
+        async def evaluate_all(self, expression: str):
+            return ["https://www.facebook.com/photo/?fbid=1"]
+
+    class FakePage:
+        url = ""
+
+        async def goto(self, url: str, **kwargs):
+            self.url = url
+            return Response()
+
+        async def wait_for_timeout(self, milliseconds: int):
+            return None
+
+        def locator(self, selector: str):
+            return Links()
+
+    gateway = FacebookBrowserGateway(True, tmp_path)
+    gateway.album_batch_max_new_photos = 1
+
+    async def no_grid_images(current_page, selector):
+        return []
+
+    async def current_viewer_image(current_page):
+        return "https://scontent.example.fbcdn.net/v/photo-new.jpg?token=1"
+
+    async def unexpected_click(current_page):
+        raise AssertionError("batch should stop before clicking next")
+
+    monkeypatch.setattr(gateway, "_large_facebook_images", no_grid_images)
+    monkeypatch.setattr(gateway, "_largest_viewer_image", current_viewer_image)
+    monkeypatch.setattr(gateway, "_click_next_photo", unexpected_click)
+
+    photos, progress = await gateway._collect_post_album_photos(FakePage(), "https://www.facebook.com/example/posts/p1")
+
+    assert len(photos) == 1
+    assert progress["completed"] is False
+    assert progress["resume_url"] == "https://www.facebook.com/photo/?fbid=1"
+    gateway._save_album_progress({"post": progress})
+    assert gateway._load_album_progress()["post"]["resume_url"] == progress["resume_url"]
 
 
 @pytest.mark.asyncio

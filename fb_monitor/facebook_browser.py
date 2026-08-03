@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import random
 import re
 import time
@@ -271,8 +272,28 @@ class FacebookBrowserGateway:
         self.data_dir = data_dir
         self.timeout_ms = max(10, timeout_seconds) * 1000
         self.canary_max_posts = max(0, min(2, canary_max_posts))
+        self.album_batch_max_new_photos = 30
+        self.album_batch_max_seconds = 180
         self._canary_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self._expanded_canary_cache: set[str] = set()
+
+    @property
+    def _album_progress_path(self) -> Path:
+        return self.data_dir / "canary-album-progress.json"
+
+    def _load_album_progress(self) -> dict[str, dict[str, Any]]:
+        try:
+            value = json.loads(self._album_progress_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def _save_album_progress(self, progress: dict[str, dict[str, Any]]) -> None:
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        target = self._album_progress_path
+        temporary = target.with_suffix(".tmp")
+        temporary.write_text(json.dumps(progress, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        temporary.replace(target)
 
     def cached_canary_posts(self, profile_url: str, max_age_seconds: int = 600) -> list[dict[str, Any]] | None:
         cached = self._canary_cache.get(profile_url.rstrip("/"))
@@ -302,6 +323,7 @@ class FacebookBrowserGateway:
     async def _expand_canary_albums(self, posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Open each selected permalink and walk its photo viewer until it ends."""
         expanded = [dict(post) for post in posts]
+        progress = self._load_album_progress()
         async with async_playwright() as playwright:
             try:
                 context = await playwright.chromium.launch_persistent_context(
@@ -318,10 +340,21 @@ class FacebookBrowserGateway:
                 self._require_login(await context.cookies("https://www.facebook.com"))
                 page = context.pages[0] if context.pages else await context.new_page()
                 for post in expanded:
-                    try:
-                        discovered = await self._collect_post_album_photos(page, str(post.get("source_url") or ""))
-                    except Exception:
+                    post_url = str(post.get("source_url") or "")
+                    progress_key = normalize_url(post_url)
+                    state = progress.get(progress_key, {})
+                    if bool(state.get("completed")):
                         discovered = []
+                        next_state = state
+                    else:
+                        try:
+                            discovered, next_state = await self._collect_post_album_photos(page, post_url, state)
+                        except Exception:
+                            discovered = []
+                            next_state = state
+                    if progress_key:
+                        progress[progress_key] = next_state
+                        self._save_album_progress(progress)
                     images = [item for item in post.get("images") or [] if isinstance(item, dict) and item.get("url")]
                     seen = {normalize_url(str(item["url"])) for item in images}
                     for url in discovered:
@@ -335,40 +368,69 @@ class FacebookBrowserGateway:
                 await context.close()
         return expanded
 
-    async def _collect_post_album_photos(self, page: Page, post_url: str) -> list[str]:
+    async def _collect_post_album_photos(
+        self,
+        page: Page,
+        post_url: str,
+        progress: dict[str, Any] | None = None,
+    ) -> tuple[list[str], dict[str, Any]]:
+        state = dict(progress or {})
         if not post_url:
-            return []
+            return [], state
         response = await page.goto(post_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
         if response and response.status >= 400:
             raise FacebookBrowserError(f"Facebook 貼文頁面 HTTP {response.status}")
         await page.wait_for_timeout(round(random.uniform(2200, 3800)))
         photos = await self._large_facebook_images(page, "[role='main'] [role='article'] img, main [role='article'] img")
-        seen = {normalize_url(url) for url in photos}
+        seen = {str(value) for value in state.get("seen_assets") or [] if value}
+        seen.update(normalize_url(url) for url in photos)
+
+        if bool(state.get("completed")):
+            return photos, state
 
         photo_links = await page.locator(
             "[role='main'] [role='article'] a[href*='/photo'], main [role='article'] a[href*='/photo']"
         ).evaluate_all("nodes => nodes.map(node => node.href || '').filter(Boolean)")
         first_photo_url = next((str(url) for url in photo_links if "/photo" in str(url)), "")
+        resume_url = str(state.get("resume_url") or "")
+        resume_host = (urlsplit(resume_url).hostname or "").casefold()
+        if resume_host != "facebook.com" and not resume_host.endswith(".facebook.com"):
+            resume_url = ""
+        first_photo_url = resume_url or first_photo_url
         if not first_photo_url:
-            return photos
+            state.update({"seen_assets": sorted(seen), "resume_url": "", "completed": True})
+            return photos, state
 
         await page.goto(first_photo_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
         await page.wait_for_timeout(round(random.uniform(1800, 3200)))
         previous_asset = ""
         viewer_seen: set[str] = set()
+        new_photos = 0
+        started_at = time.monotonic()
+        completed = False
+        resume_url = first_photo_url
         # This is a loop-safety circuit breaker, not a configured photo limit.
         # Normal termination is no next button or returning to a seen photo.
         for _ in range(500):
             current = await self._largest_viewer_image(page)
             asset = normalize_url(current)
             if not current or (asset and asset in viewer_seen):
+                completed = True
                 break
             viewer_seen.add(asset)
             if asset not in seen:
                 photos.append(current)
                 seen.add(asset)
+                new_photos += 1
             previous_asset = asset
+            resume_url = page.url
+            if (
+                new_photos >= self.album_batch_max_new_photos
+                or time.monotonic() - started_at >= self.album_batch_max_seconds
+            ):
+                break
             if not await self._click_next_photo(page):
+                completed = True
                 break
             changed = False
             for _ in range(8):
@@ -378,9 +440,16 @@ class FacebookBrowserGateway:
                     changed = True
                     break
             if not changed:
+                completed = True
                 break
-            await page.wait_for_timeout(round(random.uniform(1200, 2600)))
-        return photos
+            await page.wait_for_timeout(round(random.uniform(3000, 7000)))
+        state.update({
+            "seen_assets": sorted(seen),
+            "resume_url": "" if completed else resume_url,
+            "completed": completed,
+            "updated_at": time.time(),
+        })
+        return photos, state
 
     @staticmethod
     async def _large_facebook_images(page: Page, selector: str) -> list[str]:
