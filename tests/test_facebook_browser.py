@@ -128,6 +128,35 @@ def test_normalize_browser_profile_uses_name_before_combined_follow_summary():
     assert item["followers"] == "503"
 
 
+def test_normalize_browser_profile_combines_primary_name_alias_and_svg_avatar():
+    item = normalize_browser_profile(
+        {
+            "main_heading": "",
+            "headings": ["（林小黑）"],
+            "role_headings": ["（林小黑）"],
+            "og_title": "(4) Facebook",
+            "title": "(4) Facebook",
+            "text": "林純玉\n（林小黑）\n164 位朋友\n全部\n關於\n朋友\n相片",
+            "images": [
+                {
+                    "src": "https://scontent.example.fbcdn.net/v/avatar.jpg",
+                    "alt": "",
+                    "natural_width": 0,
+                    "natural_height": 0,
+                    "rendered_width": 300,
+                    "rendered_height": 300,
+                    "x": 100,
+                    "y": 350,
+                }
+            ],
+        },
+        "https://www.facebook.com/100000117208012",
+    )
+
+    assert item["name"] == "林純玉（林小黑）"
+    assert item["profile_picture"] == "https://scontent.example.fbcdn.net/v/avatar.jpg"
+
+
 @pytest.mark.asyncio
 async def test_browser_capture_is_saved_per_profile(tmp_path: Path):
     class FakePage:

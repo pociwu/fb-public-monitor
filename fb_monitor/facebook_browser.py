@@ -49,7 +49,11 @@ def _first_labeled_value(lines: list[str], labels: tuple[str, ...]) -> str:
 
 def _clean_name_candidate(value: object) -> str:
     candidate = re.sub(r"\s*[|\-]‎?\s*Facebook\s*$", "", str(value or ""), flags=re.IGNORECASE).strip()
-    if candidate.casefold() in _FACEBOOK_UI_HEADINGS or re.fullmatch(r"\(\d+\)\s*facebook", candidate, flags=re.IGNORECASE):
+    if (
+        candidate.casefold() in _FACEBOOK_UI_HEADINGS
+        or re.fullmatch(r"\(\d+\)\s*facebook", candidate, flags=re.IGNORECASE)
+        or re.fullmatch(r"[\(（][^\(（\)）]{1,80}[\)）]", candidate)
+    ):
         return ""
     return candidate
 
@@ -81,10 +85,14 @@ def _name_from_profile_summary(lines: list[str]) -> str:
     for index, line in enumerate(lines):
         if not count_pattern.fullmatch(line):
             continue
+        alias = ""
         for candidate_line in reversed(lines[max(0, index - 3):index]):
+            if re.fullmatch(r"[\(（][^\(（\)）]{1,80}[\)）]", candidate_line):
+                alias = candidate_line
+                continue
             candidate = _clean_name_candidate(candidate_line)
             if candidate and len(candidate) <= 80 and not candidate.startswith(("http://", "https://")):
-                return candidate
+                return f"{candidate}{alias}" if alias and alias not in candidate else candidate
     return ""
 
 
@@ -95,15 +103,19 @@ def normalize_browser_profile(raw: dict[str, Any], profile_url: str) -> dict[str
     images = [item for item in raw.get("images", []) if isinstance(item, dict) and item.get("src")]
     headings = raw.get("headings") if isinstance(raw.get("headings"), list) else []
     role_headings = raw.get("role_headings") if isinstance(raw.get("role_headings"), list) else []
+    summary_name = _name_from_profile_summary(lines)
+    aliased_summary = summary_name if re.search(r"[\(（][^\(（\)）]{1,80}[\)）]$", summary_name) else ""
     name_candidates = [
-        raw.get("main_heading"), *role_headings, *headings,
-        _name_from_profile_image(images), _name_from_profile_summary(lines),
+        aliased_summary, raw.get("main_heading"), *role_headings, *headings,
+        _name_from_profile_image(images), summary_name,
         raw.get("og_title"), raw.get("heading"), raw.get("title"),
     ]
     name = next((candidate for value in name_candidates if (candidate := _clean_name_candidate(value))), "")
 
     def image_score(item: dict[str, Any]) -> int:
-        return int(item.get("natural_width") or 0) * int(item.get("natural_height") or 0)
+        width = int(item.get("natural_width") or item.get("rendered_width") or 0)
+        height = int(item.get("natural_height") or item.get("rendered_height") or 0)
+        return width * height
 
     def image_asset_key(value: object) -> str:
         parsed = urlsplit(str(value or ""))
@@ -113,6 +125,14 @@ def normalize_browser_profile(raw: dict[str, Any], profile_url: str) -> dict[str
         item for item in images
         if any(word in str(item.get("alt") or "").casefold() for word in ("profile picture", "個人大頭貼", "大頭貼照片", "頭像"))
     ]
+    if not profile_candidates:
+        profile_candidates = [
+            item for item in images
+            if 96 <= int(item.get("rendered_width") or 0) <= 420
+            and 96 <= int(item.get("rendered_height") or 0) <= 420
+            and 0.75 <= int(item.get("rendered_width") or 0) / max(1, int(item.get("rendered_height") or 0)) <= 1.34
+            and 0 <= int(item.get("y") or 0) <= 650
+        ]
     cover_candidates = [
         item for item in images
         if any(word in str(item.get("alt") or "").casefold() for word in ("cover photo", "封面相片", "封面照片"))
@@ -126,8 +146,8 @@ def normalize_browser_profile(raw: dict[str, Any], profile_url: str) -> dict[str
     for image in sorted(images, key=image_score, reverse=True):
         src = str(image.get("src") or "")
         asset_key = image_asset_key(src)
-        width = int(image.get("natural_width") or 0)
-        height = int(image.get("natural_height") or 0)
+        width = int(image.get("natural_width") or image.get("rendered_width") or 0)
+        height = int(image.get("natural_height") or image.get("rendered_height") or 0)
         if src in excluded or asset_key in excluded_assets or not src.startswith("http") or width < 180 or height < 180:
             continue
         if "fbcdn.net" not in (urlsplit(src).hostname or ""):
@@ -221,13 +241,17 @@ class FacebookBrowserGateway:
                 """() => {
                     const heading = document.querySelector('[role="main"] h1, main h1, h1, [role="heading"][aria-level="1"]');
                     if (!heading || !(heading.innerText || '').trim()) return false;
-                    const visibleImages = [...document.images].filter((image) => {
-                        const src = image.currentSrc || image.src || '';
+                    const visibleImages = [...document.querySelectorAll('img, svg image')].filter((image) => {
+                        const src = image.currentSrc || image.src || image.href?.baseVal || image.getAttribute('href') || '';
                         const rect = image.getBoundingClientRect();
                         return src.includes('fbcdn.net') && rect.width > 0 && rect.height > 0;
                     });
                     return visibleImages.length === 0 || visibleImages.some(
-                        (image) => image.complete && image.naturalWidth >= 180 && image.naturalHeight >= 180
+                        (image) => {
+                            const rect = image.getBoundingClientRect();
+                            return (image.complete && image.naturalWidth >= 180 && image.naturalHeight >= 180)
+                                || (image.tagName.toLowerCase() === 'image' && rect.width >= 96 && rect.height >= 96);
+                        }
                     );
                 }""",
                 timeout=5000,
@@ -263,10 +287,16 @@ class FacebookBrowserGateway:
         raw = await page.evaluate(
             """() => {
                 const meta = (property) => document.querySelector(`meta[property="${property}"]`)?.content || '';
-                const images = [...document.images].map((image) => ({
-                    src: image.currentSrc || image.src || '', alt: image.alt || '',
-                    natural_width: image.naturalWidth || 0, natural_height: image.naturalHeight || 0,
-                }));
+                const images = [...document.querySelectorAll('img, svg image')].map((image) => {
+                    const rect = image.getBoundingClientRect();
+                    return {
+                        src: image.currentSrc || image.src || image.href?.baseVal || image.getAttribute('href') || '',
+                        alt: image.alt || image.getAttribute('aria-label') || image.closest('[aria-label]')?.getAttribute('aria-label') || '',
+                        natural_width: image.naturalWidth || 0, natural_height: image.naturalHeight || 0,
+                        rendered_width: Math.round(rect.width), rendered_height: Math.round(rect.height),
+                        x: Math.round(rect.x), y: Math.round(rect.y),
+                    };
+                });
                 const text = (document.body?.innerText || '').slice(0, 200000);
                 return {
                     title: document.title || '', heading: document.querySelector('h1')?.innerText || '',
