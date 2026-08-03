@@ -348,6 +348,30 @@ storage:
     assert service.db.row("SELECT COUNT(*) count FROM jobs WHERE profile_id=1 AND job_type='visit' AND priority=-50")["count"] == 1
 
 
+def test_historical_name_repair_restores_latest_known_name(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: FB-100\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    service = MonitorService(load_settings(config))
+    service.db.execute("UPDATE profiles SET display_name='FB-100' WHERE id=1")
+    entity_id = service.db.execute(
+        """INSERT INTO entities(profile_id,kind,external_id,current_hash,present,first_seen_at,last_seen_at)
+        VALUES(1,'profile','100','current',1,'2026-08-01','2026-08-03')"""
+    )
+    service.db.execute(
+        """INSERT INTO versions(entity_id,content_hash,normalized_json,raw_path,seen_at,change_type)
+        VALUES(?,?,?,?,?,?)""",
+        (entity_id, "known", '{"authorName":"吳佳欣"}', "known.json", "2026-08-02", "created"),
+    )
+
+    service._seed_historical_name_repair()
+
+    assert service.db.row("SELECT display_name FROM profiles WHERE id=1")["display_name"] == "吳佳欣"
+
+
 @pytest.mark.asyncio
 async def test_manual_visit_bypasses_global_spacing(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"

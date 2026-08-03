@@ -19,6 +19,8 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 
 from .config import MAX_PROFILES, Settings, add_profile_to_config, load_settings, remove_profile_from_config
 from .db import Database, utcnow
+from .ingest import is_placeholder_profile_name
+from .normalize import normalize_url
 from .service import MonitorService
 from .serpapi import profile_id_from_url
 from .timeutil import display_time, parse_time
@@ -33,6 +35,28 @@ def _json(value: str | None) -> Any:
         return json.loads(value or "{}")
     except json.JSONDecodeError:
         return {}
+
+
+def _attach_profile_name_history(db: Database, profile: dict[str, Any]) -> None:
+    names: list[str] = []
+    rows = db.rows(
+        """SELECT v.normalized_json FROM versions v
+        JOIN entities e ON e.id=v.entity_id
+        WHERE e.profile_id=? AND e.kind='profile'
+        ORDER BY v.seen_at DESC,v.id DESC""",
+        (profile["id"],),
+    )
+    for row in rows:
+        payload = _json(row.get("normalized_json"))
+        name = str(payload.get("authorName") or "").strip()
+        if is_placeholder_profile_name(name) or name in names:
+            continue
+        names.append(name)
+    current = str(profile.get("display_name") or "")
+    if is_placeholder_profile_name(current) and names:
+        profile["display_name"] = names[0]
+        current = names[0]
+    profile["previous_names"] = [name for name in names if name != current]
 
 
 def _first_value(item: dict[str, Any], keys: tuple[str, ...]) -> Any:
@@ -150,6 +174,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             FROM profiles p WHERE p.enabled=1 ORDER BY COALESCE(p.sort_order,p.id),p.id""")
         for profile in profiles:
             _attach_browser_capture(profile, cfg)
+            _attach_profile_name_history(db, profile)
             profile["last_success_display"] = display_time(profile.get("last_success_at"), cfg.timezone)
             profile["next_visit_display"] = display_time(profile.get("next_visit_at"), cfg.timezone)
             profile["manual_available_at"] = ""
@@ -176,12 +201,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     profile["work_labels"].extend(labels)
                 elif section.get("section_type") in {"college", "secondary_school", "education"}:
                     profile["education_labels"].extend(labels)
-            profile["public_photo_ids"] = [row["id"] for row in db.rows(
-                """SELECT DISTINCT m.id FROM media m JOIN entity_media em ON em.media_id=m.id
+            excluded_assets: set[str] = set()
+            for media_id in (profile.get("avatar_media_id"), profile.get("cover_media_id")):
+                if media_id and (media_row := db.row("SELECT source_url FROM media WHERE id=?", (media_id,))):
+                    excluded_assets.add(normalize_url(str(media_row["source_url"])))
+            public_photo_rows = db.rows(
+                """SELECT DISTINCT m.id,m.source_url FROM media m JOIN entity_media em ON em.media_id=m.id
                 JOIN entities e ON e.id=em.entity_id WHERE e.profile_id=? AND e.kind='profile'
-                AND m.status='ready' AND em.role='image' ORDER BY em.version_id DESC,m.id DESC LIMIT 4""",
+                AND em.version_id=e.current_version_id
+                AND m.status='ready' AND em.role='image' ORDER BY em.version_id DESC,m.id DESC LIMIT 12""",
                 (profile["id"],),
-            )]
+            )
+            profile["public_photo_ids"] = [
+                row["id"] for row in public_photo_rows
+                if normalize_url(str(row["source_url"])) not in excluded_assets
+            ][:4]
         usage = db.rows("SELECT * FROM usage ORDER BY month DESC,category")
         pending = db.row("SELECT COUNT(*) count FROM jobs WHERE status IN ('pending','running')")
         outbox = db.row("SELECT COUNT(*) count FROM outbox WHERE status='pending'")
@@ -312,6 +346,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not profile:
             raise HTTPException(404)
         _attach_browser_capture(profile, cfg)
+        _attach_profile_name_history(db, profile)
         size, offset = 20, (page - 1) * 20
         params: tuple[Any, ...] = (profile_id, kind)
         where = "e.profile_id=? AND e.kind=?"

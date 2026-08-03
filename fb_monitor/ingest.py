@@ -87,7 +87,24 @@ def profile_display_name(item: dict[str, Any]) -> str:
     if isinstance(nested, dict):
         candidates.extend(nested.get(key) for key in ("name", "title", "fullName", "profileName"))
     candidates.extend(item.get(key) for key in ("title", "name", "pageName", "profileName", "source_profile_name"))
-    return next((normalize_text(value) for value in candidates if isinstance(value, str) and normalize_text(value)), "")
+    return next(
+        (
+            normalize_text(value)
+            for value in candidates
+            if isinstance(value, str) and not is_placeholder_profile_name(value)
+        ),
+        "",
+    )
+
+
+def is_placeholder_profile_name(value: object) -> bool:
+    name = normalize_text(value)
+    if not name:
+        return True
+    return bool(
+        re.fullmatch(r"(?:FB|Facebook)[\s_-]*\d+", name, flags=re.IGNORECASE)
+        or re.fullmatch(r"\(\d+\)\s*Facebook", name, flags=re.IGNORECASE)
+    )
 
 
 def embedded_posts(item: dict[str, Any]) -> list[dict[str, Any]]:

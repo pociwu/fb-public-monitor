@@ -105,6 +105,10 @@ def normalize_browser_profile(raw: dict[str, Any], profile_url: str) -> dict[str
     def image_score(item: dict[str, Any]) -> int:
         return int(item.get("natural_width") or 0) * int(item.get("natural_height") or 0)
 
+    def image_asset_key(value: object) -> str:
+        parsed = urlsplit(str(value or ""))
+        return f"{parsed.netloc.casefold()}{parsed.path}"
+
     profile_candidates = [
         item for item in images
         if any(word in str(item.get("alt") or "").casefold() for word in ("profile picture", "個人大頭貼", "大頭貼照片", "頭像"))
@@ -117,17 +121,20 @@ def normalize_browser_profile(raw: dict[str, Any], profile_url: str) -> dict[str
     cover_photo = str(max(cover_candidates, key=image_score).get("src")) if cover_candidates else ""
 
     excluded = {profile_picture, cover_photo}
+    excluded_assets = {image_asset_key(src) for src in excluded if src}
     photos = []
     for image in sorted(images, key=image_score, reverse=True):
         src = str(image.get("src") or "")
+        asset_key = image_asset_key(src)
         width = int(image.get("natural_width") or 0)
         height = int(image.get("natural_height") or 0)
-        if src in excluded or not src.startswith("http") or width < 180 or height < 180:
+        if src in excluded or asset_key in excluded_assets or not src.startswith("http") or width < 180 or height < 180:
             continue
         if "fbcdn.net" not in (urlsplit(src).hostname or ""):
             continue
         photos.append({"url": src})
         excluded.add(src)
+        excluded_assets.add(asset_key)
         if len(photos) == 6:
             break
 

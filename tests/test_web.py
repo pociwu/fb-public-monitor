@@ -75,6 +75,39 @@ def test_dashboard_card_shows_serpapi_profile_details(tmp_path: Path, monkeypatc
         assert "data-copy-profile" in dashboard.text
 
 
+def test_dashboard_recovers_and_shows_recorded_profile_names(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: FB-100\n    url: https://www.facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    app = create_app(load_settings(config))
+    db = app.state.db
+    entity_id = db.execute(
+        """INSERT INTO entities(profile_id,kind,external_id,current_hash,present,first_seen_at,last_seen_at)
+        VALUES(1,'profile','100','new',1,'2026-08-01','2026-08-03')"""
+    )
+    db.execute(
+        """INSERT INTO versions(entity_id,content_hash,normalized_json,raw_path,seen_at,change_type)
+        VALUES(?,?,?,?,?,?)""",
+        (entity_id, "old", '{"authorName":"吳佳欣"}', "old.json", "2026-08-01", "created"),
+    )
+    db.execute(
+        """INSERT INTO versions(entity_id,content_hash,normalized_json,raw_path,seen_at,change_type)
+        VALUES(?,?,?,?,?,?)""",
+        (entity_id, "older", '{"authorName":"吳小姐"}', "older.json", "2026-07-01", "created"),
+    )
+
+    with TestClient(app) as client:
+        dashboard = client.get("/")
+
+    assert dashboard.status_code == 200
+    assert "吳佳欣" in dashboard.text
+    assert "曾用名稱" in dashboard.text
+    assert "吳小姐" in dashboard.text
+
+
 def test_profile_card_links_to_latest_browser_screenshot(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text(
@@ -158,6 +191,50 @@ storage:
         assert thumbnail.status_code == 200
         assert thumbnail.headers["content-type"].startswith("image/webp")
         assert client.get("/profiles/1?kind=post&media_filter=image").status_code == 200
+
+
+def test_dashboard_hides_cover_preview_from_public_photos(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    app = create_app(load_settings(config))
+    db = app.state.db
+    entity_id = db.execute(
+        """INSERT INTO entities(profile_id,kind,external_id,current_hash,present,first_seen_at,last_seen_at)
+        VALUES(1,'profile','100','current',1,'2026-08-01','2026-08-03')"""
+    )
+    version_id = db.execute(
+        """INSERT INTO versions(entity_id,content_hash,normalized_json,raw_path,seen_at,change_type)
+        VALUES(?,?,?,?,?,?)""",
+        (entity_id, "current", '{"authorName":"吳佳欣"}', "current.json", "2026-08-03", "created"),
+    )
+    db.execute("UPDATE entities SET current_version_id=? WHERE id=?", (version_id, entity_id))
+    media = []
+    for sha, source_url, role in (
+        ("cover", "https://scontent.example.fbcdn.net/v/cover.jpg?quality=high", "cover_photo"),
+        ("blur", "https://scontent.example.fbcdn.net/v/cover.jpg?quality=blurred", "image"),
+        ("photo", "https://scontent.example.fbcdn.net/v/photo.jpg", "image"),
+    ):
+        media_id = db.execute(
+            """INSERT INTO media(sha256,source_url,mime_type,path,status,first_seen_at)
+            VALUES(?,?,?,'sample.jpg','ready','2026-08-03')""",
+            (sha, source_url, "image/jpeg"),
+        )
+        db.execute(
+            "INSERT INTO entity_media(entity_id,version_id,media_id,role,position) VALUES(?,?,?,?,?)",
+            (entity_id, version_id, media_id, role, len(media)),
+        )
+        media.append(media_id)
+
+    with TestClient(app) as client:
+        dashboard = client.get("/")
+
+    assert dashboard.status_code == 200
+    assert f'/media/{media[1]}/thumbnail' not in dashboard.text
+    assert f'/media/{media[2]}/thumbnail' in dashboard.text
 
 
 def test_dashboard_profile_order_can_be_dragged_and_persisted(tmp_path: Path, monkeypatch):

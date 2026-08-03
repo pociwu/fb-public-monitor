@@ -33,6 +33,39 @@ def test_normalize_browser_profile_extracts_card_fields():
     assert item["profile_data_source"] == "Facebook 直接瀏覽器"
 
 
+def test_normalize_browser_profile_excludes_low_quality_duplicate_of_cover():
+    item = normalize_browser_profile(
+        {
+            "main_heading": "吳佳欣",
+            "images": [
+                {
+                    "src": "https://scontent.example.fbcdn.net/v/photo.jpg?stp=cover-high",
+                    "alt": "吳佳欣的封面相片",
+                    "natural_width": 1200,
+                    "natural_height": 500,
+                },
+                {
+                    "src": "https://scontent.example.fbcdn.net/v/photo.jpg?stp=blurred-preview",
+                    "alt": "",
+                    "natural_width": 400,
+                    "natural_height": 300,
+                },
+                {
+                    "src": "https://scontent.example.fbcdn.net/v/public-photo.jpg",
+                    "alt": "",
+                    "natural_width": 800,
+                    "natural_height": 800,
+                },
+            ],
+        },
+        "https://www.facebook.com/100",
+    )
+
+    assert item["photos"] == [
+        {"url": "https://scontent.example.fbcdn.net/v/public-photo.jpg"}
+    ]
+
+
 def test_normalize_browser_profile_ignores_notification_overlay_heading():
     item = normalize_browser_profile(
         {

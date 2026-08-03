@@ -21,7 +21,7 @@ from .facebook_browser import (
     FacebookBrowserLoginRequired,
     is_facebook_ui_heading,
 )
-from .ingest import Ingester, external_id
+from .ingest import Ingester, external_id, is_placeholder_profile_name
 from .media import MediaStore
 from .telegram import TelegramSender
 from .serpapi import SerpApiError, SerpApiGateway, SerpApiQuotaExceeded, profile_id_from_url
@@ -33,6 +33,7 @@ REPAIR_MIGRATION = "schema_media_v2_20260719"
 PROFILE_PIC_MIGRATION = "profile_pic_fields_v3_20260719"
 NOTIFICATION_HYGIENE_MIGRATION = "notification_hygiene_v5_20260723"
 BROWSER_NAME_REPAIR_MIGRATION = "browser_name_heading_v2_20260803"
+HISTORICAL_NAME_REPAIR_MIGRATION = "historical_profile_name_v1_20260803"
 
 
 class BudgetExceeded(RuntimeError):
@@ -87,6 +88,7 @@ class MonitorService:
 
     async def start(self) -> None:
         self._seed_browser_name_repair()
+        self._seed_historical_name_repair()
         self._seed_notification_hygiene()
         self._seed_profile_pic_migration()
         self._seed_upgrade_repair()
@@ -108,6 +110,34 @@ class MonitorService:
                 self._enqueue(profile_id, "visit", -50, datetime.now(UTC))
             repaired += 1
         self.db.mark_migration(BROWSER_NAME_REPAIR_MIGRATION, {"profiles_reset": repaired})
+
+    def _seed_historical_name_repair(self) -> None:
+        if self.db.migration_applied(HISTORICAL_NAME_REPAIR_MIGRATION):
+            return
+        repaired = 0
+        for profile in self.db.rows("SELECT id,display_name FROM profiles WHERE enabled=1"):
+            if not is_placeholder_profile_name(profile.get("display_name")):
+                continue
+            versions = self.db.rows(
+                """SELECT v.normalized_json FROM versions v
+                JOIN entities e ON e.id=v.entity_id
+                WHERE e.profile_id=? AND e.kind='profile'
+                ORDER BY v.seen_at DESC,v.id DESC""",
+                (profile["id"],),
+            )
+            recovered = ""
+            for version in versions:
+                try:
+                    recovered = str(json.loads(version["normalized_json"]).get("authorName") or "")
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not is_placeholder_profile_name(recovered):
+                    break
+                recovered = ""
+            if recovered:
+                self.db.execute("UPDATE profiles SET display_name=? WHERE id=?", (recovered, profile["id"]))
+                repaired += 1
+        self.db.mark_migration(HISTORICAL_NAME_REPAIR_MIGRATION, {"profiles_recovered": repaired})
 
     def stop(self) -> None:
         self.stop_event.set()

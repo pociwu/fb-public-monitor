@@ -22,7 +22,7 @@
   <span class="drag-handle" draggable="true" aria-label="拖曳調整順序" title="拖曳調整順序">⠿</span>
   <div class="profile-card">
   {% if p.cover_media_id %}<div class="card-cover"><img src="/media/{{ p.cover_media_id }}/thumbnail" alt="{{ p.display_name or p.name }} 封面照"></div>{% endif %}
-  <div class="profile-head">{% if p.avatar_media_id %}<img class="avatar" src="/media/{{ p.avatar_media_id }}" alt="">{% else %}<span class="avatar placeholder">FB</span>{% endif %}<div><span class="dot {{ p.public_state }}"></span><strong>{{ p.display_name or p.name }}</strong>{% if p.display_name and p.name != p.display_name %}<small class="alias">別名：{{ p.name }}</small>{% endif %}</div></div>
+  <div class="profile-head">{% if p.avatar_media_id %}<img class="avatar" src="/media/{{ p.avatar_media_id }}" alt="">{% else %}<span class="avatar placeholder">FB</span>{% endif %}<div><span class="dot {{ p.public_state }}"></span><strong>{{ p.display_name or p.name }}</strong>{% if p.display_name and p.name != p.display_name %}<small class="alias">別名：{{ p.name }}</small>{% endif %}{% if p.previous_names %}<small class="alias">曾用名稱：{{ p.previous_names|join('、') }}</small>{% endif %}</div></div>
   <small>{{ p.public_state }} · Facebook ID：{{ p.display_fb_id or '尚未解析' }}</small>
   {% if p.details %}<div class="profile-details">
     {% if p.details.profile_intro_text %}<p>{{ p.details.profile_intro_text }}</p>{% endif %}
