@@ -72,3 +72,20 @@ def test_normalize_browser_profile_ignores_unread_count_facebook_title():
         "https://www.facebook.com/100000288843407",
     )
     assert item_without_role_heading["name"] == "謝球球"
+
+
+def test_normalize_browser_profile_uses_name_before_combined_follow_summary():
+    item = normalize_browser_profile(
+        {
+            "main_heading": "",
+            "headings": [],
+            "role_headings": [],
+            "og_title": "(4) Facebook",
+            "title": "(4) Facebook",
+            "text": "吳佳蓉\n503 位追蹤者 · 正在追蹤 183 人\n數位創作者\n全部\n關於\n朋友\n相片",
+            "images": [],
+        },
+        "https://www.facebook.com/100000063131907",
+    )
+    assert item["name"] == "吳佳蓉"
+    assert item["followers"] == "503"

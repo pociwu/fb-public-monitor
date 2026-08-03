@@ -74,7 +74,10 @@ def _name_from_profile_image(images: list[dict[str, Any]]) -> str:
 
 
 def _name_from_profile_summary(lines: list[str]) -> str:
-    count_pattern = re.compile(r"^[\d,.]+(?:\s*[KMB萬億])?\s*(?:位\s*)?(?:朋友|追蹤者|friends|followers)$", re.IGNORECASE)
+    count_pattern = re.compile(
+        r"^[\d,.]+(?:\s*[KMB萬億])?\s*(?:位\s*)?(?:朋友|追蹤者|friends|followers)(?:\s*[·•・]\s*.*)?$",
+        re.IGNORECASE,
+    )
     for index, line in enumerate(lines):
         if not count_pattern.fullmatch(line):
             continue
