@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, RedirectResponse
@@ -23,7 +24,8 @@ from .ingest import is_placeholder_profile_name
 from .normalize import normalize_url
 from .service import MonitorService
 from .serpapi import profile_id_from_url
-from .timeutil import display_time, parse_time
+from .storage import decorate_snapshot
+from .timeutil import display_time, parse_time, timezone_module_fallback
 
 PACKAGE = Path(__file__).parent
 templates = Jinja2Templates(directory=str(PACKAGE / "templates"))
@@ -237,13 +239,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             row["finished_display"] = display_time(row.get("finished_at"), cfg.timezone)
         media = db.row("SELECT COUNT(*) total,SUM(CASE WHEN status='ready' THEN 1 ELSE 0 END) ready FROM media")
         monitored = db.row("SELECT COUNT(*) count FROM profiles WHERE enabled=1")
+        storage_rows = db.rows("SELECT * FROM storage_snapshots ORDER BY snapshot_date DESC LIMIT 2")
+        storage_latest = decorate_snapshot(storage_rows[0], storage_rows[1] if len(storage_rows) > 1 else None) if storage_rows else None
         official_usage = db.apify_usage_snapshot()
         serpapi_usage = db.serpapi_usage_snapshot()
         if official_usage:
             official_usage["cycle_start_display"] = display_time(official_usage.get("cycle_start_at"), cfg.timezone)
             official_usage["cycle_end_display"] = display_time(official_usage.get("cycle_end_at"), cfg.timezone)
             official_usage["fetched_display"] = display_time(official_usage.get("fetched_at"), cfg.timezone)
-        return templates.TemplateResponse(request, "dashboard.html", {"profiles": profiles, "usage": usage, "official_usage": official_usage, "serpapi_usage": serpapi_usage, "pending": pending, "outbox": outbox, "outbox_counts": outbox_counts, "outbox_rows": outbox_rows, "maintenance_runs": maintenance_runs, "media": media, "budget": cfg.monthly_budget_usd, "monitored": monitored, "max_profiles": MAX_PROFILES, "notice": notice, "error": error})
+        return templates.TemplateResponse(request, "dashboard.html", {"profiles": profiles, "usage": usage, "official_usage": official_usage, "serpapi_usage": serpapi_usage, "pending": pending, "outbox": outbox, "outbox_counts": outbox_counts, "outbox_rows": outbox_rows, "maintenance_runs": maintenance_runs, "media": media, "storage_latest": storage_latest, "budget": cfg.monthly_budget_usd, "monitored": monitored, "max_profiles": MAX_PROFILES, "notice": notice, "error": error})
+
+    @app.get("/storage")
+    def storage_detail(request: Request):
+        db: Database = request.app.state.db
+        try:
+            timezone = ZoneInfo(cfg.timezone)
+        except ZoneInfoNotFoundError:
+            timezone = timezone_module_fallback(cfg.timezone)
+        today = datetime.now(timezone).date().isoformat()
+        if not db.row("SELECT snapshot_date FROM storage_snapshots WHERE snapshot_date=?", (today,)):
+            request.app.state.service.capture_storage_snapshot(today)
+        rows = db.rows("SELECT * FROM storage_snapshots ORDER BY snapshot_date DESC LIMIT 31")
+        history = [
+            decorate_snapshot(row, rows[index + 1] if index + 1 < len(rows) else None)
+            for index, row in enumerate(rows[:30])
+        ]
+        return templates.TemplateResponse(
+            request,
+            "storage.html",
+            {"current": history[0] if history else None, "history": history},
+        )
 
     @app.post("/profiles")
     async def add_profile(request: Request):

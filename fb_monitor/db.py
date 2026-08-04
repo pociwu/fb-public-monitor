@@ -103,6 +103,15 @@ CREATE TABLE IF NOT EXISTS maintenance_runs (
   id INTEGER PRIMARY KEY, task_name TEXT NOT NULL, status TEXT NOT NULL,
   summary_json TEXT NOT NULL DEFAULT '{}', error TEXT, started_at TEXT NOT NULL, finished_at TEXT
 );
+CREATE TABLE IF NOT EXISTS storage_snapshots (
+  snapshot_date TEXT PRIMARY KEY, captured_at TEXT NOT NULL,
+  image_bytes INTEGER NOT NULL DEFAULT 0, video_bytes INTEGER NOT NULL DEFAULT 0,
+  attachment_bytes INTEGER NOT NULL DEFAULT 0, database_bytes INTEGER NOT NULL DEFAULT 0,
+  content_bytes INTEGER NOT NULL DEFAULT 0, cache_bytes INTEGER NOT NULL DEFAULT 0,
+  browser_bytes INTEGER NOT NULL DEFAULT 0, other_bytes INTEGER NOT NULL DEFAULT 0,
+  filesystem_used_bytes INTEGER NOT NULL DEFAULT 0, filesystem_total_bytes INTEGER NOT NULL DEFAULT 0,
+  filesystem_free_bytes INTEGER NOT NULL DEFAULT 0
+);
 CREATE INDEX IF NOT EXISTS idx_entities_profile_kind ON entities(profile_id, kind, published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_jobs_queue ON jobs(status, available_at, priority);
 CREATE INDEX IF NOT EXISTS idx_outbox_queue ON outbox(status, next_attempt_at);

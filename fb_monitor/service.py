@@ -26,6 +26,7 @@ from .media import MediaStore
 from .normalize import normalize_url
 from .telegram import TelegramSender
 from .serpapi import SerpApiError, SerpApiGateway, SerpApiQuotaExceeded, profile_id_from_url
+from .storage import collect_storage_snapshot, daily_storage_message
 from .timeutil import telegram_time
 
 log = logging.getLogger(__name__)
@@ -96,7 +97,11 @@ class MonitorService:
         self._seed_profile_pic_migration()
         self._seed_upgrade_repair()
         self._seed_initial_jobs()
-        await asyncio.gather(self._scheduler_loop(), self._outbox_loop(), self._health_loop(), self._media_retry_loop(), self._daily_media_dedupe_loop())
+        await asyncio.gather(
+            self._scheduler_loop(), self._outbox_loop(), self._health_loop(),
+            self._media_retry_loop(), self._daily_media_dedupe_loop(),
+            self._storage_snapshot_loop(),
+        )
 
     def _seed_browser_name_repair(self) -> None:
         if self.db.migration_applied(BROWSER_NAME_REPAIR_MIGRATION):
@@ -1079,6 +1084,40 @@ class MonitorService:
                             self.db.finish_maintenance_run(run_id, {}, str(exc))
                             raise
                     self.db.add_event(key, "media_dedupe", {"title": "每日媒體去重完成", "text": f"重新雜湊 {counts['checked']} 個檔案；合併 {counts['merged']} 筆；移除 {counts['orphaned']} 個無引用檔案；錯誤 {counts['errors']} 筆。"}, notify=False)
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=60)
+            except TimeoutError:
+                pass
+
+    def capture_storage_snapshot(self, snapshot_date: str) -> dict[str, Any]:
+        return collect_storage_snapshot(
+            self.db,
+            self.settings.data_dir,
+            self.settings.facebook_browser_data_dir,
+            snapshot_date,
+        )
+
+    def record_daily_storage_snapshot(self, snapshot_date: str) -> bool:
+        event_key = f"storage-daily:{snapshot_date}"
+        if self.db.row("SELECT id FROM events WHERE event_key=?", (event_key,)):
+            return False
+        current = self.capture_storage_snapshot(snapshot_date)
+        previous = self.db.row(
+            "SELECT * FROM storage_snapshots WHERE snapshot_date<? ORDER BY snapshot_date DESC LIMIT 1",
+            (snapshot_date,),
+        )
+        return bool(self.db.add_event(event_key, "storage_daily", daily_storage_message(current, previous)))
+
+    async def _storage_snapshot_loop(self) -> None:
+        tz = ZoneInfo(self.settings.timezone)
+        while not self.stop_event.is_set():
+            local = datetime.now(tz)
+            snapshot_date = local.date().isoformat()
+            if local.hour >= self.settings.health_hour:
+                try:
+                    await asyncio.to_thread(self.record_daily_storage_snapshot, snapshot_date)
+                except Exception:
+                    log.exception("daily storage snapshot failed")
             try:
                 await asyncio.wait_for(self.stop_event.wait(), timeout=60)
             except TimeoutError:
