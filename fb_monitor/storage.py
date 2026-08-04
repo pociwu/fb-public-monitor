@@ -18,7 +18,6 @@ STORAGE_CATEGORIES = (
     ("content_bytes", "JSON／Markdown 歷史"),
     ("cache_bytes", "縮圖快取"),
     ("browser_bytes", "Chromium 資料"),
-    ("other_bytes", "其他（含 Docker／系統）"),
 )
 
 
@@ -102,12 +101,6 @@ def collect_storage_snapshot(db: Database, data_dir: Path, browser_dir: Path, sn
     cache_bytes = directory_size(data_dir / "cache")
     browser_bytes = directory_size(browser_dir)
     usage = shutil.disk_usage(data_dir)
-    known_primary = image_bytes + video_bytes + attachment_bytes + database_bytes + content_bytes + cache_bytes
-    try:
-        if data_dir.stat().st_dev == browser_dir.stat().st_dev:
-            known_primary += browser_bytes
-    except OSError:
-        pass
     values: dict[str, Any] = {
         "snapshot_date": snapshot_date,
         "captured_at": utcnow(),
@@ -118,7 +111,9 @@ def collect_storage_snapshot(db: Database, data_dir: Path, browser_dir: Path, sn
         "content_bytes": content_bytes,
         "cache_bytes": cache_bytes,
         "browser_bytes": browser_bytes,
-        "other_bytes": max(0, usage.used - known_primary),
+        # Retained for schema compatibility with the first storage release.
+        # Host/Docker usage is deliberately not attributed to this project.
+        "other_bytes": 0,
         "filesystem_used_bytes": usage.used,
         "filesystem_total_bytes": usage.total,
         "filesystem_free_bytes": usage.free,
@@ -137,18 +132,27 @@ def collect_storage_snapshot(db: Database, data_dir: Path, browser_dir: Path, sn
 def storage_delta(current: dict[str, Any], previous: dict[str, Any] | None) -> dict[str, int] | None:
     if not previous:
         return None
-    keys = [key for key, _ in STORAGE_CATEGORIES] + ["filesystem_used_bytes", "filesystem_free_bytes"]
-    return {key: int(current.get(key) or 0) - int(previous.get(key) or 0) for key in keys}
+    result = {
+        key: int(current.get(key) or 0) - int(previous.get(key) or 0)
+        for key, _ in STORAGE_CATEGORIES
+    }
+    result["project_used_bytes"] = project_used_bytes(current) - project_used_bytes(previous)
+    return result
+
+
+def project_used_bytes(snapshot: dict[str, Any]) -> int:
+    return sum(int(snapshot.get(key) or 0) for key, _ in STORAGE_CATEGORIES)
 
 
 def decorate_snapshot(snapshot: dict[str, Any], previous: dict[str, Any] | None = None) -> dict[str, Any]:
     row = dict(snapshot)
     delta = storage_delta(row, previous)
-    row["used_display"] = format_bytes(row.get("filesystem_used_bytes"))
+    project_bytes = project_used_bytes(row)
+    row["used_display"] = format_bytes(project_bytes)
     row["total_display"] = format_bytes(row.get("filesystem_total_bytes"))
     row["free_display"] = format_bytes(row.get("filesystem_free_bytes"))
     row["used_percent"] = round(
-        100 * int(row.get("filesystem_used_bytes") or 0) / max(1, int(row.get("filesystem_total_bytes") or 0)), 1
+        100 * project_bytes / max(1, int(row.get("filesystem_total_bytes") or 0)), 1
     )
     row["categories"] = [
         {
@@ -158,24 +162,22 @@ def decorate_snapshot(snapshot: dict[str, Any], previous: dict[str, Any] | None 
             "display": format_bytes(row.get(key)),
             "delta": delta.get(key, 0) if delta else None,
             "delta_display": format_bytes(delta.get(key, 0), signed=True) if delta else "建立基準",
-            "percent": round(100 * int(row.get(key) or 0) / max(1, int(row.get("filesystem_used_bytes") or 0)), 2),
+            "percent": round(100 * int(row.get(key) or 0) / max(1, project_bytes), 2),
         }
         for key, label in STORAGE_CATEGORIES
     ]
-    row["used_delta"] = delta.get("filesystem_used_bytes") if delta else None
-    row["used_delta_display"] = format_bytes(delta.get("filesystem_used_bytes", 0), signed=True) if delta else "建立基準"
+    row["used_delta"] = delta.get("project_used_bytes") if delta else None
+    row["used_delta_display"] = format_bytes(delta.get("project_used_bytes", 0), signed=True) if delta else "建立基準"
     return row
 
 
 def daily_storage_message(current: dict[str, Any], previous: dict[str, Any] | None) -> dict[str, str]:
     decorated = decorate_snapshot(current, previous)
     lines = [
-        f"整體已用：{decorated['used_display']} / {decorated['total_display']}",
-        f"剩餘：{decorated['free_display']}",
+        f"fb-public-monitor 專案總用量：{decorated['used_display']}",
+        f"主機剩餘空間：{decorated['free_display']}",
         f"每日增加量：{decorated['used_delta_display']}",
         "",
     ]
     lines.extend(f"{item['label']}：{item['display']}（{item['delta_display']}）" for item in decorated["categories"])
-    lines.append("")
-    lines.append("「其他」包含 Docker 映像、Build Cache 與作業系統檔案。")
     return {"title": f"【硬碟每日用量】{current['snapshot_date']}", "text": "\n".join(lines)}

@@ -3,18 +3,18 @@
 <div class="profile-titlebar"><div><h1>硬碟用量</h1><p class="muted">每日快照與相較前一日的增加量</p></div><a class="button secondary" href="/">返回儀表板</a></div>
 {% if current %}
 <section class="stats storage-summary">
-  <article><span>整體已用</span><strong>{{ current.used_display }}</strong><small>{{ current.used_percent }}% / {{ current.total_display }}</small></article>
-  <article><span>剩餘空間</span><strong>{{ current.free_display }}</strong></article>
+  <article><span>fb-public-monitor 專案總用量</span><strong>{{ current.used_display }}</strong><small>只統計本專案資料</small></article>
+  <article><span>主機剩餘空間</span><strong>{{ current.free_display }}</strong><small>僅作安全門檻參考</small></article>
   <article><span>每日增加量</span><strong class="{{ 'storage-growth' if current.used_delta and current.used_delta > 0 else 'storage-reduced' }}">{{ current.used_delta_display }}</strong><small>{{ current.snapshot_date }}</small></article>
 </section>
-<section class="panel"><div class="panel-heading"><h2>目前分類</h2><small>「其他」包含 Docker 映像、Build Cache 與作業系統檔案</small></div>
+<section class="panel"><div class="panel-heading"><h2>目前分類</h2><small>不包含其他 Docker、Docker Images、Build Cache 或 Ubuntu 系統檔案</small></div>
   <div class="storage-categories">{% for item in current.categories %}<div class="storage-category">
     <div><strong>{{ item.label }}</strong><span>{{ item.display }}</span><small>{{ item.delta_display }}</small></div>
     <div class="storage-bar"><i style="width:{{ [item.percent,100]|min }}%"></i></div>
   </div>{% endfor %}</div>
 </section>
-<section class="panel"><h2>最近 30 天</h2><div class="queue-table storage-history"><table><thead><tr><th>日期</th><th>整體已用</th><th>每日增加</th><th>圖片</th><th>影片／附件</th><th>資料庫</th><th>內容歷史</th><th>Chromium</th><th>其他</th></tr></thead><tbody>
-  {% for row in history %}<tr><td>{{ row.snapshot_date }}</td><td>{{ row.used_display }}</td><td>{{ row.used_delta_display }}</td><td>{{ row.categories[0].display }}<br><small>{{ row.categories[0].delta_display }}</small></td><td>{{ row.categories[1].display }} + {{ row.categories[2].display }}</td><td>{{ row.categories[3].display }}</td><td>{{ row.categories[4].display }}</td><td>{{ row.categories[6].display }}</td><td>{{ row.categories[7].display }}</td></tr>{% endfor %}
+<section class="panel"><h2>最近 30 天</h2><div class="queue-table storage-history"><table><thead><tr><th>日期</th><th>專案總用量</th><th>每日增加</th><th>圖片</th><th>影片／附件</th><th>資料庫</th><th>內容歷史</th><th>Chromium</th></tr></thead><tbody>
+  {% for row in history %}<tr><td>{{ row.snapshot_date }}</td><td>{{ row.used_display }}</td><td>{{ row.used_delta_display }}</td><td>{{ row.categories[0].display }}<br><small>{{ row.categories[0].delta_display }}</small></td><td>{{ row.categories[1].display }} + {{ row.categories[2].display }}</td><td>{{ row.categories[3].display }}</td><td>{{ row.categories[4].display }}</td><td>{{ row.categories[6].display }}</td></tr>{% endfor %}
   </tbody></table></div>
 </section>
 {% else %}<section class="panel empty">尚無硬碟用量快照。</section>{% endif %}

@@ -36,7 +36,7 @@ def test_storage_snapshot_classifies_files_and_calculates_delta(tmp_path: Path, 
     monkeypatch.setattr("fb_monitor.storage.shutil.disk_usage", lambda path: SimpleNamespace(total=20_000, used=10_000, free=10_000))
 
     current = collect_storage_snapshot(db, data, browser, "2026-08-04")
-    previous = dict(current, snapshot_date="2026-08-03", image_bytes=1, filesystem_used_bytes=9_000)
+    previous = dict(current, snapshot_date="2026-08-03", image_bytes=1)
 
     assert current["image_bytes"] == 101
     assert current["video_bytes"] == 202
@@ -45,8 +45,11 @@ def test_storage_snapshot_classifies_files_and_calculates_delta(tmp_path: Path, 
     assert current["cache_bytes"] == 505
     assert current["browser_bytes"] == 606
     assert current["database_bytes"] > 0
-    assert storage_delta(current, previous)["filesystem_used_bytes"] == 1_000
-    assert "每日增加量：+1000 B" in daily_storage_message(current, previous)["text"]
+    assert storage_delta(current, previous)["project_used_bytes"] == 100
+    message = daily_storage_message(current, previous)["text"]
+    assert "fb-public-monitor 專案總用量" in message
+    assert "每日增加量：+100 B" in message
+    assert "Docker" not in message
 
 
 def test_daily_storage_notification_is_queued_only_once(tmp_path: Path, monkeypatch):
@@ -80,5 +83,7 @@ def test_dashboard_links_to_storage_detail_page(tmp_path: Path, monkeypatch):
     assert "硬碟用量" in detail.text
     assert "目前分類" in detail.text
     assert "最近 30 天" in detail.text
+    assert "專案總用量" in detail.text
+    assert "其他（含 Docker" not in detail.text
     assert 'href="/storage"' in dashboard.text
     assert "每日增加" in dashboard.text

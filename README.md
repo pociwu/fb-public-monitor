@@ -13,7 +13,7 @@
 - 內容消失需連續兩次成功核對才確認；Actor 失敗不會改變 Facebook 狀態。
 - 所有公開留言及最多三層回覆；留言附件依官方 Actor 回傳內容 best-effort 下載。
 - SQLite 保存實體、版本、事件、排程、通知 outbox、SerpApi 額度、本地費用估算與 Apify 官方用量快照。JSON、Markdown 和媒體保存在 `/data`。
-- 每日在健康摘要時段統計圖片、影片／附件、SQLite、JSON／Markdown、縮圖快取、Chromium 與其他磁碟用量；首頁可進入最近 30 天詳細頁，Telegram 每日傳送相較前一日的增加量。「其他」包含無法由容器安全拆分的 Docker 與作業系統檔案。
+- 每日在健康摘要時段統計本專案的圖片、影片／附件、SQLite、JSON／Markdown、縮圖快取與 Chromium 用量；首頁可進入最近 30 天詳細頁，Telegram 每日傳送相較前一日的增加量。專案總用量不包含其他 Docker、Docker Images、Build Cache 或 Ubuntu 系統檔案。
 - 媒體依 SHA-256 去重。磁碟少於 10 GB 時暫停媒體下載；失敗項目保留 30 天補抓狀態。
 - Chromium 個人檔案中與大頭照或封面照同一 CDN 資產的模糊預覽不會下載；升級重啟時也會移除既有重複關聯、原檔與縮圖快取。
 - 每次 Actor 執行前查詢 Apify Billing 的官方當期用量。已達 5 美元、剩餘額不足一筆結果，或官方 API 查詢失敗時，都不會啟動 Actor；Actor run 也帶入剩餘費用上限。
