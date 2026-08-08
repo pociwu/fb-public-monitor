@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 
-from .normalize import normalize_url
+from .normalize import facebook_post_identity, normalize_url
 
 
 class FacebookBrowserError(RuntimeError):
@@ -207,6 +207,7 @@ def normalize_browser_canary_posts(
         return []
     posts: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
+    seen_post_ids: set[str] = set()
     for raw in raw_posts:
         if not isinstance(raw, dict):
             continue
@@ -221,10 +222,9 @@ def normalize_browser_canary_posts(
         ) or parsed.path.casefold().endswith("/permalink.php") or bool(parse_qs(parsed.query).get("story_fbid"))
         if not permalink or source_url in seen_urls:
             continue
-        post_id = (parse_qs(parsed.query).get("story_fbid") or [""])[0]
-        if not post_id:
-            match = re.search(r"/(?:posts|videos|reel)/([^/?#]+)", parsed.path, flags=re.IGNORECASE)
-            post_id = match.group(1) if match else ""
+        post_id = facebook_post_identity(source_url)
+        if post_id and post_id in seen_post_ids:
+            continue
         photos: list[dict[str, str]] = []
         seen_assets: set[str] = set()
         for image in raw.get("images") or []:
@@ -255,6 +255,8 @@ def normalize_browser_canary_posts(
             item["images"] = photos
         posts.append(item)
         seen_urls.add(source_url)
+        if post_id:
+            seen_post_ids.add(post_id)
         if len(posts) >= max_posts:
             break
     return posts

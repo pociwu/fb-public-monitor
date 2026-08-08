@@ -28,6 +28,19 @@ def normalize_url(value: str | None) -> str:
     return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/"), urlencode(query), ""))
 
 
+def facebook_post_identity(value: str | None) -> str:
+    """Return the stable Facebook post token shared by permalink aliases."""
+    if not value:
+        return ""
+    parts = urlsplit(value)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    story_fbid = query.get("story_fbid")
+    if story_fbid:
+        return story_fbid
+    match = re.search(r"/(?:posts|photos|videos|reel|share/p)/([^/?#]+)", parts.path, flags=re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
 def stable_projection(value: Any) -> Any:
     if isinstance(value, dict):
         ignored = {"scrapedAt", "scraped_at", "crawlTime", "runId", "likesCount", "reactionsCount", "commentsCount", "sharesCount"}

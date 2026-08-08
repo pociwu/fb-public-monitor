@@ -23,7 +23,7 @@ from .facebook_browser import (
 )
 from .ingest import Ingester, external_id, is_placeholder_profile_name
 from .media import MediaStore
-from .normalize import normalize_url
+from .normalize import facebook_post_identity, normalize_url
 from .telegram import TelegramSender
 from .serpapi import SerpApiError, SerpApiGateway, SerpApiQuotaExceeded, profile_id_from_url
 from .storage import collect_storage_snapshot, daily_storage_message
@@ -657,10 +657,18 @@ class MonitorService:
             for row in existing
             if row.get("source_url")
         }
+        ids_by_identity = {
+            identity: str(row["external_id"])
+            for row in existing
+            if row.get("source_url")
+            for identity in [facebook_post_identity(str(row["source_url"]))]
+            if identity
+        }
         for raw_item in items:
             item = dict(raw_item)
             source_url = str(item.get("source_url") or "")
-            known_id = ids_by_url.get(normalize_url(source_url)) if source_url else None
+            identity = facebook_post_identity(source_url)
+            known_id = (ids_by_identity.get(identity) if identity else None) or (ids_by_url.get(normalize_url(source_url)) if source_url else None)
             if known_id:
                 item["source_post_id"] = known_id
             await self.ingester.ingest(profile_id, "post", item, notify=notify)
@@ -783,6 +791,16 @@ class MonitorService:
         return True
 
     async def _store_profile_details(self, profile: dict[str, Any], item: dict[str, Any]) -> None:
+        item = dict(item)
+        # Browser DOM headings can be page labels, group names, or stale UI text.
+        # Never let that low-trust fallback replace a name already established by
+        # a provider or the user's configured identity. It may still fill a blank
+        # FB-id placeholder on the first successful browser visit.
+        source_label = str(item.get("profile_data_source") or "")
+        browser_source = "瀏覽器" in source_label or "browser" in source_label.casefold()
+        existing_name = str(profile.get("display_name") or "")
+        if browser_source and not is_placeholder_profile_name(existing_name):
+            item["name"] = existing_name
         previous_state = str(profile.get("public_state") or "unknown")
         state = "private" if bool(item.get("private") or item.get("is_private")) else "public"
         configured_id = profile_id_from_url(str(profile["url"]))

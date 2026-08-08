@@ -204,6 +204,35 @@ browser_canary:
     assert service.db.row("SELECT COUNT(*) count FROM events WHERE event_type='browser_canary'")["count"] == 1
 
 
+@pytest.mark.asyncio
+async def test_browser_canary_matches_post_permalink_alias_to_existing_entity(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    service = MonitorService(load_settings(config))
+    await service.ingester.ingest(
+        1,
+        "post",
+        {"postId": "pfbid123", "source_url": "https://facebook.com/100/posts/pfbid123", "text": "same"},
+        notify=False,
+    )
+
+    await service._ingest_browser_canary_posts(
+        1,
+        [{
+            "source_url": "https://facebook.com/permalink.php?story_fbid=pfbid123&id=100",
+            "text": "same",
+            "ingest_source": "facebook_browser_canary",
+        }],
+        notify=False,
+    )
+
+    assert service.db.row("SELECT COUNT(*) count FROM entities WHERE profile_id=1 AND kind='post'")["count"] == 1
+
+
 def test_browser_canary_respects_persistent_cooldown(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text(
@@ -250,6 +279,30 @@ def test_health_summary_uses_resolved_display_name():
         "吳佳欣: public · 最近成功 2026/8/1 08:00",
         "姓名待確認: unknown · 最近成功 -",
     ]
+
+
+@pytest.mark.asyncio
+async def test_browser_profile_name_cannot_overwrite_existing_canonical_name(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: FB-100000950467959\n    url: https://facebook.com/100000950467959\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    service = MonitorService(load_settings(config))
+    service.db.execute("UPDATE profiles SET display_name='Ya Ling Shen' WHERE id=1")
+
+    await service._store_profile_details(
+        service.db.row("SELECT * FROM profiles WHERE id=1"),
+        {
+            "id": "100000950467959",
+            "name": "慈濟@新竹",
+            "url": "https://www.facebook.com/100000950467959",
+            "profile_data_source": "Facebook 直接瀏覽器",
+        },
+    )
+
+    assert service.db.row("SELECT display_name FROM profiles WHERE id=1")["display_name"] == "Ya Ling Shen"
 
 
 @pytest.mark.asyncio

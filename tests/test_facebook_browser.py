@@ -184,6 +184,18 @@ def test_normalize_browser_canary_posts_limits_posts_but_keeps_all_photos():
     assert all("fbclid" not in post["source_url"] for post in posts)
 
 
+def test_normalize_browser_canary_posts_deduplicates_alias_urls_for_same_post():
+    posts = normalize_browser_canary_posts(
+        [
+            {"url": "https://www.facebook.com/permalink.php?story_fbid=pfbid123&id=100", "text": "same"},
+            {"url": "https://www.facebook.com/100/posts/pfbid123", "text": "same"},
+        ],
+        max_posts=2,
+    )
+
+    assert len(posts) == 1
+
+
 @pytest.mark.asyncio
 async def test_album_walker_keeps_advancing_until_photo_repeats(tmp_path: Path, monkeypatch):
     class Response:
