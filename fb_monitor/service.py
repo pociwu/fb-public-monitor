@@ -580,8 +580,10 @@ class MonitorService:
         always_full = str(profile.get("url") or "").rstrip("/") in {
             str(url).rstrip("/") for url in self.settings.always_full_fetch_urls
         }
-        if initial or not profile.get("backfill_done") or always_full:
+        if initial or not profile.get("backfill_done"):
             return await self._fetch_posts(profile, self.settings.recent_posts)
+        if always_full:
+            return await self._fetch_posts(profile, self.settings.always_full_fetch_max_posts)
 
         probe = await self._fetch_posts(profile, 1)
         probe_error = actor_summary_error(probe.summary)

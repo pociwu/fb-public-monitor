@@ -13,6 +13,7 @@ schedule:
   recent_posts: 10
   # Optional: skip the one-post probe for selected profiles.
   always_full_fetch_urls: []
+  always_full_fetch_max_posts: 50
   backfill_posts: 20
   full_audit_days: 7
   serpapi_profile_refresh_hours: 48
