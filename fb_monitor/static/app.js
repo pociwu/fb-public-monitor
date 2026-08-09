@@ -207,6 +207,10 @@
     initProfileSorting(event.target);
     updateUsageCountdowns(event.target);
     updateManualCooldowns(event.target);
+    const requestPath = event.detail?.requestConfig?.path || "";
+    if (event.target.id === "profile-content" && (/(?:^|[?&])page=\d+/.test(requestPath) || new URLSearchParams(window.location.search).has("page"))) {
+      window.scrollTo({top: 0, behavior: "smooth"});
+    }
   });
   window.addEventListener("load", () => {
     initExpandable();
