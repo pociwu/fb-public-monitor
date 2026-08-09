@@ -577,7 +577,10 @@ class MonitorService:
 
     async def _fetch_regular_posts(self, profile: dict[str, Any], initial: bool) -> ActorResult:
         """Probe one latest post before paying for the normal ten-post batch."""
-        if initial or not profile.get("backfill_done"):
+        always_full = str(profile.get("url") or "").rstrip("/") in {
+            str(url).rstrip("/") for url in self.settings.always_full_fetch_urls
+        }
+        if initial or not profile.get("backfill_done") or always_full:
             return await self._fetch_posts(profile, self.settings.recent_posts)
 
         probe = await self._fetch_posts(profile, 1)

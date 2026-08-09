@@ -116,6 +116,7 @@ class Settings:
     spacing_min_minutes: float = 20
     spacing_max_minutes: float = 30
     recent_posts: int = 10
+    always_full_fetch_urls: tuple[str, ...] = ()
     backfill_posts: int = 20
     full_audit_days: int = 7
     serpapi_profile_refresh_hours: float = 48
@@ -198,6 +199,10 @@ def load_settings(path: str | Path | None = None) -> Settings:
         spacing_min_minutes=float(schedule.get("spacing_min_minutes", 20)),
         spacing_max_minutes=float(schedule.get("spacing_max_minutes", 30)),
         recent_posts=int(schedule.get("recent_posts", 10)),
+        always_full_fetch_urls=tuple(
+            normalize_profile_url(str(url))
+            for url in (schedule.get("always_full_fetch_urls") or [])
+        ),
         backfill_posts=int(schedule.get("backfill_posts", 20)),
         full_audit_days=int(schedule.get("full_audit_days", 7)),
         serpapi_profile_refresh_hours=float(schedule.get("serpapi_profile_refresh_hours", 48)),

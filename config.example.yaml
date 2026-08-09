@@ -11,6 +11,8 @@ schedule:
   spacing_min_minutes: 20
   spacing_max_minutes: 30
   recent_posts: 10
+  # Optional: skip the one-post probe for selected profiles.
+  always_full_fetch_urls: []
   backfill_posts: 20
   full_audit_days: 7
   serpapi_profile_refresh_hours: 48
