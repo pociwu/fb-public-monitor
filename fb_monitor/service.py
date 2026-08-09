@@ -1194,8 +1194,24 @@ class MonitorService:
         counts = {"entities_merged": 0, "posts_merged": 0, "comments_merged": 0}
         groups = self.db.rows("""SELECT profile_id,kind,current_hash,GROUP_CONCAT(id) ids
             FROM entities WHERE current_hash IS NOT NULL GROUP BY profile_id,kind,current_hash HAVING COUNT(*) > 1""")
+        alias_groups: dict[tuple[int, str], list[int]] = {}
+        for row in self.db.rows("SELECT id,profile_id,source_url FROM entities WHERE kind='post' AND source_url IS NOT NULL"):
+            identity = facebook_post_identity(str(row.get("source_url") or ""))
+            if identity:
+                alias_groups.setdefault((int(row["profile_id"]), identity), []).append(int(row["id"]))
+        groups = list(groups) + [
+            {"profile_id": profile_id, "kind": "post", "current_hash": None, "ids": ",".join(map(str, ids))}
+            for (profile_id, _), ids in alias_groups.items()
+            if len(ids) > 1
+        ]
         for group in groups:
-            ids = sorted(int(value) for value in str(group["ids"]).split(","))
+            ids = sorted(
+                int(value)
+                for value in str(group["ids"]).split(",")
+                if self.db.row("SELECT id FROM entities WHERE id=?", (int(value),))
+            )
+            if len(ids) < 2:
+                continue
             canonical = ids[0]
             for duplicate in ids[1:]:
                 with self.db.connect() as conn:
