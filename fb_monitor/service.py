@@ -324,6 +324,8 @@ class MonitorService:
                 await self.visit_profile(int(job["profile_id"]))
             elif job["job_type"] == "backfill":
                 await self.backfill_profile(int(job["profile_id"]))
+            elif job["job_type"] == "backfill_comments":
+                await self.backfill_comments(int(job["profile_id"]), job_payload)
             elif job["job_type"] == "audit":
                 await self.audit_profile(int(job["profile_id"]))
             elif job["job_type"] == "migrate_raw":
@@ -373,6 +375,8 @@ class MonitorService:
                 self._enqueue(int(job["profile_id"]), job["job_type"], int(job["priority"]), resume, json.loads(job["payload_json"]))
         except Exception as exc:
             self.db.execute("UPDATE jobs SET status='failed',finished_at=?,error=? WHERE id=?", (utcnow(), str(exc)[:2000], job["id"]))
+            if job["job_type"] == "backfill_comments":
+                self._enqueue(int(job["profile_id"]), "backfill_comments", int(job["priority"]), datetime.now(UTC) + timedelta(minutes=15), job_payload)
             if job["profile_id"]:
                 self._record_failure(int(job["profile_id"]), exc)
             else:
@@ -974,8 +978,6 @@ class MonitorService:
             url = next((str(post.get(k)) for k in ("source_url", "postUrl", "post_url", "url", "facebookUrl") if post.get(k)), "")
             if url:
                 post_urls.append(url)
-        if post_urls and self._remaining_budget() > 0:
-            await self._fetch_comments(profile_id, post_urls, notify=False)
         if not result.summary or not result.summary.get("profiles"):
             raise RuntimeError("貼文 Actor schema 異常：完整回溯缺少 SUMMARY.profiles")
         summary_profile = result.summary["profiles"][0]
@@ -984,12 +986,31 @@ class MonitorService:
         if not pointer and str(coverage).startswith("partial"):
             raise BudgetExceeded(f"完整回溯尚未完成：{coverage}")
         done = not bool(pointer)
-        self.db.execute("UPDATE profiles SET backfill_cursor=?,backfill_done=?,last_full_audit_at=? WHERE id=?", (pointer, int(done), utcnow() if done else profile.get("last_full_audit_at"), profile_id))
-        if not done and self._remaining_budget() > 0:
+        self.db.execute("UPDATE profiles SET backfill_cursor=?,backfill_done=0 WHERE id=?", (pointer, profile_id))
+        if post_urls:
+            self._enqueue(profile_id, "backfill_comments", 31, datetime.now(UTC) + timedelta(minutes=self.settings.spacing_max_minutes), {"post_urls": post_urls, "next_cursor": pointer})
+        elif not done:
             self._enqueue(profile_id, "backfill", 30, datetime.now(UTC) + timedelta(minutes=self.settings.spacing_max_minutes))
         elif done:
             counts = self.db.row("SELECT SUM(kind='post') posts,SUM(kind='comment') comments FROM entities WHERE profile_id=?", (profile_id,)) or {}
             self.db.add_event(f"profile:{profile_id}:backfill_complete", "backfill_complete", {"title": f"{profile['name']} 初始完整回溯完成", "text": f"已保存 {counts.get('posts') or 0} 篇貼文、{counts.get('comments') or 0} 則留言。", "source_url": profile["url"]}, profile_id)
+
+    async def backfill_comments(self, profile_id: int, payload: dict[str, Any]) -> None:
+        profile = self.db.row("SELECT * FROM profiles WHERE id=?", (profile_id,))
+        if not profile or profile["public_state"] != "public":
+            return
+        post_urls = [str(url) for url in payload.get("post_urls") or [] if url]
+        if post_urls and self._remaining_budget() < PRICES["comments"]:
+            raise BudgetExceeded("貼文已完成；留言等待 Apify 額度恢復", self._next_month())
+        if post_urls:
+            await self._fetch_comments(profile_id, post_urls, notify=False)
+        pointer = payload.get("next_cursor")
+        if pointer:
+            self._enqueue(profile_id, "backfill", 30, datetime.now(UTC) + timedelta(minutes=self.settings.spacing_max_minutes))
+            return
+        self.db.execute("UPDATE profiles SET backfill_cursor=NULL,backfill_done=1,last_full_audit_at=? WHERE id=?", (utcnow(), profile_id))
+        counts = self.db.row("SELECT SUM(kind='post') posts,SUM(kind='comment') comments FROM entities WHERE profile_id=?", (profile_id,)) or {}
+        self.db.add_event(f"profile:{profile_id}:backfill_complete", "backfill_complete", {"title": f"{profile['name']} 回溯完成", "text": f"已保存 {counts.get('posts') or 0} 篇貼文、{counts.get('comments') or 0} 則留言。", "source_url": profile["url"]}, profile_id)
 
     async def audit_profile(self, profile_id: int) -> None:
         profile = self.db.row("SELECT * FROM profiles WHERE id=?", (profile_id,))
