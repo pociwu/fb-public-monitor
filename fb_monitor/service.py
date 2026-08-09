@@ -536,21 +536,18 @@ class MonitorService:
         if not posts.items:
             if summary_error and not self.settings.browser_canary_enabled:
                 raise RuntimeError(f"貼文 Actor 三種輸入格式均失敗：{summary_error}")
-        seen_posts: set[str] = set()
         post_urls: list[str] = []
         if initial and posts.items:
             self.db.execute("UPDATE profiles SET backfill_done=0,backfill_cursor=NULL,last_full_audit_at=NULL WHERE id=?", (profile_id,))
             profile["backfill_done"] = 0
         for post in posts.items:
-            _, ext, _ = await self.ingester.ingest(profile_id, "post", post, notify=not initial)
-            seen_posts.add(ext)
+            await self.ingester.ingest(profile_id, "post", post, notify=not initial)
             url = next((str(post.get(k)) for k in ("source_url", "postUrl", "post_url", "url", "facebookUrl") if post.get(k)), "")
             if url:
                 post_urls.append(url)
-        # A browser canary is supplementary evidence. It must never mark a
-        # post missing or deleted, so only successful Apify data is reconciled.
-        if not summary_error:
-            self.ingester.reconcile(profile_id, "post", seen_posts, self.settings.recent_posts, notify=not initial)
+        # A regular patrol is a bounded latest-post sample, not a complete
+        # inventory. Never mark older posts removed from this sample; removal
+        # reconciliation belongs to the cursor-based full audit below.
 
         cached_canary = self.facebook_browser.cached_canary_posts(str(profile["url"]))
         canary_items: list[dict[str, Any]] = []

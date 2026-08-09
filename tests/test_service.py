@@ -199,7 +199,7 @@ browser_canary:
     assert {row["external_id"] for row in service.db.rows("SELECT external_id FROM entities WHERE kind='post'")} == {
         "old", "api-post", "browser-post",
     }
-    assert reconciled == [{"api-post"}]
+    assert reconciled == []
     assert service.db.row("SELECT browser_canary_last_attempt_at FROM profiles WHERE id=1")["browser_canary_last_attempt_at"]
     assert service.db.row("SELECT COUNT(*) count FROM events WHERE event_type='browser_canary'")["count"] == 1
 
