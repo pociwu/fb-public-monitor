@@ -21,9 +21,9 @@ from .facebook_browser import (
     FacebookBrowserLoginRequired,
     is_facebook_ui_heading,
 )
-from .ingest import Ingester, external_id, is_placeholder_profile_name
-from .media import MediaStore
-from .normalize import facebook_post_identity, normalize_url
+from .ingest import Ingester, external_id, is_placeholder_profile_name, monitored_projection
+from .media import MediaStore, extract_media
+from .normalize import content_hash, facebook_post_identity, normalize_url
 from .telegram import TelegramSender
 from .serpapi import SerpApiError, SerpApiGateway, SerpApiQuotaExceeded, profile_id_from_url
 from .storage import collect_storage_snapshot, daily_storage_message
@@ -519,10 +519,13 @@ class MonitorService:
             return
         initial = not bool(self.db.row("SELECT id FROM entities WHERE profile_id=? AND kind='post' LIMIT 1", (profile_id,)))
         try:
-            posts = await self._fetch_posts(profile, self.settings.recent_posts)
+            posts = await self._fetch_regular_posts(profile, initial)
         except BudgetExceeded:
             canary_items = await self._try_browser_canary(profile, 0, "apify_budget")
             await self._ingest_browser_canary_posts(profile_id, canary_items, notify=not initial)
+            self._schedule_next(profile_id)
+            return
+        if isinstance(posts.summary, dict) and posts.summary.get("source") == "unchanged_probe":
             self._schedule_next(profile_id)
             return
         summary_error = actor_summary_error(posts.summary)
@@ -571,6 +574,38 @@ class MonitorService:
             if (not last_audit or datetime.now(UTC) - last_audit >= timedelta(days=self.settings.full_audit_days)) and not self.db.row("SELECT id FROM jobs WHERE profile_id=? AND job_type='audit' AND status IN ('pending','running')", (profile_id,)):
                 self._enqueue(profile_id, "audit", 40, datetime.now(UTC) + timedelta(minutes=self.settings.spacing_max_minutes))
         self._schedule_next(profile_id)
+
+    async def _fetch_regular_posts(self, profile: dict[str, Any], initial: bool) -> ActorResult:
+        """Probe one latest post before paying for the normal ten-post batch."""
+        if initial or not profile.get("backfill_done"):
+            return await self._fetch_posts(profile, self.settings.recent_posts)
+
+        probe = await self._fetch_posts(profile, 1)
+        probe_error = actor_summary_error(probe.summary)
+        if not probe_error and self._probe_posts_unchanged(int(profile["id"]), probe.items):
+            # The single probe result is already known and unchanged. Avoid a
+            # second Actor run and, importantly, avoid the comments Actor too.
+            return ActorResult([], {"source": "unchanged_probe", "profiles": [{"status": "succeeded", "postsReturned": 1}]}, probe.run_id, probe.charged_usd, probe.diagnostic_id)
+        if probe_error or not probe.items:
+            return probe
+        return await self._fetch_posts(profile, self.settings.recent_posts)
+
+    def _probe_posts_unchanged(self, profile_id: int, posts: list[dict[str, Any]]) -> bool:
+        if len(posts) != 1:
+            return False
+        item = posts[0]
+        identity = facebook_post_identity(str(next((item.get(key) for key in ("source_url", "postUrl", "post_url", "url", "facebookUrl") if item.get(key)), "")))
+        ext_id = external_id(item, "post")
+        existing = self.db.row("SELECT * FROM entities WHERE profile_id=? AND kind='post' AND external_id=?", (profile_id, ext_id))
+        if not existing and identity:
+            for row in self.db.rows("SELECT * FROM entities WHERE profile_id=? AND kind='post' AND source_url IS NOT NULL", (profile_id,)):
+                if facebook_post_identity(str(row.get("source_url") or "")) == identity:
+                    existing = row
+                    break
+        if not existing:
+            return False
+        digest = content_hash(monitored_projection(item, "post", extract_media(item, "post")))
+        return existing.get("current_hash") == digest
 
     def _browser_canary_due(self, profile: dict[str, Any]) -> bool:
         if not self.settings.facebook_browser_enabled or not self.settings.browser_canary_enabled:

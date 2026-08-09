@@ -233,6 +233,31 @@ async def test_browser_canary_matches_post_permalink_alias_to_existing_entity(tm
     assert service.db.row("SELECT COUNT(*) count FROM entities WHERE profile_id=1 AND kind='post'")["count"] == 1
 
 
+@pytest.mark.asyncio
+async def test_regular_post_probe_skips_full_batch_when_latest_post_is_unchanged(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    service = MonitorService(load_settings(config))
+    item = {"postId": "p1", "source_url": "https://facebook.com/100/posts/p1", "text": "same"}
+    await service.ingester.ingest(1, "post", item, notify=False)
+    calls: list[int] = []
+
+    async def fake_fetch(profile, maximum, cursor=None):
+        calls.append(maximum)
+        return ActorResult([item], {"profiles": [{"status": "succeeded"}]}, "probe")
+
+    service._fetch_posts = fake_fetch
+    result = await service._fetch_regular_posts({"id": 1, "backfill_done": 1}, initial=False)
+
+    assert calls == [1]
+    assert result.items == []
+    assert result.summary["source"] == "unchanged_probe"
+
+
 def test_browser_canary_respects_persistent_cooldown(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text(
