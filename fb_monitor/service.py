@@ -883,11 +883,14 @@ class MonitorService:
         numeric = str(profile.get("fb_id") or "")
         if not numeric:
             numeric = next((part for part in original.rstrip("/").split("/")[::-1] if part.isdigit()), "")
-        variants = [("original_url", original)]
-        if numeric:
-            if self.settings.actors.posts == "unseenuser/fb-profile":
-                variants.append(("profile_php", f"https://www.facebook.com/profile.php?id={numeric}"))
-            else:
+        if self.settings.actors.posts == "unseenuser/fb-profile" and numeric:
+            # This Actor charges each returned result event.  Numeric profile
+            # URLs have a canonical profile.php form, so do not pay for both
+            # the original URL and its equivalent alias on every probe.
+            variants = [("profile_php", f"https://www.facebook.com/profile.php?id={numeric}")]
+        else:
+            variants = [("original_url", original)]
+            if numeric:
                 variants.extend((("numeric_id", numeric), ("profile_php", f"https://www.facebook.com/profile.php?id={numeric}")))
         seen_inputs: set[str] = set()
         last = ActorResult([], None, "")

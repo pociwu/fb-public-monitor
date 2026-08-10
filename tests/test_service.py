@@ -291,6 +291,28 @@ schedule:
     assert result.summary["source"] == "unchanged_probe"
 
 
+@pytest.mark.asyncio
+async def test_unseenuser_numeric_profile_uses_one_canonical_url(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    service = MonitorService(load_settings(config))
+    calls: list[dict] = []
+
+    async def fake_actor(category, actor_id, payload, profile_id=None, input_variant="default"):
+        calls.append(payload)
+        return ActorResult([], {"profiles": [{"status": "succeeded"}]}, "run")
+
+    service._actor = fake_actor
+    await service._fetch_posts({"id": 1, "url": "https://facebook.com/100", "fb_id": "100"}, 1)
+
+    assert len(calls) == 1
+    assert calls[0]["startUrls"] == ["https://www.facebook.com/profile.php?id=100"]
+
+
 def test_browser_canary_respects_persistent_cooldown(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text(
