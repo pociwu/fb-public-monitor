@@ -329,6 +329,31 @@ storage:
         assert db.row("SELECT priority FROM jobs WHERE profile_id=1 AND status='pending'")["priority"] == -100
 
 
+def test_dashboard_can_queue_immediate_browser_visit(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("FACEBOOK_BROWSER_ENABLED", "1")
+    app = create_app(load_settings(config))
+    db = app.state.db
+    db.execute("DELETE FROM jobs")
+
+    with TestClient(app) as client:
+        dashboard = client.get("/")
+        assert "立即瀏覽器拜訪" in dashboard.text
+        queued = client.post("/profiles/1/browser-scan", follow_redirects=False)
+        repeated = client.post("/profiles/1/browser-scan", follow_redirects=False)
+
+    assert queued.status_code == 303
+    assert repeated.status_code == 303
+    assert "error=" in repeated.headers["location"]
+    job = db.row("SELECT * FROM jobs WHERE profile_id=1 AND job_type='browser_visit' AND status='pending'")
+    assert job and job["priority"] == -110 and '"manual":true' in job["payload_json"]
+
+
 def test_dashboard_can_refresh_profile_name(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text(

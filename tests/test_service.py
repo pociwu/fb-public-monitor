@@ -234,6 +234,32 @@ async def test_browser_canary_matches_post_permalink_alias_to_existing_entity(tm
 
 
 @pytest.mark.asyncio
+async def test_manual_browser_visit_updates_profile_and_canary_posts(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("FACEBOOK_BROWSER_ENABLED", "1")
+    service = MonitorService(load_settings(config))
+
+    async def fake_profile(url, diagnostic_key=None):
+        return {"name": "Browser Name", "profile_data_source": "Facebook 直接瀏覽器"}
+
+    async def fake_posts(url, diagnostic_key=None):
+        return [{"source_post_id": "p1", "source_url": "https://facebook.com/100/posts/p1", "text": "post"}]
+
+    service.facebook_browser.profile = fake_profile
+    service.facebook_browser.canary_posts = fake_posts
+    await service.browser_visit_profile(1)
+
+    assert service.db.row("SELECT last_success_at FROM profiles WHERE id=1")["last_success_at"]
+    assert service.db.row("SELECT COUNT(*) count FROM entities WHERE profile_id=1 AND kind='post'")["count"] == 1
+    assert service.db.row("SELECT COUNT(*) count FROM events WHERE event_type='browser_manual_visit'")["count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_regular_post_probe_skips_full_batch_when_latest_post_is_unchanged(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text(

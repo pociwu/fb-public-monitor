@@ -190,6 +190,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         profile["manual_available_at"] = available_at.isoformat()
                 except (TypeError, ValueError):
                     pass
+            profile["browser_manual_available_at"] = ""
+            browser_job = db.row(
+                "SELECT created_at,status FROM jobs WHERE profile_id=? AND job_type='browser_visit' ORDER BY id DESC LIMIT 1",
+                (profile["id"],),
+            )
+            if browser_job:
+                try:
+                    created_at = parse_time(browser_job.get("created_at"))
+                    available_at = created_at + timedelta(minutes=MANUAL_VISIT_COOLDOWN_MINUTES) if created_at else None
+                    if browser_job.get("status") in {"pending", "running"} and available_at:
+                        available_at = max(available_at, datetime.now(available_at.tzinfo) + timedelta(minutes=1))
+                    if available_at and available_at > datetime.now(available_at.tzinfo):
+                        profile["browser_manual_available_at"] = available_at.isoformat()
+                except (TypeError, ValueError):
+                    pass
             configured_id = profile_id_from_url(str(profile["url"]))
             stored_id = str(profile.get("fb_id") or "")
             profile["display_fb_id"] = next((value for value in (configured_id, stored_id) if value.isdigit()), "")
@@ -247,7 +262,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             official_usage["cycle_start_display"] = display_time(official_usage.get("cycle_start_at"), cfg.timezone)
             official_usage["cycle_end_display"] = display_time(official_usage.get("cycle_end_at"), cfg.timezone)
             official_usage["fetched_display"] = display_time(official_usage.get("fetched_at"), cfg.timezone)
-        return templates.TemplateResponse(request, "dashboard.html", {"profiles": profiles, "usage": usage, "official_usage": official_usage, "serpapi_usage": serpapi_usage, "pending": pending, "outbox": outbox, "outbox_counts": outbox_counts, "outbox_rows": outbox_rows, "maintenance_runs": maintenance_runs, "media": media, "storage_latest": storage_latest, "budget": cfg.monthly_budget_usd, "monitored": monitored, "max_profiles": MAX_PROFILES, "notice": notice, "error": error})
+        return templates.TemplateResponse(request, "dashboard.html", {"profiles": profiles, "usage": usage, "official_usage": official_usage, "serpapi_usage": serpapi_usage, "pending": pending, "outbox": outbox, "outbox_counts": outbox_counts, "outbox_rows": outbox_rows, "maintenance_runs": maintenance_runs, "media": media, "storage_latest": storage_latest, "budget": cfg.monthly_budget_usd, "monitored": monitored, "max_profiles": MAX_PROFILES, "browser_enabled": cfg.facebook_browser_enabled, "notice": notice, "error": error})
 
     @app.get("/storage")
     def storage_detail(request: Request):
@@ -318,6 +333,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             message = f"此帳號仍在立即拜訪冷卻時間內，可再次執行：{display_time(available_at.isoformat(), cfg.timezone)}"
             return RedirectResponse(url=f"/?error={quote(message)}", status_code=303)
         return RedirectResponse(url=f"/?notice={quote('已排入立即拜訪，將於目前工作完成後執行')}", status_code=303)
+
+    @app.post("/profiles/{profile_id}/browser-scan")
+    def browser_scan_profile(request: Request, profile_id: int):
+        if not cfg.facebook_browser_enabled:
+            return RedirectResponse(url=f"/?error={quote('Facebook 直接瀏覽器尚未啟用')}", status_code=303)
+        db: Database = request.app.state.db
+        profile = db.row("SELECT id,display_name,name FROM profiles WHERE id=? AND enabled=1", (profile_id,))
+        if not profile:
+            raise HTTPException(404)
+        queued, available_at = db.queue_manual_browser_visit(profile_id, MANUAL_VISIT_COOLDOWN_MINUTES)
+        if not queued:
+            message = f"瀏覽器拜訪冷卻中，請於 {display_time(available_at.isoformat(), cfg.timezone)} 後再試"
+            return RedirectResponse(url=f"/?error={quote(message)}", status_code=303)
+        label = profile.get("display_name") or profile.get("name") or "Facebook"
+        return RedirectResponse(url=f"/?notice={quote(f'已排入 {label} 立即瀏覽器拜訪')}", status_code=303)
 
     @app.post("/profiles/{profile_id}/refresh-name")
     def refresh_profile_name(request: Request, profile_id: int):
@@ -538,7 +568,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             params + (size, (page - 1) * size),
         )
         type_labels = {
-            "visit": "定期拜訪", "backfill": "首次回溯", "audit": "完整核對",
+            "visit": "定期拜訪", "browser_visit": "立即瀏覽器拜訪", "backfill": "首次回溯", "audit": "完整核對",
             "repair_scan": "修復掃描", "migrate_raw": "歷史資料轉換",
             "migrate_profile_pics": "大頭照欄位更新", "dedupe_database": "資料庫去重",
         }

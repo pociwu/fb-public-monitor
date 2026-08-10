@@ -311,7 +311,11 @@ class MonitorService:
             job_payload = json.loads(job.get("payload_json") or "{}")
         except (TypeError, json.JSONDecodeError):
             job_payload = {}
-        is_manual_visit = isinstance(job_payload, dict) and job["job_type"] == "visit" and job_payload.get("manual") is True
+        is_manual_visit = (
+            isinstance(job_payload, dict)
+            and job["job_type"] in {"visit", "browser_visit"}
+            and job_payload.get("manual") is True
+        )
         last = self.db.row("SELECT started_at FROM jobs WHERE profile_id IS NOT NULL AND started_at IS NOT NULL AND id<>? ORDER BY started_at DESC LIMIT 1", (job["id"],))
         if not is_manual_visit and job["profile_id"] is not None and last and last["started_at"]:
             earliest = datetime.fromisoformat(last["started_at"]) + timedelta(minutes=random.uniform(self.settings.spacing_min_minutes, self.settings.spacing_max_minutes))
@@ -322,6 +326,8 @@ class MonitorService:
         try:
             if job["job_type"] == "visit":
                 await self.visit_profile(int(job["profile_id"]))
+            elif job["job_type"] == "browser_visit":
+                await self.browser_visit_profile(int(job["profile_id"]))
             elif job["job_type"] == "backfill":
                 await self.backfill_profile(int(job["profile_id"]))
             elif job["job_type"] == "backfill_comments":
@@ -385,6 +391,34 @@ class MonitorService:
                     "system_error",
                     {"title": "系統修復工作失敗，已停止", "text": f"工作：{job['job_type']}\n錯誤：{str(exc)[:3000]}"},
                 )
+
+    async def browser_visit_profile(self, profile_id: int) -> None:
+        profile = self.db.row("SELECT * FROM profiles WHERE id=? AND enabled=1", (profile_id,))
+        if not profile:
+            return
+        if not self.settings.facebook_browser_enabled:
+            raise FacebookBrowserError("Facebook 直接瀏覽器尚未啟用")
+        attempted_at = utcnow()
+        self.db.execute(
+            "UPDATE profiles SET last_attempt_at=?,browser_canary_last_attempt_at=? WHERE id=?",
+            (attempted_at, attempted_at, profile_id),
+        )
+        item = await self.facebook_browser.profile(str(profile["url"]), str(profile_id))
+        await self._store_profile_details(profile, item)
+        posts = await self.facebook_browser.canary_posts(str(profile["url"]), str(profile_id))
+        await self._ingest_browser_canary_posts(profile_id, posts, notify=True)
+        display = item.get("name") or profile.get("display_name") or profile.get("name") or "Facebook"
+        self.db.add_event(
+            f"browser-manual:{profile_id}:{utcnow()}",
+            "browser_manual_visit",
+            {
+                "title": f"{display} 瀏覽器拜訪完成",
+                "text": f"已更新個人資料、擷取畫面，並處理 {len(posts)} 篇具永久連結的貼文。",
+                "source_url": profile["url"],
+            },
+            profile_id,
+            notify=False,
+        )
 
     def _remaining_budget(self) -> float:
         snapshot = self.db.apify_usage_snapshot()

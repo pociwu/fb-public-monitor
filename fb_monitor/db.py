@@ -291,6 +291,35 @@ class Database:
             conn.execute("UPDATE profiles SET last_manual_visit_at=?,updated_at=? WHERE id=?", (now_text, now_text, profile_id))
             return True, now + timedelta(minutes=cooldown_minutes)
 
+    def queue_manual_browser_visit(self, profile_id: int, cooldown_minutes: int = 10) -> tuple[bool, datetime]:
+        now = datetime.now(UTC)
+        with self.connect() as conn:
+            profile = conn.execute("SELECT id FROM profiles WHERE id=? AND enabled=1", (profile_id,)).fetchone()
+            if not profile:
+                raise ValueError("找不到可拜訪的監控帳號")
+            latest = conn.execute(
+                "SELECT status,created_at FROM jobs WHERE profile_id=? AND job_type='browser_visit' ORDER BY id DESC LIMIT 1",
+                (profile_id,),
+            ).fetchone()
+            if latest:
+                try:
+                    created = datetime.fromisoformat(str(latest["created_at"]))
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=UTC)
+                    available = created + timedelta(minutes=cooldown_minutes)
+                    if latest["status"] in {"pending", "running"}:
+                        return False, max(available, now + timedelta(minutes=1))
+                    if available > now:
+                        return False, available
+                except ValueError:
+                    pass
+            now_text = now.isoformat()
+            conn.execute(
+                "INSERT INTO jobs(profile_id,job_type,priority,payload_json,available_at,created_at) VALUES(?,'browser_visit',-110,'{\"manual\":true}',?,?)",
+                (profile_id, now_text, now_text),
+            )
+            return True, now + timedelta(minutes=cooldown_minutes)
+
     def rows(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         with self.connect() as conn:
             return [dict(row) for row in conn.execute(sql, params).fetchall()]
