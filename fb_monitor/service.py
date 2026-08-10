@@ -21,7 +21,7 @@ from .facebook_browser import (
     FacebookBrowserLoginRequired,
     is_facebook_ui_heading,
 )
-from .ingest import Ingester, external_id, is_placeholder_profile_name, monitored_projection
+from .ingest import Ingester, external_id, is_placeholder_profile_name, monitored_projection, profile_display_name
 from .media import MediaStore, extract_media
 from .normalize import content_hash, facebook_post_identity, normalize_url
 from .telegram import TelegramSender
@@ -993,8 +993,9 @@ class MonitorService:
         if browser_source and not is_placeholder_profile_name(existing_name):
             incoming_name = str(item.get("name") or "").strip()
             historical_names: set[str] = set()
+            trusted_names: list[str] = []
             for version in self.db.rows(
-                """SELECT v.normalized_json FROM versions v
+                """SELECT v.normalized_json,v.raw_path FROM versions v
                 JOIN entities e ON e.id=v.entity_id
                 WHERE e.profile_id=? AND e.kind='profile'
                 ORDER BY v.seen_at DESC,v.id DESC""",
@@ -1006,8 +1007,28 @@ class MonitorService:
                     continue
                 if known_name and not is_placeholder_profile_name(known_name):
                     historical_names.add(known_name)
+                try:
+                    raw_item = json.loads(Path(str(version.get("raw_path") or "")).read_text(encoding="utf-8"))
+                except (OSError, TypeError, json.JSONDecodeError):
+                    continue
+                raw_source = str(raw_item.get("profile_data_source") or "")
+                raw_is_browser = "瀏覽器" in raw_source or "browser" in raw_source.casefold()
+                trusted_name = profile_display_name(raw_item)
+                if raw_is_browser or is_placeholder_profile_name(trusted_name) or trusted_name in trusted_names:
+                    continue
+                trusted_names.append(trusted_name)
             if incoming_name and incoming_name != existing_name and incoming_name in historical_names:
                 rejected.add(existing_name)
+            elif (
+                "瀏覽器" in str(previous_details.get("profile_data_source") or "")
+                and trusted_names
+                and existing_name not in trusted_names
+            ):
+                restored_name = trusted_names[0]
+                rejected.add(existing_name)
+                if incoming_name and incoming_name != restored_name:
+                    rejected.add(incoming_name)
+                item["name"] = restored_name
             else:
                 item["name"] = existing_name
         if rejected:

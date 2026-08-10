@@ -507,6 +507,12 @@ async def test_browser_profile_can_restore_known_historical_name_and_reject_bad_
     )
     monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
     service = MonitorService(load_settings(config))
+    trusted_raw = service.settings.data_dir / "trusted-profile.json"
+    trusted_raw.parent.mkdir(parents=True, exist_ok=True)
+    trusted_raw.write_text(
+        '{"name":"Ya Ling Shen","profile_data_source":"SerpApi"}',
+        encoding="utf-8",
+    )
     entity_id = service.db.execute(
         """INSERT INTO entities(profile_id,kind,external_id,current_hash,present,first_seen_at,last_seen_at)
         VALUES(1,'profile','100000950467959','old',1,'2026-08-01','2026-08-09')"""
@@ -514,7 +520,7 @@ async def test_browser_profile_can_restore_known_historical_name_and_reject_bad_
     service.db.execute(
         """INSERT INTO versions(entity_id,content_hash,normalized_json,raw_path,seen_at,change_type)
         VALUES(?,?,?,?,?,?)""",
-        (entity_id, "known", '{"authorName":"Ya Ling Shen"}', "known.json", "2026-08-01", "created"),
+        (entity_id, "known", '{"authorName":"Ya Ling Shen"}', str(trusted_raw), "2026-08-01", "created"),
     )
     service.db.execute(
         "UPDATE profiles SET display_name='慈濟@新竹',profile_details_json=? WHERE id=1",
@@ -525,7 +531,7 @@ async def test_browser_profile_can_restore_known_historical_name_and_reject_bad_
         service.db.row("SELECT * FROM profiles WHERE id=1"),
         {
             "id": "100000950467959",
-            "name": "Ya Ling Shen",
+            "name": "慈濟@新竹",
             "url": "https://www.facebook.com/100000950467959",
             "profile_data_source": "Facebook 直接瀏覽器",
         },
