@@ -327,14 +327,25 @@ async def test_album_walker_saves_resume_state_when_batch_limit_is_reached(tmp_p
 @pytest.mark.asyncio
 async def test_browser_capture_is_saved_per_profile(tmp_path: Path):
     class FakePage:
-        async def screenshot(self, *, path: str, full_page: bool):
+        viewport_size = {"width": 1365, "height": 900}
+
+        def __init__(self):
+            self.clip = None
+
+        async def evaluate(self, expression: str):
+            return 5000
+
+        async def screenshot(self, *, path: str, full_page: bool, clip: dict):
+            self.clip = clip
             Path(path).write_bytes(b"png")
 
     gateway = FacebookBrowserGateway(True, tmp_path)
-    saved = await gateway._save_capture(FakePage(), "profile/1")
+    page = FakePage()
+    saved = await gateway._save_capture(page, "profile/1")
 
     assert saved == tmp_path / "screenshots" / "profile-profile_1.png"
     assert saved.read_bytes() == b"png"
+    assert page.clip == {"x": 0, "y": 0, "width": 1365, "height": 2700}
 
 
 @pytest.mark.asyncio

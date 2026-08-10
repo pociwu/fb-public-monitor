@@ -12,6 +12,8 @@ from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError, a
 
 from .normalize import facebook_post_identity, normalize_url
 
+CAPTURE_VIEWPORT_MULTIPLIER = 3
+
 
 class FacebookBrowserError(RuntimeError):
     pass
@@ -648,7 +650,24 @@ class FacebookBrowserGateway:
         target = self.screenshot_path(diagnostic_key)
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            await page.screenshot(path=str(target), full_page=False)
+            viewport = page.viewport_size or {"width": 1365, "height": 900}
+            document_height = await page.evaluate(
+                "Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0)"
+            )
+            capture_height = min(
+                max(int(document_height or 0), int(viewport["height"])),
+                int(viewport["height"]) * CAPTURE_VIEWPORT_MULTIPLIER,
+            )
+            await page.screenshot(
+                path=str(target),
+                full_page=False,
+                clip={
+                    "x": 0,
+                    "y": 0,
+                    "width": int(viewport["width"]),
+                    "height": capture_height,
+                },
+            )
             return target
         except Exception:
             return None
