@@ -34,6 +34,7 @@
   <small>最近成功：{{ p.last_success_display if p.last_success_at else '—' }}<br>下次拜訪：{{ p.next_visit_display if p.next_visit_at else '佇列中' }}</small>
   </div>
   <div class="card-admin-actions">
+    <form method="post" action="/profiles/{{ p.id }}/refresh-name" onsubmit="return confirm('重新抓取此帳號名稱？目前顯示名稱會先清除。')"><button class="button secondary" type="submit">重新抓取名稱</button></form>
     <a class="button secondary" href="/profiles/{{ p.id }}">查看資料</a>
     {% if p.browser_capture_available %}<a class="button secondary" href="/profiles/{{ p.id }}/browser-screenshot" target="_blank" title="最後擷取：{{ p.browser_capture_display }}">瀏覽器擷取畫面</a>{% endif %}
     <button class="button secondary" type="button" data-copy-profile>複製內容</button>

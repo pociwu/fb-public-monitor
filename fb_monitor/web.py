@@ -319,6 +319,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return RedirectResponse(url=f"/?error={quote(message)}", status_code=303)
         return RedirectResponse(url=f"/?notice={quote('已排入立即拜訪，將於目前工作完成後執行')}", status_code=303)
 
+    @app.post("/profiles/{profile_id}/refresh-name")
+    def refresh_profile_name(request: Request, profile_id: int):
+        db: Database = request.app.state.db
+        profile = db.row(
+            "SELECT id,display_name,name FROM profiles WHERE id=? AND enabled=1",
+            (profile_id,),
+        )
+        if not profile:
+            raise HTTPException(404)
+        queued, available_at = db.queue_manual_visit(profile_id, MANUAL_VISIT_COOLDOWN_MINUTES)
+        if not queued:
+            message = f"名稱重新抓取冷卻中，請於 {display_time(available_at.isoformat(), cfg.timezone)} 後再試"
+            return RedirectResponse(url=f"/?error={quote(message)}", status_code=303)
+        db.execute(
+            "UPDATE profiles SET display_name=NULL,serp_last_checked_at=NULL WHERE id=?",
+            (profile_id,),
+        )
+        label = profile.get("display_name") or profile.get("name") or "Facebook"
+        return RedirectResponse(url=f"/?notice={quote(f'已排入 {label} 名稱重新抓取')}", status_code=303)
+
     @app.post("/profiles/{profile_id}/remove")
     def remove_profile(request: Request, profile_id: int):
         db: Database = request.app.state.db

@@ -329,6 +329,36 @@ storage:
         assert db.row("SELECT priority FROM jobs WHERE profile_id=1 AND status='pending'")["priority"] == -100
 
 
+def test_dashboard_can_refresh_profile_name(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """profiles:
+  - name: FB-100000950467959
+    url: https://www.facebook.com/100000950467959
+storage:
+  data_dir: data
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    app = create_app(load_settings(config))
+    db = app.state.db
+    db.execute(
+        "UPDATE profiles SET display_name='錯誤名稱',serp_last_checked_at='2026-08-09T00:00:00+00:00' WHERE id=1"
+    )
+    db.execute("DELETE FROM jobs")
+
+    with TestClient(app) as client:
+        response = client.post("/profiles/1/refresh-name", follow_redirects=False)
+
+    assert response.status_code == 303
+    profile = db.row("SELECT display_name,serp_last_checked_at FROM profiles WHERE id=1")
+    assert profile["display_name"] is None
+    assert profile["serp_last_checked_at"] is None
+    job = db.row("SELECT * FROM jobs WHERE profile_id=1 AND job_type='visit' AND status='pending'")
+    assert job and '"manual":true' in job["payload_json"]
+
+
 def test_dashboard_can_add_and_remove_validated_profile_urls(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text(
