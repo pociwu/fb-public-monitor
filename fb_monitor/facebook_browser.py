@@ -114,7 +114,10 @@ def normalize_browser_profile(raw: dict[str, Any], profile_url: str) -> dict[str
     aliased_summary = summary_name if re.search(r"[\(（][^\(（\)）]{1,80}[\)）]$", summary_name) else ""
     image_name = _name_from_profile_image(images)
     name_candidates = [
-        aliased_summary, raw.get("main_heading"), image_name, summary_name,
+        # The name adjacent to the friend/follower count and the avatar alt text
+        # belong to the profile header.  A generic role=main h1 may instead be a
+        # visible post author, so only use it after those profile-specific clues.
+        aliased_summary, image_name, summary_name, raw.get("main_heading"),
         *role_headings, *headings,
         raw.get("og_title"), raw.get("heading"), raw.get("title"),
     ]

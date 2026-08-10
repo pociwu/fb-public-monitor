@@ -115,7 +115,10 @@ def test_normalize_browser_profile_ignores_unread_count_facebook_title():
 def test_normalize_browser_profile_prefers_avatar_name_over_post_author_heading():
     item = normalize_browser_profile(
         {
-            "main_heading": "",
+            # Facebook can expose the author of a visible timeline post as the
+            # first heading inside role=main.  The profile summary and avatar
+            # still identify the actual owner of the page.
+            "main_heading": "慈濟@新竹",
             "role_headings": ["慈濟@新竹", "Ya Ling Shen"],
             "headings": ["慈濟@新竹"],
             "og_title": "(4) Facebook",
