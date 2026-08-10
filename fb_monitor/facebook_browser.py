@@ -648,29 +648,31 @@ class FacebookBrowserGateway:
         if not diagnostic_key:
             return None
         target = self.screenshot_path(diagnostic_key)
+        original_viewport = page.viewport_size or {"width": 1365, "height": 900}
+        expanded_viewport = {
+            "width": int(original_viewport["width"]),
+            "height": int(original_viewport["height"]) * CAPTURE_VIEWPORT_MULTIPLIER,
+        }
+        resized = False
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            viewport = page.viewport_size or {"width": 1365, "height": 900}
-            document_height = await page.evaluate(
-                "Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0)"
-            )
-            capture_height = min(
-                max(int(document_height or 0), int(viewport["height"])),
-                int(viewport["height"]) * CAPTURE_VIEWPORT_MULTIPLIER,
-            )
-            await page.screenshot(
-                path=str(target),
-                full_page=False,
-                clip={
-                    "x": 0,
-                    "y": 0,
-                    "width": int(viewport["width"]),
-                    "height": capture_height,
-                },
-            )
+            await page.set_viewport_size(expanded_viewport)
+            resized = True
+            await page.evaluate("window.scrollTo(0, 0)")
+            # Facebook lazily renders timeline content according to the visible
+            # viewport. Give the newly visible second and third screens time to
+            # settle before taking the diagnostic capture.
+            await page.wait_for_timeout(2000)
+            await page.screenshot(path=str(target), full_page=False)
             return target
         except Exception:
             return None
+        finally:
+            if resized:
+                try:
+                    await page.set_viewport_size(original_viewport)
+                except Exception:
+                    pass
 
     async def _save_failure(self, page: Page, diagnostic_key: str | None) -> None:
         try:

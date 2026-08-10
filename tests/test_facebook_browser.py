@@ -327,16 +327,23 @@ async def test_album_walker_saves_resume_state_when_batch_limit_is_reached(tmp_p
 @pytest.mark.asyncio
 async def test_browser_capture_is_saved_per_profile(tmp_path: Path):
     class FakePage:
-        viewport_size = {"width": 1365, "height": 900}
-
         def __init__(self):
-            self.clip = None
+            self.viewport_size = {"width": 1365, "height": 900}
+            self.loaded_content_height = 900
+            self.captured_content_height = 0
+
+        async def set_viewport_size(self, size: dict):
+            self.viewport_size = dict(size)
+            self.loaded_content_height = int(size["height"])
+
+        async def wait_for_timeout(self, milliseconds: int):
+            pass
 
         async def evaluate(self, expression: str):
             return 5000
 
-        async def screenshot(self, *, path: str, full_page: bool, clip: dict):
-            self.clip = clip
+        async def screenshot(self, *, path: str, full_page: bool):
+            self.captured_content_height = self.loaded_content_height
             Path(path).write_bytes(b"png")
 
     gateway = FacebookBrowserGateway(True, tmp_path)
@@ -345,7 +352,8 @@ async def test_browser_capture_is_saved_per_profile(tmp_path: Path):
 
     assert saved == tmp_path / "screenshots" / "profile-profile_1.png"
     assert saved.read_bytes() == b"png"
-    assert page.clip == {"x": 0, "y": 0, "width": 1365, "height": 2700}
+    assert page.captured_content_height == 2700
+    assert page.viewport_size == {"width": 1365, "height": 900}
 
 
 @pytest.mark.asyncio
