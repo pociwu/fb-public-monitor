@@ -139,6 +139,41 @@ def test_normalize_browser_profile_prefers_avatar_name_over_post_author_heading(
     assert item["name"] == "Ya Ling Shen"
 
 
+def test_normalize_browser_profile_ignores_small_post_author_avatar_name():
+    item = normalize_browser_profile(
+        {
+            "main_heading": "",
+            "heading": "通知",
+            "headings": ["通知"],
+            "role_headings": [],
+            "og_title": "",
+            "title": "(6) Facebook",
+            "text": "通知\nYa Ling Shen\n34 位朋友\nThis Is Me\n貼文\n慈濟＠新竹",
+            "images": [
+                {
+                    "src": "https://scontent.example.fbcdn.net/profile.jpg",
+                    "alt": "Ya Ling Shen",
+                    "natural_width": 720,
+                    "natural_height": 720,
+                    "rendered_width": 168,
+                    "rendered_height": 168,
+                },
+                {
+                    "src": "https://scontent.example.fbcdn.net/post-author.jpg",
+                    "alt": "慈濟＠新竹的大頭貼照",
+                    "natural_width": 40,
+                    "natural_height": 40,
+                    "rendered_width": 40,
+                    "rendered_height": 40,
+                },
+            ],
+        },
+        "https://www.facebook.com/100000950467959",
+    )
+
+    assert item["name"] == "Ya Ling Shen"
+
+
 def test_normalize_browser_profile_uses_name_before_combined_follow_summary():
     item = normalize_browser_profile(
         {

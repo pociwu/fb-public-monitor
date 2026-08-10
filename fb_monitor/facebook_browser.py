@@ -76,6 +76,14 @@ def _name_from_profile_image(images: list[dict[str, Any]]) -> str:
         r"^(.+?)(?:'s|’s) profile picture$",
     )
     for image in images:
+        rendered_width = int(image.get("rendered_width") or 0)
+        rendered_height = int(image.get("rendered_height") or 0)
+        # Timeline author avatars are normally rendered around 40x40 and may
+        # carry an explicit "X's profile picture" alt label.  They identify a
+        # post author, not the owner of the profile page.  The profile-header
+        # avatar in our desktop viewport is substantially larger.
+        if rendered_width and rendered_height and min(rendered_width, rendered_height) < 96:
+            continue
         alt = str(image.get("alt") or "").strip()
         for pattern in patterns:
             match = re.match(pattern, alt, flags=re.IGNORECASE)
