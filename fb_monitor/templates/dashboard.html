@@ -38,6 +38,8 @@
     {% if browser_enabled %}<form method="post" action="/profiles/{{ p.id }}/browser-scan" onsubmit="return confirm('立即使用 Chromium 拜訪 {{ p.display_name or p.name }}？')"><button class="button secondary" type="submit"{% if p.browser_manual_available_at %} disabled data-manual-cooldown="{{ p.browser_manual_available_at }}"{% endif %}><span data-manual-label>{% if p.browser_manual_available_at %}瀏覽器冷卻中{% else %}立即瀏覽器拜訪{% endif %}</span></button></form>{% endif %}
     <a class="button secondary" href="/profiles/{{ p.id }}">查看資料</a>
     <a class="button secondary" href="/diagnostics?profile_id={{ p.id }}">Apify 紀錄</a>
+    <form method="post" action="/profiles/{{ p.id }}/apify-freeze" onsubmit="return confirm('{% if p.apify_frozen %}解除此帳號的 Apify 凍結？{% else %}凍結後，此帳號將不使用任何 Apify 功能，其他功能維持正常。確定凍結？{% endif %}')"><button class="button {% if p.apify_frozen %}secondary{% else %}danger{% endif %}" type="submit">{% if p.apify_frozen %}解除 Apify 凍結{% else %}凍結 Apify{% endif %}</button></form>
+    {% if p.apify_frozen %}<span class="badge gone">Apify 已凍結</span>{% endif %}
     {% if p.browser_capture_available %}<a class="button secondary" href="/profiles/{{ p.id }}/browser-screenshot" target="_blank" title="最後擷取：{{ p.browser_capture_display }}">瀏覽器擷取畫面</a>{% endif %}
     <button class="button secondary" type="button" data-copy-profile>複製內容</button>
     <form method="post" action="/profiles/{{ p.id }}/scan" onsubmit="return confirm('立即執行拜訪 {{ p.display_name or p.name }}？同一帳號 10 分鐘內不可重複執行。')"><button class="button secondary" type="submit"{% if p.manual_available_at %} disabled data-manual-cooldown="{{ p.manual_available_at }}"{% endif %}><span data-manual-label>{% if p.manual_available_at %}冷卻中{% else %}立即拜訪{% endif %}</span></button></form>

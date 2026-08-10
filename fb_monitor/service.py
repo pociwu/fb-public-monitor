@@ -44,6 +44,10 @@ class BudgetExceeded(RuntimeError):
         self.resume_at = resume_at
 
 
+class ApifyFrozen(RuntimeError):
+    """The selected profile has explicitly disabled all Apify work."""
+
+
 def actor_summary_error(summary: dict[str, Any] | None) -> str | None:
     if not isinstance(summary, dict):
         return None
@@ -372,6 +376,10 @@ class MonitorService:
                     self.db.finish_maintenance_run(run_id, {}, str(exc))
                     raise
             self.db.execute("UPDATE jobs SET status='done',finished_at=?,error=NULL WHERE id=?", (utcnow(), job["id"]))
+        except ApifyFrozen as exc:
+            self.db.execute("UPDATE jobs SET status='skipped_apify_frozen',finished_at=?,error=? WHERE id=?", (utcnow(), str(exc), job["id"]))
+            if job["job_type"] == "visit":
+                self._schedule_next(int(job["profile_id"]))
         except BudgetExceeded as exc:
             resume = exc.resume_at or self._next_month()
             self.db.execute("UPDATE jobs SET status='deferred_budget',finished_at=?,error=? WHERE id=?", (utcnow(), str(exc), job["id"]))
@@ -476,6 +484,10 @@ class MonitorService:
         return max(0.0, self.settings.monthly_budget_usd - usage.used_usd), usage
 
     async def _actor(self, category: str, actor_id: str, payload: dict[str, Any], profile_id: int | None = None, input_variant: str = "default") -> ActorResult:
+        if profile_id is not None:
+            profile = self.db.row("SELECT apify_frozen FROM profiles WHERE id=?", (profile_id,))
+            if profile and profile.get("apify_frozen"):
+                raise ApifyFrozen("此帳號已凍結 Apify；本次付費工作未執行")
         official_remaining, official_usage = await self._official_available()
         remaining = min(self._available_for(category), official_remaining)
         if remaining < PRICES[category]:
@@ -563,8 +575,9 @@ class MonitorService:
         initial = not bool(self.db.row("SELECT id FROM entities WHERE profile_id=? AND kind='post' LIMIT 1", (profile_id,)))
         try:
             posts = await self._fetch_regular_posts(profile, initial)
-        except BudgetExceeded:
-            canary_items = await self._try_browser_canary(profile, 0, "apify_budget")
+        except (ApifyFrozen, BudgetExceeded) as exc:
+            reason = "apify_frozen" if isinstance(exc, ApifyFrozen) else "apify_budget"
+            canary_items = await self._try_browser_canary(profile, 0, reason)
             await self._ingest_browser_canary_posts(profile_id, canary_items, notify=not initial)
             self._schedule_next(profile_id)
             return
@@ -605,7 +618,7 @@ class MonitorService:
         if post_urls and self._remaining_budget() > 0:
             try:
                 await self._fetch_comments(profile_id, post_urls, notify=not initial)
-            except BudgetExceeded:
+            except (ApifyFrozen, BudgetExceeded):
                 pass
         if not profile["backfill_done"] and not self.db.row("SELECT id FROM jobs WHERE profile_id=? AND job_type='backfill' AND status IN ('pending','running')", (profile_id,)):
             self._enqueue(profile_id, "backfill", 30, datetime.now(UTC) + timedelta(minutes=self.settings.spacing_max_minutes))
@@ -1161,6 +1174,8 @@ class MonitorService:
         profile = self.db.row("SELECT * FROM profiles WHERE id=?", (profile_id,))
         if not profile or profile["public_state"] != "public":
             return
+        if profile.get("apify_frozen"):
+            return
         result = await self._fetch_posts(profile, self.settings.backfill_posts, profile.get("backfill_cursor"))
         post_urls, _ = await self._ingest_apify_posts(
             profile_id,
@@ -1189,6 +1204,8 @@ class MonitorService:
         profile = self.db.row("SELECT * FROM profiles WHERE id=?", (profile_id,))
         if not profile or profile["public_state"] != "public":
             return
+        if profile.get("apify_frozen"):
+            return
         post_urls = [str(url) for url in payload.get("post_urls") or [] if url]
         if post_urls and self._remaining_budget() < PRICES["comments"]:
             raise BudgetExceeded("貼文已完成；留言等待 Apify 額度恢復", self._next_month())
@@ -1205,6 +1222,8 @@ class MonitorService:
     async def audit_profile(self, profile_id: int) -> None:
         profile = self.db.row("SELECT * FROM profiles WHERE id=?", (profile_id,))
         if not profile or profile["public_state"] != "public":
+            return
+        if profile.get("apify_frozen"):
             return
         token = profile.get("audit_token") or datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
         cursor = profile.get("audit_cursor")

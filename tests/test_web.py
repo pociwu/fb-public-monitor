@@ -390,6 +390,30 @@ def test_dashboard_can_queue_immediate_browser_visit(tmp_path: Path, monkeypatch
     assert job and job["priority"] == -110 and '"manual":true' in job["payload_json"]
 
 
+def test_dashboard_can_freeze_and_unfreeze_apify_per_profile(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    app = create_app(load_settings(config))
+    db = app.state.db
+
+    with TestClient(app) as client:
+        dashboard = client.get("/")
+        frozen = client.post("/profiles/1/apify-freeze", follow_redirects=False)
+        frozen_dashboard = client.get("/")
+        unfrozen = client.post("/profiles/1/apify-freeze", follow_redirects=False)
+
+    assert "凍結 Apify" in dashboard.text
+    assert frozen.status_code == 303
+    assert "解除 Apify 凍結" in frozen_dashboard.text
+    assert "Apify 已凍結" in frozen_dashboard.text
+    assert unfrozen.status_code == 303
+    assert db.row("SELECT apify_frozen FROM profiles WHERE id=1")["apify_frozen"] == 0
+
+
 def test_dashboard_can_refresh_profile_name(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text(

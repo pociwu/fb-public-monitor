@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS profiles (
   last_attempt_at TEXT, last_success_at TEXT, next_visit_at TEXT, last_full_audit_at TEXT,
   backfill_cursor TEXT, backfill_done INTEGER NOT NULL DEFAULT 0, audit_cursor TEXT, audit_token TEXT,
   consecutive_failures INTEGER NOT NULL DEFAULT 0, sort_order INTEGER, last_manual_visit_at TEXT,
+  apify_frozen INTEGER NOT NULL DEFAULT 0,
   last_error TEXT, profile_details_json TEXT, serp_last_checked_at TEXT, browser_canary_last_attempt_at TEXT,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
@@ -160,6 +161,8 @@ class Database:
                 conn.execute("ALTER TABLE profiles ADD COLUMN sort_order INTEGER")
             if "last_manual_visit_at" not in columns:
                 conn.execute("ALTER TABLE profiles ADD COLUMN last_manual_visit_at TEXT")
+            if "apify_frozen" not in columns:
+                conn.execute("ALTER TABLE profiles ADD COLUMN apify_frozen INTEGER NOT NULL DEFAULT 0")
             if "apify_posts_blocked_until" not in columns:
                 conn.execute("ALTER TABLE profiles ADD COLUMN apify_posts_blocked_until TEXT")
             if "apify_posts_unparsed_streak" not in columns:

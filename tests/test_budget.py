@@ -4,7 +4,7 @@ import pytest
 
 from fb_monitor.apify import ActorResult, MonthlyUsage
 from fb_monitor.config import load_settings
-from fb_monitor.service import BudgetExceeded, MonitorService
+from fb_monitor.service import ApifyFrozen, BudgetExceeded, MonitorService
 
 
 def test_apify_budget_is_available_to_posts_after_profile_moves_to_serpapi(tmp_path: Path, monkeypatch):
@@ -78,4 +78,38 @@ async def test_actor_fails_closed_when_official_usage_cannot_be_checked(tmp_path
 
     assert actor_called is False
     assert caught.value.resume_at is not None
+    assert service.db.row("SELECT COUNT(*) count FROM actor_runs")["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_frozen_profile_never_checks_usage_or_calls_apify(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    service = MonitorService(load_settings(config))
+    service.db.execute("UPDATE profiles SET apify_frozen=1 WHERE id=1")
+    usage_checked = False
+    actor_called = False
+
+    async def usage():
+        nonlocal usage_checked
+        usage_checked = True
+        raise AssertionError("must not check paid service usage")
+
+    async def actor_call(*args, **kwargs):
+        nonlocal actor_called
+        actor_called = True
+        raise AssertionError("must not call Apify")
+
+    service.apify.monthly_usage = usage
+    service.apify.call = actor_call
+
+    with pytest.raises(ApifyFrozen):
+        await service._actor("posts", "actor", {}, profile_id=1)
+
+    assert usage_checked is False
+    assert actor_called is False
     assert service.db.row("SELECT COUNT(*) count FROM actor_runs")["count"] == 0

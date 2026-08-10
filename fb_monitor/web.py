@@ -349,6 +349,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         label = profile.get("display_name") or profile.get("name") or "Facebook"
         return RedirectResponse(url=f"/?notice={quote(f'已排入 {label} 立即瀏覽器拜訪')}", status_code=303)
 
+    @app.post("/profiles/{profile_id}/apify-freeze")
+    def toggle_profile_apify(request: Request, profile_id: int):
+        db: Database = request.app.state.db
+        profile = db.row(
+            "SELECT id,display_name,name,apify_frozen FROM profiles WHERE id=? AND enabled=1",
+            (profile_id,),
+        )
+        if not profile:
+            raise HTTPException(404)
+        frozen = 0 if profile.get("apify_frozen") else 1
+        db.execute("UPDATE profiles SET apify_frozen=?,updated_at=? WHERE id=?", (frozen, utcnow(), profile_id))
+        label = profile.get("display_name") or profile.get("name") or "Facebook"
+        action = "已凍結 Apify；其他功能維持正常" if frozen else "已解除 Apify 凍結"
+        return RedirectResponse(url=f"/?notice={quote(f'{label} {action}')}", status_code=303)
+
     @app.post("/profiles/{profile_id}/refresh-name")
     def refresh_profile_name(request: Request, profile_id: int):
         db: Database = request.app.state.db
