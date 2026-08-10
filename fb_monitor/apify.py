@@ -15,6 +15,7 @@ class ActorResult:
     run_id: str
     charged_usd: float = 0.0
     diagnostic_id: int | None = None
+    raw_result_count: int | None = None
 
 
 @dataclass(slots=True)
@@ -76,4 +77,11 @@ class ApifyGateway:
             if record:
                 summary = record.get("value")
         charged = run.get("usageTotalUsd") or run.get("usageUsd") or 0
-        return ActorResult(items=list(items), summary=summary, run_id=str(run.get("id", "")), charged_usd=float(charged))
+        result_items = list(items)
+        return ActorResult(
+            items=result_items,
+            summary=summary,
+            run_id=str(run.get("id", "")),
+            charged_usd=float(charged),
+            raw_result_count=len(result_items),
+        )

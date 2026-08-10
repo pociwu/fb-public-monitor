@@ -493,6 +493,8 @@ class MonitorService:
             self.db.finish_actor_run(diagnostic_id, status="failed", error=str(exc))
             raise
         result.diagnostic_id = diagnostic_id
+        raw_result_count = result.raw_result_count if result.raw_result_count is not None else len(result.items)
+        result.raw_result_count = raw_result_count
         summary_error = actor_summary_error(result.summary)
         self.db.finish_actor_run(
             diagnostic_id,
@@ -502,12 +504,15 @@ class MonitorService:
             charged_usd=result.charged_usd,
             summary=result.summary,
             error=summary_error,
+            samples=result.items,
+            raw_result_count=raw_result_count,
+            parsed_result_count=len(result.items),
         )
         # Store pricing is result-based; usageTotalUsd captures platform/run charges
         # when Apify exposes them. A small conservative run buffer prevents the
         # local ledger from understating synthetic Actor-start events.
-        cost = max(len(result.items) * PRICES[category], result.charged_usd) + 0.001
-        self.db.add_usage(datetime.now(UTC).strftime("%Y-%m"), category, len(result.items), cost)
+        cost = max(raw_result_count * PRICES[category], result.charged_usd) + 0.001
+        self.db.add_usage(datetime.now(UTC).strftime("%Y-%m"), category, raw_result_count, cost)
         cycle_key = official_usage.cycle_start_at[:10]
         used = official_usage.used_usd
         if used >= self.settings.monthly_budget_usd * self.settings.budget_warning_ratio:
@@ -570,15 +575,15 @@ class MonitorService:
         if not posts.items:
             if summary_error and not self.settings.browser_canary_enabled:
                 raise RuntimeError(f"貼文 Actor 三種輸入格式均失敗：{summary_error}")
-        post_urls: list[str] = []
         if initial and posts.items:
             self.db.execute("UPDATE profiles SET backfill_done=0,backfill_cursor=NULL,last_full_audit_at=NULL WHERE id=?", (profile_id,))
             profile["backfill_done"] = 0
-        for post in posts.items:
-            await self.ingester.ingest(profile_id, "post", post, notify=not initial)
-            url = next((str(post.get(k)) for k in ("source_url", "postUrl", "post_url", "url", "facebookUrl") if post.get(k)), "")
-            if url:
-                post_urls.append(url)
+        post_urls, _ = await self._ingest_apify_posts(
+            profile_id,
+            posts.items,
+            notify=not initial,
+            diagnostic_id=posts.diagnostic_id,
+        )
         # A regular patrol is a bounded latest-post sample, not a complete
         # inventory. Never mark older posts removed from this sample; removal
         # reconciliation belongs to the cursor-based full audit below.
@@ -625,6 +630,12 @@ class MonitorService:
             probe = await self._fetch_posts(profile, 1)
             probe_error = actor_summary_error(probe.summary)
             if not probe_error and self._probe_posts_unchanged(int(profile["id"]), probe.items):
+                self.db.update_actor_ingest_counts(
+                    probe.diagnostic_id,
+                    new=0,
+                    updated=0,
+                    duplicate=len(probe.items),
+                )
                 return ActorResult(
                     [],
                     {"source": "unchanged_probe", "profiles": [{"status": "succeeded", "postsReturned": 1}]},
@@ -641,6 +652,12 @@ class MonitorService:
         if not probe_error and self._probe_posts_unchanged(int(profile["id"]), probe.items):
             # The single probe result is already known and unchanged. Avoid a
             # second Actor run and, importantly, avoid the comments Actor too.
+            self.db.update_actor_ingest_counts(
+                probe.diagnostic_id,
+                new=0,
+                updated=0,
+                duplicate=len(probe.items),
+            )
             return ActorResult([], {"source": "unchanged_probe", "profiles": [{"status": "succeeded", "postsReturned": 1}]}, probe.run_id, probe.charged_usd, probe.diagnostic_id)
         if probe_error or not probe.items:
             return probe
@@ -763,6 +780,65 @@ class MonitorService:
             if known_id:
                 item["source_post_id"] = known_id
             await self.ingester.ingest(profile_id, "post", item, notify=notify)
+
+    async def _ingest_apify_posts(
+        self,
+        profile_id: int,
+        items: list[dict[str, Any]],
+        *,
+        notify: bool,
+        diagnostic_id: int | None,
+    ) -> tuple[list[str], set[str]]:
+        existing_rows = self.db.rows(
+            "SELECT external_id,source_url FROM entities WHERE profile_id=? AND kind='post'",
+            (profile_id,),
+        )
+        ids_by_identity = {
+            identity: str(row["external_id"])
+            for row in existing_rows
+            if row.get("source_url")
+            for identity in [facebook_post_identity(str(row["source_url"]))]
+            if identity
+        }
+        new_count = 0
+        updated_count = 0
+        duplicate_count = 0
+        post_urls: list[str] = []
+        persisted_ids: set[str] = set()
+        for raw_item in items:
+            item = dict(raw_item)
+            source_url = next(
+                (str(item.get(key)) for key in ("source_url", "postUrl", "post_url", "url", "facebookUrl") if item.get(key)),
+                "",
+            )
+            identity = facebook_post_identity(source_url)
+            known_alias_id = ids_by_identity.get(identity) if identity else None
+            if known_alias_id:
+                item["source_post_id"] = known_alias_id
+            ext_id = external_id(item, "post")
+            existed = self.db.row(
+                "SELECT id FROM entities WHERE profile_id=? AND kind='post' AND external_id=?",
+                (profile_id, ext_id),
+            )
+            _, persisted_id, changed = await self.ingester.ingest(profile_id, "post", item, notify=notify)
+            persisted_ids.add(persisted_id)
+            if not existed:
+                new_count += 1
+            elif changed:
+                updated_count += 1
+            else:
+                duplicate_count += 1
+            if source_url:
+                post_urls.append(source_url)
+            if identity:
+                ids_by_identity[identity] = ext_id
+        self.db.update_actor_ingest_counts(
+            diagnostic_id,
+            new=new_count,
+            updated=updated_count,
+            duplicate=duplicate_count,
+        )
+        return post_urls, persisted_ids
 
     def _serpapi_profile_due(self, profile: dict[str, Any]) -> bool:
         checked_at = profile.get("serp_last_checked_at")
@@ -913,6 +989,16 @@ class MonitorService:
             self.db.add_event(f"profile:{profile['id']}:private:{utcnow()[:13]}", "profile_private", {"title": f"{display} 目前為私人帳號", "source_url": profile["url"]}, int(profile["id"]))
 
     async def _fetch_posts(self, profile: dict[str, Any], maximum: int, cursor: str | None = None) -> ActorResult:
+        blocked_until = profile.get("apify_posts_blocked_until")
+        if blocked_until:
+            try:
+                resume = datetime.fromisoformat(str(blocked_until))
+                if resume.tzinfo is None:
+                    resume = resume.replace(tzinfo=UTC)
+                if resume > datetime.now(UTC):
+                    raise BudgetExceeded("Apify 貼文查詢因付費結果無法解析而暫停", resume)
+            except ValueError:
+                pass
         original = str(profile["url"])
         numeric = str(profile.get("fb_id") or "")
         if not numeric:
@@ -942,7 +1028,8 @@ class MonitorService:
             payload.update(actor_input(self.settings.actors.posts_input, profile_url=profile_input, max_posts=maximum, cursor=cursor or ""))
             last = await self._actor("posts", self.settings.actors.posts, payload, int(profile["id"]), label)
             last = self._unwrap_embedded_posts(last, maximum)
-            if last.diagnostic_id and isinstance(last.summary, dict) and last.summary.get("source") == "embedded_posts":
+            raw_count = last.raw_result_count if last.raw_result_count is not None else len(last.items)
+            if last.diagnostic_id:
                 self.db.finish_actor_run(
                     last.diagnostic_id,
                     status="succeeded" if last.items else "succeeded_zero",
@@ -950,6 +1037,32 @@ class MonitorService:
                     result_count=len(last.items),
                     charged_usd=last.charged_usd,
                     summary=last.summary,
+                    raw_result_count=raw_count,
+                    parsed_result_count=len(last.items),
+                )
+            if raw_count > 0 and not last.items:
+                resume = datetime.now(UTC) + timedelta(hours=24)
+                self.db.execute(
+                    """UPDATE profiles SET apify_posts_blocked_until=?,
+                    apify_posts_unparsed_streak=apify_posts_unparsed_streak+1 WHERE id=?""",
+                    (resume.isoformat(), profile["id"]),
+                )
+                if last.diagnostic_id:
+                    self.db.finish_actor_run(
+                        last.diagnostic_id,
+                        status="unparsed_paid_result",
+                        run_id=last.run_id,
+                        result_count=0,
+                        charged_usd=last.charged_usd,
+                        summary=last.summary,
+                        error=f"Apify 回傳 {raw_count} 筆計費結果，但未解析出貼文；已暫停 24 小時",
+                        parsed_result_count=0,
+                    )
+                raise BudgetExceeded("Apify 回傳付費結果但無法解析；已安全暫停 24 小時", resume)
+            if last.items:
+                self.db.execute(
+                    "UPDATE profiles SET apify_posts_blocked_until=NULL,apify_posts_unparsed_streak=0 WHERE id=?",
+                    (profile["id"],),
                 )
             if not last.items:
                 if not actor_summary_error(last.summary):
@@ -984,7 +1097,14 @@ class MonitorService:
         else:
             coverage = "partial_actor_limit" if len(direct) >= maximum else "complete"
             summary = {"source": "embedded_posts", "profiles": [{"status": "succeeded", "postsReturned": len(direct), "coverageStatus": coverage, "pointer": {"nextCursor": None}}]}
-        return ActorResult(direct, summary, result.run_id, result.charged_usd, result.diagnostic_id)
+        return ActorResult(
+            direct,
+            summary,
+            result.run_id,
+            result.charged_usd,
+            result.diagnostic_id,
+            result.raw_result_count if result.raw_result_count is not None else len(result.items),
+        )
 
     async def _fetch_comments(self, profile_id: int, post_urls: list[str], notify: bool) -> None:
         remaining = self._available_for("comments")
@@ -1001,13 +1121,33 @@ class MonitorService:
             url: bool(self.db.row("SELECT 1 FROM comment_baselines WHERE profile_id=? AND parent_external_id=?", (profile_id, url)))
             for url in post_urls
         }
+        new_count = 0
+        updated_count = 0
+        duplicate_count = 0
         for comment in result.items:
             parent_url = str(comment.get("facebookUrl") or comment.get("inputUrl") or comment.get("postUrl") or "")
             if not parent_url and len(post_urls) == 1:
                 parent_url = post_urls[0]
             had_baseline = baseline_before.setdefault(parent_url, bool(self.db.row("SELECT 1 FROM comment_baselines WHERE profile_id=? AND parent_external_id=?", (profile_id, parent_url))))
-            _, ext, _ = await self.ingester.ingest(profile_id, "comment", comment, notify=notify and had_baseline, parent_external_id=parent_url)
+            candidate_id = external_id(comment, "comment")
+            existed = self.db.row(
+                "SELECT id FROM entities WHERE profile_id=? AND kind='comment' AND external_id=? AND parent_external_id=?",
+                (profile_id, candidate_id, parent_url),
+            )
+            _, ext, changed = await self.ingester.ingest(profile_id, "comment", comment, notify=notify and had_baseline, parent_external_id=parent_url)
+            if not existed:
+                new_count += 1
+            elif changed:
+                updated_count += 1
+            else:
+                duplicate_count += 1
             by_post.setdefault(parent_url, set()).add(ext)
+        self.db.update_actor_ingest_counts(
+            result.diagnostic_id,
+            new=new_count,
+            updated=updated_count,
+            duplicate=duplicate_count,
+        )
         # Absence is only reconciled by a complete, uncapped result set; partial budget runs must not imply deletion.
         if len(result.items) < limit:
             for parent_url, seen in by_post.items():
@@ -1022,12 +1162,12 @@ class MonitorService:
         if not profile or profile["public_state"] != "public":
             return
         result = await self._fetch_posts(profile, self.settings.backfill_posts, profile.get("backfill_cursor"))
-        post_urls: list[str] = []
-        for post in result.items:
-            await self.ingester.ingest(profile_id, "post", post, notify=False)
-            url = next((str(post.get(k)) for k in ("source_url", "postUrl", "post_url", "url", "facebookUrl") if post.get(k)), "")
-            if url:
-                post_urls.append(url)
+        post_urls, _ = await self._ingest_apify_posts(
+            profile_id,
+            result.items,
+            notify=False,
+            diagnostic_id=result.diagnostic_id,
+        )
         if not result.summary or not result.summary.get("profiles"):
             raise RuntimeError("貼文 Actor schema 異常：完整回溯缺少 SUMMARY.profiles")
         summary_profile = result.summary["profiles"][0]
@@ -1069,16 +1209,15 @@ class MonitorService:
         token = profile.get("audit_token") or datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
         cursor = profile.get("audit_cursor")
         result = await self._fetch_posts(profile, self.settings.backfill_posts, cursor)
-        post_urls: list[str] = []
+        post_urls, persisted_ids = await self._ingest_apify_posts(
+            profile_id,
+            result.items,
+            notify=True,
+            diagnostic_id=result.diagnostic_id,
+        )
         with self.db.connect() as conn:
-            for post in result.items:
-                ext = external_id(post, "post")
+            for ext in persisted_ids:
                 conn.execute("INSERT OR IGNORE INTO audit_seen(profile_id,audit_token,kind,external_id) VALUES(?,?,?,?)", (profile_id, token, "post", ext))
-        for post in result.items:
-            await self.ingester.ingest(profile_id, "post", post, notify=True)
-            url = next((str(post.get(k)) for k in ("source_url", "postUrl", "post_url", "url", "facebookUrl") if post.get(k)), "")
-            if url:
-                post_urls.append(url)
         if post_urls and self._remaining_budget() > 0:
             await self._fetch_comments(profile_id, post_urls, notify=True)
         if not result.summary or not result.summary.get("profiles"):

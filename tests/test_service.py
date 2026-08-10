@@ -8,7 +8,7 @@ from fb_monitor.apify import ActorResult, MonthlyUsage
 from fb_monitor.config import load_settings
 from fb_monitor.facebook_browser import FacebookBrowserError, FacebookBrowserLoginRequired
 from fb_monitor.serpapi import SerpApiAccount, SerpApiError, SerpApiProfileResult
-from fb_monitor.service import MonitorService, actor_summary_error
+from fb_monitor.service import BudgetExceeded, MonitorService, actor_summary_error
 
 
 def test_failed_actor_summary_is_not_treated_as_empty_success():
@@ -141,7 +141,9 @@ schedule:
     service.apify.call = fake_call
     await service.visit_profile(1)
     assert service.db.row("SELECT external_id FROM entities WHERE kind='post'") is None
-    assert service.db.row("SELECT COUNT(*) count FROM actor_runs WHERE category='posts'")["count"] == 2
+    # unseenuser charges per returned event. Numeric accounts therefore use
+    # only the canonical profile.php input instead of paying for URL aliases.
+    assert service.db.row("SELECT COUNT(*) count FROM actor_runs WHERE category='posts'")["count"] == 1
 
 
 @pytest.mark.asyncio
@@ -271,10 +273,11 @@ async def test_regular_post_probe_skips_full_batch_when_latest_post_is_unchanged
     item = {"postId": "p1", "source_url": "https://facebook.com/100/posts/p1", "text": "same"}
     await service.ingester.ingest(1, "post", item, notify=False)
     calls: list[int] = []
+    diagnostic_id = service.db.start_actor_run(1, "posts", "actor", "probe", {})
 
     async def fake_fetch(profile, maximum, cursor=None):
         calls.append(maximum)
-        return ActorResult([item], {"profiles": [{"status": "succeeded"}]}, "probe")
+        return ActorResult([item], {"profiles": [{"status": "succeeded"}]}, "probe", diagnostic_id=diagnostic_id)
 
     service._fetch_posts = fake_fetch
     result = await service._fetch_regular_posts({"id": 1, "backfill_done": 1}, initial=False)
@@ -282,6 +285,7 @@ async def test_regular_post_probe_skips_full_batch_when_latest_post_is_unchanged
     assert calls == [1]
     assert result.items == []
     assert result.summary["source"] == "unchanged_probe"
+    assert service.db.row("SELECT duplicate_result_count FROM actor_runs WHERE id=?", (diagnostic_id,))["duplicate_result_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -374,6 +378,89 @@ def test_unseenuser_wrapper_is_flattened_to_posts():
     assert [item["id"] for item in result.items] == ["p1"]
     assert result.items[0]["ingest_source"] == "posts_actor_embedded"
     assert result.summary["profiles"][0]["coverageStatus"] == "complete"
+
+
+def test_unseenuser_wrapper_preserves_raw_billable_result_count():
+    wrapped = ActorResult(
+        [{"name": "Profile", "posts": []}],
+        None,
+        "run",
+        raw_result_count=7,
+    )
+
+    result = MonitorService._unwrap_embedded_posts(wrapped, 20)
+
+    assert result.raw_result_count == 7
+    assert result.items == []
+
+
+@pytest.mark.asyncio
+async def test_paid_unparsed_posts_pause_future_apify_calls(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    service = MonitorService(load_settings(config))
+
+    async def fake_actor(category, actor_id, payload, profile_id=None, input_variant="default"):
+        return ActorResult(
+            [{"name": "Profile wrapper", "posts": []}],
+            None,
+            "run",
+            charged_usd=0.005,
+            diagnostic_id=service.db.start_actor_run(profile_id, category, actor_id, input_variant, payload),
+            raw_result_count=1,
+        )
+
+    service._actor = fake_actor
+    profile = service.db.row("SELECT * FROM profiles WHERE id=1")
+
+    with pytest.raises(BudgetExceeded, match="安全暫停"):
+        await service._fetch_posts(profile, 10)
+
+    paused = service.db.row("SELECT apify_posts_blocked_until,apify_posts_unparsed_streak FROM profiles WHERE id=1")
+    assert paused["apify_posts_blocked_until"]
+    assert paused["apify_posts_unparsed_streak"] == 1
+    run = service.db.row("SELECT * FROM actor_runs ORDER BY id DESC LIMIT 1")
+    assert run["raw_result_count"] == 1
+    assert run["parsed_result_count"] == 0
+    assert run["status"] == "unparsed_paid_result"
+
+
+@pytest.mark.asyncio
+async def test_apify_post_ingest_records_new_and_permalink_duplicate_counts(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    service = MonitorService(load_settings(config))
+    await service.ingester.ingest(
+        1,
+        "post",
+        {"postId": "pfbid123", "source_url": "https://facebook.com/100/posts/pfbid123", "text": "same"},
+        notify=False,
+    )
+    diagnostic_id = service.db.start_actor_run(1, "posts", "actor", "test", {})
+
+    await service._ingest_apify_posts(
+        1,
+        [
+            {"postId": "alias-id", "source_url": "https://facebook.com/permalink.php?story_fbid=pfbid123&id=100", "text": "same"},
+            {"postId": "pfbid456", "source_url": "https://facebook.com/100/posts/pfbid456", "text": "new"},
+        ],
+        notify=False,
+        diagnostic_id=diagnostic_id,
+    )
+
+    run = service.db.row("SELECT * FROM actor_runs WHERE id=?", (diagnostic_id,))
+    assert run["new_result_count"] == 1
+    assert run["updated_result_count"] == 0
+    assert run["duplicate_result_count"] == 1
+    assert service.db.row("SELECT COUNT(*) count FROM entities WHERE profile_id=1 AND kind='post'")["count"] == 2
 
 
 def test_health_summary_uses_resolved_display_name():

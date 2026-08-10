@@ -30,6 +30,42 @@ def test_dashboard_health_and_diagnostics_routes(tmp_path: Path, monkeypatch):
         assert "請輸入 Facebook 個人檔案網址" in invalid_add.text
 
 
+def test_diagnostics_shows_per_profile_apify_outcomes_and_raw_samples(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    app = create_app(load_settings(config))
+    db = app.state.db
+    db.save_apify_usage(1.25, "2026-08-09T00:00:00+00:00", "2026-09-08T23:59:59+00:00")
+    run_id = db.start_actor_run(1, "posts", "unseenuser/fb-profile", "profile_php", {"token": "secret", "maxPosts": 1})
+    db.finish_actor_run(
+        run_id,
+        status="succeeded",
+        run_id="actor-run-1",
+        result_count=1,
+        raw_result_count=1,
+        parsed_result_count=1,
+        charged_usd=0.005,
+        samples=[{"postId": "post-1", "text": "sample"}],
+    )
+    db.update_actor_ingest_counts(run_id, new=0, updated=0, duplicate=1)
+
+    with TestClient(app) as client:
+        dashboard = client.get("/")
+        diagnostics = client.get("/diagnostics?profile_id=1")
+
+    assert 'href="/diagnostics?profile_id=1"' in dashboard.text
+    assert diagnostics.status_code == 200
+    assert "本帳期各帳號 Apify 貼文用量" in diagnostics.text
+    assert "原始 1／解析 1／新增 0／更新 0／重複 1" in diagnostics.text
+    assert "原始回傳樣本（最多 5 筆）" in diagnostics.text
+    assert "post-1" in diagnostics.text
+    assert "secret" not in diagnostics.text
+
+
 def test_page_footer_shows_deployed_version_and_taipei_update_time(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text("profiles: []\nstorage:\n  data_dir: data\n", encoding="utf-8")

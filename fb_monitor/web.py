@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 import threading
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from difflib import unified_diff
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -599,8 +599,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             row["input"] = _json(row.get("input_json"))
             row["summary"] = _json(row.get("summary_json"))
             row["samples"] = _json(row.get("samples_json")) if row.get("samples_json") else []
+            row["unhandled_result_count"] = max(
+                0,
+                int(row.get("parsed_result_count") or 0)
+                - int(row.get("new_result_count") or 0)
+                - int(row.get("updated_result_count") or 0)
+                - int(row.get("duplicate_result_count") or 0),
+            )
         profiles = db.rows("SELECT id,COALESCE(display_name,name) label FROM profiles ORDER BY id")
-        return templates.TemplateResponse(request, "diagnostics.html", {"runs": rows, "profiles": profiles, "profile_id": selected_id, "page": page})
+        usage_snapshot = db.apify_usage_snapshot()
+        cycle_start = str(usage_snapshot.get("cycle_start_at")) if usage_snapshot else datetime.now(UTC).strftime("%Y-%m-01T00:00:00+00:00")
+        profile_usage = db.rows(
+            """SELECT p.id,COALESCE(p.display_name,p.name) profile_name,p.url,
+            COUNT(ar.id) run_count,COALESCE(SUM(ar.raw_result_count),0) raw_count,
+            COALESCE(SUM(ar.parsed_result_count),0) parsed_count,
+            COALESCE(SUM(ar.new_result_count),0) new_count,
+            COALESCE(SUM(ar.updated_result_count),0) updated_count,
+            COALESCE(SUM(ar.duplicate_result_count),0) duplicate_count,
+            MAX(0,COALESCE(SUM(ar.parsed_result_count),0)-COALESCE(SUM(ar.new_result_count),0)
+              -COALESCE(SUM(ar.updated_result_count),0)-COALESCE(SUM(ar.duplicate_result_count),0)) unhandled_count,
+            COALESCE(SUM(ar.charged_usd),0) charged_usd
+            FROM profiles p LEFT JOIN actor_runs ar ON ar.profile_id=p.id
+              AND ar.category='posts' AND ar.started_at>=?
+            WHERE p.enabled=1 GROUP BY p.id ORDER BY charged_usd DESC,p.id""",
+            (cycle_start,),
+        )
+        return templates.TemplateResponse(request, "diagnostics.html", {"runs": rows, "profiles": profiles, "profile_usage": profile_usage, "cycle_start_display": display_time(cycle_start, cfg.timezone), "profile_id": selected_id, "page": page})
 
     @app.get("/healthz")
     def healthz():

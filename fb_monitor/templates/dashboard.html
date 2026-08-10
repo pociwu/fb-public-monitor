@@ -37,6 +37,7 @@
     <form method="post" action="/profiles/{{ p.id }}/refresh-name" onsubmit="return confirm('重新抓取此帳號名稱？目前顯示名稱會先清除。')"><button class="button secondary" type="submit">重新抓取名稱</button></form>
     {% if browser_enabled %}<form method="post" action="/profiles/{{ p.id }}/browser-scan" onsubmit="return confirm('立即使用 Chromium 拜訪 {{ p.display_name or p.name }}？')"><button class="button secondary" type="submit"{% if p.browser_manual_available_at %} disabled data-manual-cooldown="{{ p.browser_manual_available_at }}"{% endif %}><span data-manual-label>{% if p.browser_manual_available_at %}瀏覽器冷卻中{% else %}立即瀏覽器拜訪{% endif %}</span></button></form>{% endif %}
     <a class="button secondary" href="/profiles/{{ p.id }}">查看資料</a>
+    <a class="button secondary" href="/diagnostics?profile_id={{ p.id }}">Apify 紀錄</a>
     {% if p.browser_capture_available %}<a class="button secondary" href="/profiles/{{ p.id }}/browser-screenshot" target="_blank" title="最後擷取：{{ p.browser_capture_display }}">瀏覽器擷取畫面</a>{% endif %}
     <button class="button secondary" type="button" data-copy-profile>複製內容</button>
     <form method="post" action="/profiles/{{ p.id }}/scan" onsubmit="return confirm('立即執行拜訪 {{ p.display_name or p.name }}？同一帳號 10 分鐘內不可重複執行。')"><button class="button secondary" type="submit"{% if p.manual_available_at %} disabled data-manual-cooldown="{{ p.manual_available_at }}"{% endif %}><span data-manual-label>{% if p.manual_available_at %}冷卻中{% else %}立即拜訪{% endif %}</span></button></form>

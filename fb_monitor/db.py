@@ -94,6 +94,9 @@ CREATE TABLE IF NOT EXISTS actor_runs (
   id INTEGER PRIMARY KEY, profile_id INTEGER REFERENCES profiles(id), category TEXT NOT NULL,
   actor_id TEXT NOT NULL, run_id TEXT, input_variant TEXT, input_json TEXT NOT NULL,
   status TEXT NOT NULL, result_count INTEGER NOT NULL DEFAULT 0, charged_usd REAL NOT NULL DEFAULT 0,
+  raw_result_count INTEGER NOT NULL DEFAULT 0, parsed_result_count INTEGER NOT NULL DEFAULT 0,
+  new_result_count INTEGER NOT NULL DEFAULT 0, updated_result_count INTEGER NOT NULL DEFAULT 0,
+  duplicate_result_count INTEGER NOT NULL DEFAULT 0,
   summary_json TEXT, samples_json TEXT, error TEXT, started_at TEXT NOT NULL, finished_at TEXT
 );
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -157,6 +160,10 @@ class Database:
                 conn.execute("ALTER TABLE profiles ADD COLUMN sort_order INTEGER")
             if "last_manual_visit_at" not in columns:
                 conn.execute("ALTER TABLE profiles ADD COLUMN last_manual_visit_at TEXT")
+            if "apify_posts_blocked_until" not in columns:
+                conn.execute("ALTER TABLE profiles ADD COLUMN apify_posts_blocked_until TEXT")
+            if "apify_posts_unparsed_streak" not in columns:
+                conn.execute("ALTER TABLE profiles ADD COLUMN apify_posts_unparsed_streak INTEGER NOT NULL DEFAULT 0")
             conn.execute("UPDATE profiles SET sort_order=id WHERE sort_order IS NULL")
             entity_columns = {row[1] for row in conn.execute("PRAGMA table_info(entities)")}
             if "dedupe_key" not in entity_columns:
@@ -179,6 +186,13 @@ class Database:
                 if name not in outbox_columns:
                     conn.execute(f"ALTER TABLE outbox ADD COLUMN {name} {definition}")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_outbox_media_sha ON outbox(media_sha256,status)")
+            actor_run_columns = {row[1] for row in conn.execute("PRAGMA table_info(actor_runs)")}
+            for name in (
+                "raw_result_count", "parsed_result_count", "new_result_count",
+                "updated_result_count", "duplicate_result_count",
+            ):
+                if name not in actor_run_columns:
+                    conn.execute(f"ALTER TABLE actor_runs ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0")
             conn.execute(
                 """UPDATE entity_media AS target
                 SET position=(
@@ -493,19 +507,41 @@ class Database:
         summary: dict[str, Any] | None = None,
         error: str | None = None,
         samples: list[dict[str, Any]] | None = None,
+        raw_result_count: int | None = None,
+        parsed_result_count: int | None = None,
     ) -> None:
         self.execute(
             """UPDATE actor_runs SET status=?,run_id=?,result_count=?,charged_usd=?,summary_json=?,
-            samples_json=?,error=?,finished_at=? WHERE id=?""",
+            samples_json=COALESCE(?,samples_json),error=?,finished_at=?,
+            raw_result_count=COALESCE(?,raw_result_count),
+            parsed_result_count=COALESCE(?,parsed_result_count) WHERE id=?""",
             (
                 status,
                 run_id,
                 result_count,
                 charged_usd,
                 json.dumps(summary, ensure_ascii=False) if summary is not None else None,
-                json.dumps((samples or [])[:20], ensure_ascii=False) if samples is not None else None,
+                json.dumps((samples or [])[:5], ensure_ascii=False) if samples is not None else None,
                 error[:4000] if error else None,
                 utcnow(),
+                raw_result_count,
+                parsed_result_count,
                 diagnostic_id,
             ),
+        )
+
+    def update_actor_ingest_counts(
+        self,
+        diagnostic_id: int | None,
+        *,
+        new: int,
+        updated: int,
+        duplicate: int,
+    ) -> None:
+        if diagnostic_id is None:
+            return
+        self.execute(
+            """UPDATE actor_runs SET new_result_count=?,updated_result_count=?,duplicate_result_count=?
+            WHERE id=?""",
+            (new, updated, duplicate, diagnostic_id),
         )
