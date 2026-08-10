@@ -112,9 +112,10 @@ def normalize_browser_profile(raw: dict[str, Any], profile_url: str) -> dict[str
     role_headings = raw.get("role_headings") if isinstance(raw.get("role_headings"), list) else []
     summary_name = _name_from_profile_summary(lines)
     aliased_summary = summary_name if re.search(r"[\(（][^\(（\)）]{1,80}[\)）]$", summary_name) else ""
+    image_name = _name_from_profile_image(images)
     name_candidates = [
-        aliased_summary, raw.get("main_heading"), *role_headings, *headings,
-        _name_from_profile_image(images), summary_name,
+        aliased_summary, raw.get("main_heading"), image_name, summary_name,
+        *role_headings, *headings,
         raw.get("og_title"), raw.get("heading"), raw.get("title"),
     ]
     name = next((candidate for value in name_candidates if (candidate := _clean_name_candidate(value))), "")

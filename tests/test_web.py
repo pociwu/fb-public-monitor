@@ -136,6 +136,10 @@ def test_dashboard_recovers_and_shows_recorded_profile_names(tmp_path: Path, mon
     monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
     app = create_app(load_settings(config))
     db = app.state.db
+    db.execute(
+        "UPDATE profiles SET profile_details_json=? WHERE id=1",
+        ('{"rejected_profile_names":["慈濟@新竹"]}',),
+    )
     entity_id = db.execute(
         """INSERT INTO entities(profile_id,kind,external_id,current_hash,present,first_seen_at,last_seen_at)
         VALUES(1,'profile','100','new',1,'2026-08-01','2026-08-03')"""
@@ -150,6 +154,11 @@ def test_dashboard_recovers_and_shows_recorded_profile_names(tmp_path: Path, mon
         VALUES(?,?,?,?,?,?)""",
         (entity_id, "older", '{"authorName":"吳小姐"}', "older.json", "2026-07-01", "created"),
     )
+    db.execute(
+        """INSERT INTO versions(entity_id,content_hash,normalized_json,raw_path,seen_at,change_type)
+        VALUES(?,?,?,?,?,?)""",
+        (entity_id, "rejected", '{"authorName":"慈濟@新竹"}', "rejected.json", "2026-08-02", "created"),
+    )
 
     with TestClient(app) as client:
         dashboard = client.get("/")
@@ -158,6 +167,7 @@ def test_dashboard_recovers_and_shows_recorded_profile_names(tmp_path: Path, mon
     assert "吳佳欣" in dashboard.text
     assert "曾用名稱" in dashboard.text
     assert "吳小姐" in dashboard.text
+    assert "慈濟@新竹" not in dashboard.text
 
 
 def test_profile_card_links_to_latest_browser_screenshot(tmp_path: Path, monkeypatch):

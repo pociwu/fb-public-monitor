@@ -112,6 +112,30 @@ def test_normalize_browser_profile_ignores_unread_count_facebook_title():
     assert item_without_role_heading["name"] == "謝球球"
 
 
+def test_normalize_browser_profile_prefers_avatar_name_over_post_author_heading():
+    item = normalize_browser_profile(
+        {
+            "main_heading": "",
+            "role_headings": ["慈濟@新竹", "Ya Ling Shen"],
+            "headings": ["慈濟@新竹"],
+            "og_title": "(4) Facebook",
+            "title": "(4) Facebook",
+            "text": "慈濟@新竹\nYa Ling Shen\n34 位朋友\nThis Is Me\n貼文",
+            "images": [
+                {
+                    "src": "https://scontent.example.fbcdn.net/avatar.jpg",
+                    "alt": "Ya Ling Shen 的大頭貼照片",
+                    "natural_width": 720,
+                    "natural_height": 720,
+                }
+            ],
+        },
+        "https://www.facebook.com/100000950467959",
+    )
+
+    assert item["name"] == "Ya Ling Shen"
+
+
 def test_normalize_browser_profile_uses_name_before_combined_follow_summary():
     item = normalize_browser_profile(
         {

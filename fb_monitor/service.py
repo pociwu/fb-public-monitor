@@ -979,8 +979,39 @@ class MonitorService:
         source_label = str(item.get("profile_data_source") or "")
         browser_source = "瀏覽器" in source_label or "browser" in source_label.casefold()
         existing_name = str(profile.get("display_name") or "")
+        rejected: set[str] = set()
+        if browser_source:
+            try:
+                previous_details = json.loads(str(profile.get("profile_details_json") or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                previous_details = {}
+            rejected = {
+                str(value).strip()
+                for value in previous_details.get("rejected_profile_names", [])
+                if str(value).strip()
+            }
         if browser_source and not is_placeholder_profile_name(existing_name):
-            item["name"] = existing_name
+            incoming_name = str(item.get("name") or "").strip()
+            historical_names: set[str] = set()
+            for version in self.db.rows(
+                """SELECT v.normalized_json FROM versions v
+                JOIN entities e ON e.id=v.entity_id
+                WHERE e.profile_id=? AND e.kind='profile'
+                ORDER BY v.seen_at DESC,v.id DESC""",
+                (profile["id"],),
+            ):
+                try:
+                    known_name = str(json.loads(version["normalized_json"]).get("authorName") or "").strip()
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if known_name and not is_placeholder_profile_name(known_name):
+                    historical_names.add(known_name)
+            if incoming_name and incoming_name != existing_name and incoming_name in historical_names:
+                rejected.add(existing_name)
+            else:
+                item["name"] = existing_name
+        if rejected:
+            item["rejected_profile_names"] = sorted(rejected)
         previous_state = str(profile.get("public_state") or "unknown")
         state = "private" if bool(item.get("private") or item.get("is_private")) else "public"
         configured_id = profile_id_from_url(str(profile["url"]))

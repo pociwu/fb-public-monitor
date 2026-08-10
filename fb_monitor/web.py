@@ -41,6 +41,12 @@ def _json(value: str | None) -> Any:
 
 def _attach_profile_name_history(db: Database, profile: dict[str, Any]) -> None:
     names: list[str] = []
+    details = _json(profile.get("profile_details_json"))
+    rejected = {
+        str(value).strip()
+        for value in details.get("rejected_profile_names", [])
+        if str(value).strip()
+    }
     rows = db.rows(
         """SELECT v.normalized_json FROM versions v
         JOIN entities e ON e.id=v.entity_id
@@ -51,7 +57,7 @@ def _attach_profile_name_history(db: Database, profile: dict[str, Any]) -> None:
     for row in rows:
         payload = _json(row.get("normalized_json"))
         name = str(payload.get("authorName") or "").strip()
-        if is_placeholder_profile_name(name) or name in names:
+        if is_placeholder_profile_name(name) or name in names or name in rejected:
             continue
         names.append(name)
     current = str(profile.get("display_name") or "")
