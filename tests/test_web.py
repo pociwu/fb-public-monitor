@@ -299,6 +299,49 @@ def test_dashboard_hides_cover_preview_from_public_photos(tmp_path: Path, monkey
     assert f'/media/{media[2]}/thumbnail' in dashboard.text
 
 
+def test_dashboard_deduplicates_profile_photos_with_same_perceptual_hash(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    app = create_app(load_settings(config))
+    db = app.state.db
+    entity_id = db.execute(
+        """INSERT INTO entities(profile_id,kind,external_id,current_hash,present,first_seen_at,last_seen_at)
+        VALUES(1,'profile','100','current',1,'2026-08-01','2026-08-03')"""
+    )
+    version_id = db.execute(
+        """INSERT INTO versions(entity_id,content_hash,normalized_json,raw_path,seen_at,change_type)
+        VALUES(?,?,?,?,?,?)""",
+        (entity_id, "current", '{"authorName":"Mina Lin"}', "current.json", "2026-08-03", "created"),
+    )
+    db.execute("UPDATE entities SET current_version_id=? WHERE id=?", (version_id, entity_id))
+    media = []
+    for sha, source_url, size in (
+        ("small", "https://scontent.example.fbcdn.net/v/photo-small.jpg", 12000),
+        ("large", "https://scontent.example.fbcdn.net/v/photo-large.jpg", 48000),
+    ):
+        media_id = db.execute(
+            """INSERT INTO media(sha256,source_url,mime_type,size_bytes,path,perceptual_hash,status,first_seen_at)
+            VALUES(?,?,?,?,?,'0123456789abcdef','ready','2026-08-03')""",
+            (sha, source_url, "image/jpeg", size, f"{sha}.jpg"),
+        )
+        db.execute(
+            "INSERT INTO entity_media(entity_id,version_id,media_id,role,position) VALUES(?,?,?,?,?)",
+            (entity_id, version_id, media_id, "image", len(media)),
+        )
+        media.append(media_id)
+
+    with TestClient(app) as client:
+        dashboard = client.get("/")
+
+    assert dashboard.status_code == 200
+    rendered = [media_id for media_id in media if f'/media/{media_id}/thumbnail' in dashboard.text]
+    assert rendered == [media[1]]
+
+
 def test_dashboard_profile_order_can_be_dragged_and_persisted(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text(
