@@ -584,6 +584,22 @@ class MonitorService:
         if initial or not profile.get("backfill_done"):
             return await self._fetch_posts(profile, self.settings.recent_posts)
         if always_full:
+            # Full-fetch exceptions still use a cheap latest-post probe.  Only
+            # fetch the configured batch when the newest post changed; this
+            # preserves complete capture for updates without paying for the
+            # same 50-result batch on every patrol.
+            probe = await self._fetch_posts(profile, 1)
+            probe_error = actor_summary_error(probe.summary)
+            if not probe_error and self._probe_posts_unchanged(int(profile["id"]), probe.items):
+                return ActorResult(
+                    [],
+                    {"source": "unchanged_probe", "profiles": [{"status": "succeeded", "postsReturned": 1}]},
+                    probe.run_id,
+                    probe.charged_usd,
+                    probe.diagnostic_id,
+                )
+            if probe_error or not probe.items:
+                return probe
             return await self._fetch_posts(profile, self.settings.always_full_fetch_max_posts)
 
         probe = await self._fetch_posts(profile, 1)

@@ -258,6 +258,39 @@ async def test_regular_post_probe_skips_full_batch_when_latest_post_is_unchanged
     assert result.summary["source"] == "unchanged_probe"
 
 
+@pytest.mark.asyncio
+async def test_full_fetch_exception_probes_before_fetching_batch(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """profiles:
+  - name: watched
+    url: https://facebook.com/100
+storage:
+  data_dir: data
+schedule:
+  always_full_fetch_urls:
+    - https://facebook.com/100
+  always_full_fetch_max_posts: 50
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    service = MonitorService(load_settings(config))
+    item = {"postId": "p1", "source_url": "https://facebook.com/100/posts/p1", "text": "same"}
+    await service.ingester.ingest(1, "post", item, notify=False)
+    calls: list[int] = []
+
+    async def fake_fetch(profile, maximum, cursor=None):
+        calls.append(maximum)
+        return ActorResult([item], {"profiles": [{"status": "succeeded"}]}, "probe")
+
+    service._fetch_posts = fake_fetch
+    result = await service._fetch_regular_posts({"id": 1, "backfill_done": 1, "url": "https://facebook.com/100"}, initial=False)
+
+    assert calls == [1]
+    assert result.summary["source"] == "unchanged_probe"
+
+
 def test_browser_canary_respects_persistent_cooldown(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text(
