@@ -32,7 +32,7 @@ async def allow_official_usage(service: MonitorService) -> None:
 
 
 @pytest.mark.asyncio
-async def test_initial_visit_ingests_profile_post_and_comments(tmp_path: Path, monkeypatch):
+async def test_initial_visit_finishes_posts_before_backfill_comments(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text(
         """profiles:
@@ -52,11 +52,13 @@ schedule:
     monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
     service = MonitorService(load_settings(config))
     await allow_official_usage(service)
+    post_limits: list[int] = []
 
     async def fake_call(actor_id, payload, max_charge_usd=None):
         if "pages-scraper" in actor_id:
             return ActorResult([{"id": "100", "name": "Watched", "url": "https://facebook.com/100"}], None, "profile")
         if actor_id == "unseenuser/fb-profile":
+            post_limits.append(payload["maxPosts"])
             return ActorResult([{"name": "Watched", "posts": [{"id": "p1", "url": "https://facebook.com/100/posts/p1", "text": "hello"}]}], None, "posts")
         return ActorResult([{"commentId": "c1", "facebookUrl": "https://facebook.com/100/posts/p1", "text": "reply"}], None, "comments")
 
@@ -65,10 +67,16 @@ schedule:
     profile = service.db.row("SELECT * FROM profiles WHERE id=1")
     assert profile["public_state"] == "public"
     assert profile["fb_id"] == "100"
+    assert post_limits == [20]
+    counts = {row["kind"]: row["count"] for row in service.db.rows("SELECT kind,COUNT(*) count FROM entities GROUP BY kind")}
+    assert counts == {"post": 1, "profile": 1}
+    # Initial post baseline is silent; the completion summary is emitted only
+    # after the queued comment phase finishes.
+    assert service.db.row("SELECT COUNT(*) count FROM outbox")["count"] == 0
+    queued = service.db.row("SELECT payload_json FROM jobs WHERE profile_id=1 AND job_type='backfill_comments' ORDER BY id DESC LIMIT 1")
+    await service.backfill_comments(1, json.loads(queued["payload_json"]))
     counts = {row["kind"]: row["count"] for row in service.db.rows("SELECT kind,COUNT(*) count FROM entities GROUP BY kind")}
     assert counts == {"comment": 1, "post": 1, "profile": 1}
-    # Initial baseline is summarized later rather than generating one notification per item.
-    assert service.db.row("SELECT COUNT(*) count FROM outbox")["count"] == 0
 
 
 @pytest.mark.asyncio
@@ -286,6 +294,184 @@ async def test_regular_post_probe_skips_full_batch_when_latest_post_is_unchanged
     assert result.items == []
     assert result.summary["source"] == "unchanged_probe"
     assert service.db.row("SELECT duplicate_result_count FROM actor_runs WHERE id=?", (diagnostic_id,))["duplicate_result_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_incomplete_backfill_skips_regular_post_probe(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    service = MonitorService(load_settings(config))
+    item = {"postId": "p1", "source_url": "https://facebook.com/100/posts/p1", "text": "same"}
+    await service.ingester.ingest(1, "post", item, notify=False)
+    calls: list[int] = []
+
+    async def fake_fetch(profile, maximum, cursor=None):
+        calls.append(maximum)
+        return ActorResult([item], {"profiles": [{"status": "succeeded"}]}, "probe")
+
+    service._fetch_posts = fake_fetch
+    result = await service._fetch_regular_posts({"id": 1, "backfill_done": 0}, initial=False)
+
+    assert calls == []
+    assert result.summary["source"] == "backfill_pending"
+
+
+@pytest.mark.asyncio
+async def test_visit_with_incomplete_backfill_queues_backfill_without_regular_probe(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    service = MonitorService(load_settings(config))
+    await service.ingester.ingest(
+        1,
+        "post",
+        {"postId": "p1", "source_url": "https://facebook.com/100/posts/p1", "text": "latest"},
+        notify=False,
+    )
+    service.db.execute(
+        "UPDATE profiles SET public_state='public',backfill_done=0,serp_last_checked_at=? WHERE id=1",
+        (datetime.now(UTC).isoformat(),),
+    )
+    service.db.execute("DELETE FROM jobs")
+    calls = 0
+
+    async def fake_regular_posts(profile, initial):
+        nonlocal calls
+        calls += 1
+        return ActorResult([], {"source": "unchanged_probe"}, "probe")
+
+    service._fetch_regular_posts = fake_regular_posts
+    await service.visit_profile(1)
+
+    assert calls == 0
+    assert service.db.row(
+        "SELECT COUNT(*) count FROM jobs WHERE profile_id=1 AND job_type='backfill' AND status='pending'"
+    )["count"] == 1
+
+
+def test_latest_only_completed_profile_is_requeued_for_backfill(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    service = MonitorService(load_settings(config))
+    service.db.execute(
+        """INSERT INTO entities(
+        profile_id,kind,external_id,source_url,current_hash,present,first_seen_at,last_seen_at
+        ) VALUES(1,'post','p1','https://facebook.com/100/posts/p1','hash',1,?,?)""",
+        (datetime.now(UTC).isoformat(), datetime.now(UTC).isoformat()),
+    )
+    service.db.execute(
+        "UPDATE profiles SET public_state='public',backfill_done=1,last_full_audit_at=? WHERE id=1",
+        (datetime.now(UTC).isoformat(),),
+    )
+    service.db.execute("DELETE FROM jobs")
+
+    service._seed_latest_only_backfill_repair()
+
+    profile = service.db.row("SELECT backfill_done,backfill_cursor,last_full_audit_at FROM profiles WHERE id=1")
+    assert profile == {"backfill_done": 0, "backfill_cursor": None, "last_full_audit_at": None}
+    assert service.db.row(
+        "SELECT COUNT(*) count FROM jobs WHERE profile_id=1 AND job_type='backfill' AND status='pending'"
+    )["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_cursorless_partial_backfill_stops_repeating_posts_then_queues_comments(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """profiles:
+  - name: watched
+    url: https://facebook.com/100
+storage:
+  data_dir: data
+schedule:
+  backfill_posts: 2
+  spacing_min_minutes: 0
+  spacing_max_minutes: 0
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    service = MonitorService(load_settings(config))
+    service.db.execute("UPDATE profiles SET public_state='public' WHERE id=1")
+
+    async def fake_fetch(profile, maximum, cursor=None):
+        return ActorResult(
+            [
+                {"postId": "p1", "source_url": "https://facebook.com/100/posts/p1", "text": "one"},
+                {"postId": "p2", "source_url": "https://facebook.com/100/posts/p2", "text": "two"},
+            ],
+            {"profiles": [{"status": "succeeded", "coverageStatus": "partial_actor_limit", "pointer": {"nextCursor": None}}]},
+            "run",
+        )
+
+    service._fetch_posts = fake_fetch
+    await service.backfill_profile(1)
+
+    queued = service.db.row("SELECT job_type,payload_json FROM jobs WHERE profile_id=1 AND status='pending' ORDER BY id DESC LIMIT 1")
+    assert queued["job_type"] == "backfill_comments"
+    assert json.loads(queued["payload_json"]) == {"offset": 0, "limited": True}
+    assert service.db.row("SELECT COUNT(*) count FROM jobs WHERE profile_id=1 AND job_type='backfill' AND status='pending'")["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_backfill_comments_reads_saved_posts_in_chunks_and_finishes(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """profiles:
+  - name: watched
+    url: https://facebook.com/100
+storage:
+  data_dir: data
+schedule:
+  backfill_posts: 2
+  spacing_min_minutes: 0
+  spacing_max_minutes: 0
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    service = MonitorService(load_settings(config))
+    service.db.execute("UPDATE profiles SET public_state='public',backfill_done=0 WHERE id=1")
+    for number in range(3):
+        await service.ingester.ingest(
+            1,
+            "post",
+            {
+                "postId": f"p{number}",
+                "source_url": f"https://facebook.com/100/posts/p{number}",
+                "text": str(number),
+                "timestamp": f"2026-08-0{number + 1}T00:00:00+00:00",
+            },
+            notify=False,
+        )
+    batches: list[list[str]] = []
+
+    async def fake_comments(profile_id, post_urls, notify):
+        batches.append(post_urls)
+
+    service._fetch_comments = fake_comments
+    await service.backfill_comments(1, {"offset": 0, "limited": True})
+    queued = service.db.row("SELECT payload_json FROM jobs WHERE profile_id=1 AND job_type='backfill_comments' ORDER BY id DESC LIMIT 1")
+    next_payload = json.loads(queued["payload_json"])
+    assert next_payload == {"offset": 2, "limited": True}
+    assert service.db.row("SELECT backfill_done FROM profiles WHERE id=1")["backfill_done"] == 0
+
+    await service.backfill_comments(1, next_payload)
+
+    assert [len(batch) for batch in batches] == [2, 1]
+    assert service.db.row("SELECT backfill_done FROM profiles WHERE id=1")["backfill_done"] == 1
+    assert service.db.row("SELECT event_type FROM events WHERE profile_id=1 AND event_type='backfill_limited'")["event_type"] == "backfill_limited"
 
 
 @pytest.mark.asyncio

@@ -36,6 +36,7 @@ PROFILE_PIC_MIGRATION = "profile_pic_fields_v3_20260719"
 NOTIFICATION_HYGIENE_MIGRATION = "notification_hygiene_v5_20260723"
 BROWSER_NAME_REPAIR_MIGRATION = "browser_name_heading_v2_20260803"
 HISTORICAL_NAME_REPAIR_MIGRATION = "historical_profile_name_v1_20260803"
+LATEST_ONLY_BACKFILL_REPAIR_MIGRATION = "latest_only_backfill_v1_20260812"
 
 
 class BudgetExceeded(RuntimeError):
@@ -100,6 +101,7 @@ class MonitorService:
         self._seed_notification_hygiene()
         self._seed_profile_pic_migration()
         self._seed_upgrade_repair()
+        self._seed_latest_only_backfill_repair()
         self._seed_initial_jobs()
         await asyncio.gather(
             self._scheduler_loop(), self._outbox_loop(), self._health_loop(),
@@ -150,6 +152,35 @@ class MonitorService:
                 self.db.execute("UPDATE profiles SET display_name=? WHERE id=?", (recovered, profile["id"]))
                 repaired += 1
         self.db.mark_migration(HISTORICAL_NAME_REPAIR_MIGRATION, {"profiles_recovered": repaired})
+
+    def _seed_latest_only_backfill_repair(self) -> None:
+        """Restart profiles that an older probe-first flow falsely completed."""
+        if self.db.migration_applied(LATEST_ONLY_BACKFILL_REPAIR_MIGRATION):
+            return
+        repaired = 0
+        profiles = self.db.rows(
+            """SELECT p.id FROM profiles p
+            WHERE p.enabled=1 AND p.public_state='public' AND p.backfill_done=1
+              AND COALESCE(p.apify_frozen,0)=0
+              AND (SELECT COUNT(*) FROM entities e
+                   WHERE e.profile_id=p.id AND e.kind='post' AND e.present=1) <= 1"""
+        )
+        for profile in profiles:
+            profile_id = int(profile["id"])
+            self.db.execute(
+                "UPDATE profiles SET backfill_done=0,backfill_cursor=NULL,last_full_audit_at=NULL WHERE id=?",
+                (profile_id,),
+            )
+            if not self.db.row(
+                "SELECT id FROM jobs WHERE profile_id=? AND job_type IN ('backfill','backfill_comments') AND status IN ('pending','running')",
+                (profile_id,),
+            ):
+                self._enqueue(profile_id, "backfill", 30, datetime.now(UTC))
+            repaired += 1
+        self.db.mark_migration(
+            LATEST_ONLY_BACKFILL_REPAIR_MIGRATION,
+            {"profiles_requeued": repaired},
+        )
 
     def _purge_duplicate_profile_previews(self) -> dict[str, int]:
         """Remove downloaded image previews that duplicate an avatar or cover asset."""
@@ -573,6 +604,23 @@ class MonitorService:
             self._schedule_next(profile_id)
             return
         initial = not bool(self.db.row("SELECT id FROM entities WHERE profile_id=? AND kind='post' LIMIT 1", (profile_id,)))
+        if not initial and not profile.get("backfill_done"):
+            # Backfill itself is the source of post coverage. A latest-post
+            # probe here both spends another result and can return early before
+            # the missing backfill job is repaired.
+            active_backfill = self.db.row(
+                "SELECT id FROM jobs WHERE profile_id=? AND job_type IN ('backfill','backfill_comments') AND status IN ('pending','running')",
+                (profile_id,),
+            )
+            if not active_backfill:
+                self._enqueue(
+                    profile_id,
+                    "backfill",
+                    30,
+                    datetime.now(UTC) + timedelta(minutes=self.settings.spacing_max_minutes),
+                )
+            self._schedule_next(profile_id)
+            return
         try:
             posts = await self._fetch_regular_posts(profile, initial)
         except (ApifyFrozen, BudgetExceeded) as exc:
@@ -584,12 +632,24 @@ class MonitorService:
         if isinstance(posts.summary, dict) and posts.summary.get("source") == "unchanged_probe":
             self._schedule_next(profile_id)
             return
+        initial_pointer: str | None = None
+        initial_posts_finished = False
+        initial_limited = False
+        if initial and isinstance(posts.summary, dict) and posts.summary.get("profiles"):
+            summary_profile = posts.summary["profiles"][0]
+            initial_pointer = (summary_profile.get("pointer") or {}).get("nextCursor")
+            coverage = summary_profile.get("coverageStatus") or summary_profile.get("coverage_status") or ""
+            initial_posts_finished = not bool(initial_pointer)
+            initial_limited = initial_posts_finished and str(coverage).startswith("partial")
         summary_error = actor_summary_error(posts.summary)
         if not posts.items:
             if summary_error and not self.settings.browser_canary_enabled:
                 raise RuntimeError(f"貼文 Actor 三種輸入格式均失敗：{summary_error}")
         if initial and posts.items:
-            self.db.execute("UPDATE profiles SET backfill_done=0,backfill_cursor=NULL,last_full_audit_at=NULL WHERE id=?", (profile_id,))
+            self.db.execute(
+                "UPDATE profiles SET backfill_done=0,backfill_cursor=?,last_full_audit_at=NULL WHERE id=?",
+                (initial_pointer, profile_id),
+            )
             profile["backfill_done"] = 0
         post_urls, _ = await self._ingest_apify_posts(
             profile_id,
@@ -615,13 +675,27 @@ class MonitorService:
             await self._ingest_browser_canary_posts(profile_id, canary_items, notify=not initial)
         if summary_error and not canary_items:
             raise RuntimeError(f"貼文 Actor 回傳錯誤：{summary_error}")
-        if post_urls and self._remaining_budget() > 0:
+        if post_urls and not initial and self._remaining_budget() > 0:
             try:
                 await self._fetch_comments(profile_id, post_urls, notify=not initial)
             except (ApifyFrozen, BudgetExceeded):
                 pass
-        if not profile["backfill_done"] and not self.db.row("SELECT id FROM jobs WHERE profile_id=? AND job_type='backfill' AND status IN ('pending','running')", (profile_id,)):
-            self._enqueue(profile_id, "backfill", 30, datetime.now(UTC) + timedelta(minutes=self.settings.spacing_max_minutes))
+        active_backfill = self.db.row(
+            "SELECT id FROM jobs WHERE profile_id=? AND job_type IN ('backfill','backfill_comments') AND status IN ('pending','running')",
+            (profile_id,),
+        )
+        if not profile["backfill_done"] and not active_backfill:
+            available = datetime.now(UTC) + timedelta(minutes=self.settings.spacing_max_minutes)
+            if initial and initial_posts_finished:
+                self._enqueue(
+                    profile_id,
+                    "backfill_comments",
+                    31,
+                    available,
+                    {"offset": 0, "limited": initial_limited},
+                )
+            else:
+                self._enqueue(profile_id, "backfill", 30, available)
         elif profile["backfill_done"]:
             last_audit = datetime.fromisoformat(profile["last_full_audit_at"]) if profile.get("last_full_audit_at") else None
             if (not last_audit or datetime.now(UTC) - last_audit >= timedelta(days=self.settings.full_audit_days)) and not self.db.row("SELECT id FROM jobs WHERE profile_id=? AND job_type='audit' AND status IN ('pending','running')", (profile_id,)):
@@ -630,11 +704,13 @@ class MonitorService:
 
     async def _fetch_regular_posts(self, profile: dict[str, Any], initial: bool) -> ActorResult:
         """Probe one latest post before paying for the normal ten-post batch."""
+        if not initial and not profile.get("backfill_done"):
+            return ActorResult([], {"source": "backfill_pending"}, "")
         always_full = str(profile.get("url") or "").rstrip("/") in {
             str(url).rstrip("/") for url in self.settings.always_full_fetch_urls
         }
-        if initial or not profile.get("backfill_done"):
-            return await self._fetch_posts(profile, self.settings.recent_posts)
+        if initial:
+            return await self._fetch_posts(profile, self.settings.backfill_posts)
         if always_full:
             # Full-fetch exceptions still use a cheap latest-post probe.  Only
             # fetch the configured batch when the newest post changed; this
@@ -1229,7 +1305,7 @@ class MonitorService:
         if profile.get("apify_frozen"):
             return
         result = await self._fetch_posts(profile, self.settings.backfill_posts, profile.get("backfill_cursor"))
-        post_urls, _ = await self._ingest_apify_posts(
+        await self._ingest_apify_posts(
             profile_id,
             result.items,
             notify=False,
@@ -1240,17 +1316,35 @@ class MonitorService:
         summary_profile = result.summary["profiles"][0]
         pointer = (summary_profile.get("pointer") or {}).get("nextCursor")
         coverage = summary_profile.get("coverageStatus") or summary_profile.get("coverage_status") or ""
-        if not pointer and str(coverage).startswith("partial"):
-            raise BudgetExceeded(f"完整回溯尚未完成：{coverage}")
-        done = not bool(pointer)
+        limited = not pointer and str(coverage).startswith("partial")
         self.db.execute("UPDATE profiles SET backfill_cursor=?,backfill_done=0 WHERE id=?", (pointer, profile_id))
-        if post_urls:
-            self._enqueue(profile_id, "backfill_comments", 31, datetime.now(UTC) + timedelta(minutes=self.settings.spacing_max_minutes), {"post_urls": post_urls, "next_cursor": pointer})
-        elif not done:
+        if pointer:
+            # Finish every cursor-addressable post page before spending quota
+            # on historical comments.
             self._enqueue(profile_id, "backfill", 30, datetime.now(UTC) + timedelta(minutes=self.settings.spacing_max_minutes))
-        elif done:
-            counts = self.db.row("SELECT SUM(kind='post') posts,SUM(kind='comment') comments FROM entities WHERE profile_id=?", (profile_id,)) or {}
-            self.db.add_event(f"profile:{profile_id}:backfill_complete", "backfill_complete", {"title": f"{profile['name']} 初始完整回溯完成", "text": f"已保存 {counts.get('posts') or 0} 篇貼文、{counts.get('comments') or 0} 則留言。", "source_url": profile["url"]}, profile_id)
+            return
+
+        # Some result-based Actors cap the embedded posts but expose no cursor.
+        # Retrying such a page only buys the same results again. Treat the
+        # returned range as the Actor's boundary and continue with comments.
+        self._enqueue(
+            profile_id,
+            "backfill_comments",
+            31,
+            datetime.now(UTC) + timedelta(minutes=self.settings.spacing_max_minutes),
+            {"offset": 0, "limited": limited},
+        )
+
+    def _backfill_post_urls(self, profile_id: int, offset: int, limit: int) -> list[str]:
+        rows = self.db.rows(
+            """SELECT source_url FROM entities
+            WHERE profile_id=? AND kind='post' AND present=1
+              AND source_url IS NOT NULL AND source_url!=''
+            ORDER BY COALESCE(published_at, last_seen_at) DESC, id DESC
+            LIMIT ? OFFSET ?""",
+            (profile_id, limit, offset),
+        )
+        return [str(row["source_url"]) for row in rows]
 
     async def backfill_comments(self, profile_id: int, payload: dict[str, Any]) -> None:
         profile = self.db.row("SELECT * FROM profiles WHERE id=?", (profile_id,))
@@ -1258,18 +1352,47 @@ class MonitorService:
             return
         if profile.get("apify_frozen"):
             return
-        post_urls = [str(url) for url in payload.get("post_urls") or [] if url]
+        legacy_urls = payload.get("post_urls")
+        batch_size = max(1, int(self.settings.backfill_posts))
+        offset = max(0, int(payload.get("offset") or 0))
+        post_urls = (
+            [str(url) for url in legacy_urls or [] if url]
+            if legacy_urls is not None
+            else self._backfill_post_urls(profile_id, offset, batch_size)
+        )
         if post_urls and self._remaining_budget() < PRICES["comments"]:
             raise BudgetExceeded("貼文已完成；留言等待 Apify 額度恢復", self._next_month())
         if post_urls:
             await self._fetch_comments(profile_id, post_urls, notify=False)
         pointer = payload.get("next_cursor")
-        if pointer:
+        if legacy_urls is not None and pointer:
             self._enqueue(profile_id, "backfill", 30, datetime.now(UTC) + timedelta(minutes=self.settings.spacing_max_minutes))
             return
+        if legacy_urls is None and len(post_urls) == batch_size:
+            next_offset = offset + len(post_urls)
+            if self._backfill_post_urls(profile_id, next_offset, 1):
+                self._enqueue(
+                    profile_id,
+                    "backfill_comments",
+                    31,
+                    datetime.now(UTC) + timedelta(minutes=self.settings.spacing_max_minutes),
+                    {"offset": next_offset, "limited": bool(payload.get("limited"))},
+                )
+                return
         self.db.execute("UPDATE profiles SET backfill_cursor=NULL,backfill_done=1,last_full_audit_at=? WHERE id=?", (utcnow(), profile_id))
         counts = self.db.row("SELECT SUM(kind='post') posts,SUM(kind='comment') comments FROM entities WHERE profile_id=?", (profile_id,)) or {}
-        self.db.add_event(f"profile:{profile_id}:backfill_complete", "backfill_complete", {"title": f"{profile['name']} 回溯完成", "text": f"已保存 {counts.get('posts') or 0} 篇貼文、{counts.get('comments') or 0} 則留言。", "source_url": profile["url"]}, profile_id)
+        limited = bool(payload.get("limited"))
+        event_type = "backfill_limited" if limited else "backfill_complete"
+        title = f"{profile['name']} Actor 可取得範圍回溯完成" if limited else f"{profile['name']} 回溯完成"
+        text = f"已保存 {counts.get('posts') or 0} 篇貼文、{counts.get('comments') or 0} 則留言。"
+        if limited:
+            text += " 貼文 Actor 未提供下一頁游標，已停止重複抓取相同批次。"
+        self.db.add_event(
+            f"profile:{profile_id}:{event_type}",
+            event_type,
+            {"title": title, "text": text, "source_url": profile["url"]},
+            profile_id,
+        )
 
     async def audit_profile(self, profile_id: int) -> None:
         profile = self.db.row("SELECT * FROM profiles WHERE id=?", (profile_id,))
@@ -1296,17 +1419,28 @@ class MonitorService:
         summary_profile = result.summary["profiles"][0]
         pointer = (summary_profile.get("pointer") or {}).get("nextCursor")
         coverage = summary_profile.get("coverageStatus") or summary_profile.get("coverage_status") or ""
-        if not pointer and str(coverage).startswith("partial"):
-            raise BudgetExceeded(f"完整核對尚未完成：{coverage}")
+        limited = not pointer and str(coverage).startswith("partial")
         if pointer:
             self.db.execute("UPDATE profiles SET audit_cursor=?,audit_token=? WHERE id=?", (pointer, token, profile_id))
             if self._remaining_budget() > 0:
                 self._enqueue(profile_id, "audit", 40, datetime.now(UTC) + timedelta(minutes=self.settings.spacing_max_minutes))
             return
-        seen = {row["external_id"] for row in self.db.rows("SELECT external_id FROM audit_seen WHERE profile_id=? AND audit_token=? AND kind='post'", (profile_id, token))}
-        self.ingester.reconcile(profile_id, "post", seen, None, notify=True)
+        if not limited:
+            seen = {row["external_id"] for row in self.db.rows("SELECT external_id FROM audit_seen WHERE profile_id=? AND audit_token=? AND kind='post'", (profile_id, token))}
+            self.ingester.reconcile(profile_id, "post", seen, None, notify=True)
         self.db.execute("DELETE FROM audit_seen WHERE profile_id=? AND audit_token=?", (profile_id, token))
         self.db.execute("UPDATE profiles SET audit_cursor=NULL,audit_token=NULL,last_full_audit_at=? WHERE id=?", (utcnow(), profile_id))
+        if limited:
+            self.db.add_event(
+                f"profile:{profile_id}:audit_limited:{datetime.now(UTC).date().isoformat()}",
+                "audit_limited",
+                {
+                    "title": f"{profile['name']} 完整核對受 Actor 範圍限制",
+                    "text": "貼文 Actor 未提供下一頁游標；本次不判定舊貼文已移除，也不重複抓取相同批次。",
+                    "source_url": profile["url"],
+                },
+                profile_id,
+            )
 
     def _record_profile_missing(self, profile: dict[str, Any]) -> None:
         misses = int(profile["missing_successes"]) + 1
