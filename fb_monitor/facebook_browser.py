@@ -215,6 +215,7 @@ def normalize_browser_profile(raw: dict[str, Any], profile_url: str) -> dict[str
 def normalize_browser_canary_posts(
     raw_posts: object,
     max_posts: int = 2,
+    after_cursor: str | None = None,
 ) -> list[dict[str, Any]]:
     """Normalize only visible posts that expose a stable Facebook permalink."""
     if not isinstance(raw_posts, list) or max_posts <= 0:
@@ -222,6 +223,8 @@ def normalize_browser_canary_posts(
     posts: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
     seen_post_ids: set[str] = set()
+    cursor = str(after_cursor or "")
+    cursor_found = not bool(cursor)
     for raw in raw_posts:
         if not isinstance(raw, dict):
             continue
@@ -238,6 +241,10 @@ def normalize_browser_canary_posts(
             continue
         post_id = facebook_post_identity(source_url)
         if post_id and post_id in seen_post_ids:
+            continue
+        if not cursor_found:
+            if post_id == cursor or source_url == cursor:
+                cursor_found = True
             continue
         photos: list[dict[str, str]] = []
         seen_assets: set[str] = set()
@@ -335,6 +342,93 @@ class FacebookBrowserGateway:
         self._canary_cache[cache_key] = (time.monotonic(), expanded)
         self._expanded_canary_cache.add(cache_key)
         return [dict(post) for post in expanded]
+
+    async def canary_post_page(
+        self,
+        profile_url: str,
+        diagnostic_key: str | None = None,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """Return the next small DOM page after a persistent post identity."""
+        if not cursor:
+            posts = await self.canary_posts(profile_url, diagnostic_key)
+            next_cursor = str(posts[-1].get("source_post_id") or posts[-1].get("source_url") or "") if posts else ""
+            return {"posts": posts, "next_cursor": next_cursor or None, "completed": len(posts) < self.canary_max_posts}
+        if not self.enabled:
+            raise FacebookBrowserError("Facebook 直接瀏覽器備援未啟用")
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        posts: list[dict[str, Any]] = []
+        next_cursor: str | None = cursor
+        completed = False
+        async with async_playwright() as playwright:
+            try:
+                context = await playwright.chromium.launch_persistent_context(
+                    str(self.data_dir), headless=True, locale="zh-TW", timezone_id="Asia/Taipei",
+                    viewport={"width": 1365, "height": 900}, args=["--disable-dev-shm-usage"],
+                )
+            except Exception as exc:
+                raise FacebookBrowserError(f"無法啟動 Chromium 貼文續抓：{exc}") from exc
+            try:
+                self._require_login(await context.cookies("https://www.facebook.com"))
+                page = context.pages[0] if context.pages else await context.new_page()
+                response = await page.goto(profile_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+                if response and response.status >= 400:
+                    raise FacebookBrowserError(f"Facebook 貼文時間軸 HTTP {response.status}")
+                await self._wait_for_profile_content(page)
+                collected: list[dict[str, Any]] = []
+                seen: set[str] = set()
+                stagnant = 0
+                cursor_found = False
+                for _ in range(12):
+                    raw_posts = await self._timeline_posts(page)
+                    before = len(collected)
+                    for raw in raw_posts:
+                        url = normalize_url(str(raw.get("url") or ""))
+                        identity = facebook_post_identity(url)
+                        key = identity or url
+                        if key and key not in seen:
+                            collected.append(raw)
+                            seen.add(key)
+                        if identity == cursor or url == cursor:
+                            cursor_found = True
+                    page_posts = normalize_browser_canary_posts(collected, self.canary_max_posts, cursor)
+                    if cursor_found and len(page_posts) >= self.canary_max_posts:
+                        break
+                    stagnant = stagnant + 1 if len(collected) == before else 0
+                    if stagnant >= 3:
+                        break
+                    await page.evaluate("window.scrollBy(0, Math.max(window.innerHeight * 0.85, 700))")
+                    await page.wait_for_timeout(round(random.uniform(2200, 4200)))
+                posts = normalize_browser_canary_posts(collected, self.canary_max_posts, cursor)
+                next_cursor = str(posts[-1].get("source_post_id") or posts[-1].get("source_url") or "") if posts else cursor
+                completed = cursor_found and len(posts) < self.canary_max_posts and stagnant >= 3
+            finally:
+                await context.close()
+        # The persistent profile directory cannot be opened by two Chromium
+        # contexts concurrently. Expand albums only after the timeline context
+        # has released its lock.
+        expanded = await self._expand_canary_albums(posts) if posts else []
+        return {"posts": expanded, "next_cursor": next_cursor, "completed": completed}
+
+    @staticmethod
+    async def _timeline_posts(page: Page) -> list[dict[str, Any]]:
+        return await page.evaluate(
+            r"""() => {
+                const readImage = (image) => {
+                    const rect = image.getBoundingClientRect();
+                    return {src: image.currentSrc || image.src || '', natural_width: image.naturalWidth || 0,
+                        natural_height: image.naturalHeight || 0, rendered_width: Math.round(rect.width),
+                        rendered_height: Math.round(rect.height)};
+                };
+                const pattern = /\/posts\/|\/photos\/|\/videos\/|\/reel\/|\/share\/p\/|\/permalink\.php|story_fbid=/i;
+                return [...document.querySelectorAll('[role="main"] [role="article"], main [role="article"]')]
+                    .map((article) => {
+                        const url = [...article.querySelectorAll('a[href]')].map((link) => link.href || '').find((href) => pattern.test(href)) || '';
+                        return {url, text: (article.innerText || '').slice(0, 8000),
+                            images: [...article.querySelectorAll('img, svg image')].map(readImage)};
+                    }).filter((post) => post.url);
+            }"""
+        )
 
     async def _expand_canary_albums(self, posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Open each selected permalink and walk its photo viewer until it ends."""

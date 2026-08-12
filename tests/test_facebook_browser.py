@@ -258,6 +258,17 @@ def test_normalize_browser_canary_posts_deduplicates_alias_urls_for_same_post():
     assert len(posts) == 1
 
 
+def test_browser_post_page_continues_after_saved_cursor():
+    raw_posts = [
+        {"url": f"https://www.facebook.com/example/posts/p{i}", "text": f"post {i}"}
+        for i in range(5)
+    ]
+
+    page = normalize_browser_canary_posts(raw_posts, max_posts=2, after_cursor="p1")
+
+    assert [post["source_post_id"] for post in page] == ["p2", "p3"]
+
+
 @pytest.mark.asyncio
 async def test_album_walker_keeps_advancing_until_photo_repeats(tmp_path: Path, monkeypatch):
     class Response:

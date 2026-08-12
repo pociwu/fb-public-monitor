@@ -444,8 +444,20 @@ class MonitorService:
         )
         item = await self.facebook_browser.profile(str(profile["url"]), str(profile_id))
         await self._store_profile_details(profile, item)
-        posts = await self.facebook_browser.canary_posts(str(profile["url"]), str(profile_id))
+        browser_backfill_done = bool(profile.get("browser_post_backfill_done"))
+        if browser_backfill_done:
+            posts = await self.facebook_browser.canary_posts(str(profile["url"]), str(profile_id))
+            page = {"posts": posts, "next_cursor": profile.get("browser_post_cursor"), "completed": True}
+        else:
+            page = await self.facebook_browser.canary_post_page(
+                str(profile["url"]), str(profile_id), profile.get("browser_post_cursor")
+            )
+        posts = [post for post in page.get("posts") or [] if isinstance(post, dict)]
         await self._ingest_browser_canary_posts(profile_id, posts, notify=True)
+        self.db.execute(
+            "UPDATE profiles SET browser_post_cursor=?,browser_post_backfill_done=? WHERE id=?",
+            (page.get("next_cursor"), int(bool(page.get("completed"))), profile_id),
+        )
         display = item.get("name") or profile.get("display_name") or profile.get("name") or "Facebook"
         self.db.add_event(
             f"browser-manual:{profile_id}:{utcnow()}",

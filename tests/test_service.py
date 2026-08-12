@@ -257,16 +257,56 @@ async def test_manual_browser_visit_updates_profile_and_canary_posts(tmp_path: P
     async def fake_profile(url, diagnostic_key=None):
         return {"name": "Browser Name", "profile_data_source": "Facebook 直接瀏覽器"}
 
-    async def fake_posts(url, diagnostic_key=None):
-        return [{"source_post_id": "p1", "source_url": "https://facebook.com/100/posts/p1", "text": "post"}]
+    async def fake_posts(url, diagnostic_key=None, cursor=None):
+        assert cursor is None
+        return {
+            "posts": [{"source_post_id": "p1", "source_url": "https://facebook.com/100/posts/p1", "text": "post"}],
+            "next_cursor": "p1",
+            "completed": False,
+        }
 
     service.facebook_browser.profile = fake_profile
-    service.facebook_browser.canary_posts = fake_posts
+    service.facebook_browser.canary_post_page = fake_posts
     await service.browser_visit_profile(1)
 
-    assert service.db.row("SELECT last_success_at FROM profiles WHERE id=1")["last_success_at"]
+    profile = service.db.row("SELECT last_success_at,browser_post_cursor,browser_post_backfill_done FROM profiles WHERE id=1")
+    assert profile["last_success_at"]
+    assert profile["browser_post_cursor"] == "p1"
+    assert profile["browser_post_backfill_done"] == 0
     assert service.db.row("SELECT COUNT(*) count FROM entities WHERE profile_id=1 AND kind='post'")["count"] == 1
     assert service.db.row("SELECT COUNT(*) count FROM events WHERE event_type='browser_manual_visit'")["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_completed_browser_backfill_monitors_latest_without_resetting_cursor(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("FACEBOOK_BROWSER_ENABLED", "1")
+    service = MonitorService(load_settings(config))
+    service.db.execute(
+        "UPDATE profiles SET browser_post_cursor='oldest',browser_post_backfill_done=1 WHERE id=1"
+    )
+
+    async def fake_profile(url, diagnostic_key=None):
+        return {"name": "Browser Name", "profile_data_source": "Facebook 直接瀏覽器"}
+
+    async def fake_latest(url, diagnostic_key=None):
+        return [{"source_post_id": "new", "source_url": "https://facebook.com/100/posts/new", "text": "new"}]
+
+    async def unexpected_page(*args, **kwargs):
+        raise AssertionError("completed history must not restart cursor pagination")
+
+    service.facebook_browser.profile = fake_profile
+    service.facebook_browser.canary_posts = fake_latest
+    service.facebook_browser.canary_post_page = unexpected_page
+    await service.browser_visit_profile(1)
+
+    profile = service.db.row("SELECT browser_post_cursor,browser_post_backfill_done FROM profiles WHERE id=1")
+    assert profile == {"browser_post_cursor": "oldest", "browser_post_backfill_done": 1}
 
 
 @pytest.mark.asyncio

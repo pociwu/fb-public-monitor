@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS profiles (
   consecutive_failures INTEGER NOT NULL DEFAULT 0, sort_order INTEGER, last_manual_visit_at TEXT,
   apify_frozen INTEGER NOT NULL DEFAULT 0,
   last_error TEXT, profile_details_json TEXT, serp_last_checked_at TEXT, browser_canary_last_attempt_at TEXT,
+  browser_post_cursor TEXT, browser_post_backfill_done INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS entities (
@@ -157,6 +158,10 @@ class Database:
                     conn.execute(f"ALTER TABLE profiles ADD COLUMN {name} TEXT")
             if "browser_canary_last_attempt_at" not in columns:
                 conn.execute("ALTER TABLE profiles ADD COLUMN browser_canary_last_attempt_at TEXT")
+            if "browser_post_cursor" not in columns:
+                conn.execute("ALTER TABLE profiles ADD COLUMN browser_post_cursor TEXT")
+            if "browser_post_backfill_done" not in columns:
+                conn.execute("ALTER TABLE profiles ADD COLUMN browser_post_backfill_done INTEGER NOT NULL DEFAULT 0")
             if "sort_order" not in columns:
                 conn.execute("ALTER TABLE profiles ADD COLUMN sort_order INTEGER")
             if "last_manual_visit_at" not in columns:
