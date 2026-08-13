@@ -353,7 +353,11 @@ class FacebookBrowserGateway:
         if not cursor:
             posts = await self.canary_posts(profile_url, diagnostic_key)
             next_cursor = str(posts[-1].get("source_post_id") or posts[-1].get("source_url") or "") if posts else ""
-            return {"posts": posts, "next_cursor": next_cursor or None, "completed": len(posts) < self.canary_max_posts}
+            # A short first page does not prove that the history is exhausted:
+            # Facebook may have rendered the timeline incompletely or omitted
+            # permalink anchors.  Establish a cursor first, then require a
+            # later scrolling pass to find that cursor and verify the end.
+            return {"posts": posts, "next_cursor": next_cursor or None, "completed": False}
         if not self.enabled:
             raise FacebookBrowserError("Facebook 直接瀏覽器備援未啟用")
         self.data_dir.mkdir(parents=True, exist_ok=True)

@@ -162,6 +162,13 @@ class Database:
                 conn.execute("ALTER TABLE profiles ADD COLUMN browser_post_cursor TEXT")
             if "browser_post_backfill_done" not in columns:
                 conn.execute("ALTER TABLE profiles ADD COLUMN browser_post_backfill_done INTEGER NOT NULL DEFAULT 0")
+            # Older browser-cursor builds treated an empty initial DOM page as
+            # a completed history.  Completion without a persistent cursor is
+            # unverifiable, so safely reopen those profiles for another pass.
+            conn.execute(
+                "UPDATE profiles SET browser_post_backfill_done=0 "
+                "WHERE browser_post_cursor IS NULL AND browser_post_backfill_done=1"
+            )
             if "sort_order" not in columns:
                 conn.execute("ALTER TABLE profiles ADD COLUMN sort_order INTEGER")
             if "last_manual_visit_at" not in columns:

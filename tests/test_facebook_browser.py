@@ -6,6 +6,25 @@ from fb_monitor.facebook_browser import FacebookBrowserGateway, normalize_browse
 from fb_monitor.normalize import normalize_url
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "posts",
+    [[], [{"source_post_id": "p1", "source_url": "https://facebook.com/1/posts/p1"}]],
+)
+async def test_initial_browser_post_page_never_completes_without_a_verified_cursor(tmp_path: Path, posts):
+    gateway = FacebookBrowserGateway(True, tmp_path, canary_max_posts=2)
+
+    async def fake_canary_posts(profile_url, diagnostic_key=None):
+        return posts
+
+    gateway.canary_posts = fake_canary_posts
+
+    page = await gateway.canary_post_page("https://facebook.com/1")
+
+    assert page["completed"] is False
+    assert page["next_cursor"] == ("p1" if posts else None)
+
+
 def test_normalize_browser_profile_extracts_card_fields():
     item = normalize_browser_profile(
         {

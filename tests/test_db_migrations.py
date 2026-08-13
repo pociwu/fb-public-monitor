@@ -71,3 +71,18 @@ def test_legacy_profiles_get_stable_sort_order(tmp_path: Path):
     assert db.has_column("profiles", "profile_details_json")
     assert db.has_column("profiles", "serp_last_checked_at")
     assert [row["sort_order"] for row in db.rows("SELECT sort_order FROM profiles ORDER BY id")] == [4, 9]
+
+
+def test_schema_reopens_unverifiable_browser_backfill_completion(tmp_path: Path):
+    db = Database(tmp_path / "browser-cursor.sqlite3")
+    db.execute(
+        """INSERT INTO profiles(name,url,browser_post_cursor,browser_post_backfill_done,created_at,updated_at)
+           VALUES('watched','https://facebook.com/1',NULL,1,'x','x')"""
+    )
+
+    db.ensure_schema()
+
+    profile = db.row(
+        "SELECT browser_post_cursor,browser_post_backfill_done FROM profiles WHERE url='https://facebook.com/1'"
+    )
+    assert profile == {"browser_post_cursor": None, "browser_post_backfill_done": 0}
