@@ -7,22 +7,44 @@ from fb_monitor.normalize import normalize_url
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "posts",
-    [[], [{"source_post_id": "p1", "source_url": "https://facebook.com/1/posts/p1"}]],
-)
-async def test_initial_browser_post_page_never_completes_without_a_verified_cursor(tmp_path: Path, posts):
+@pytest.mark.parametrize("posts", [[], [{"source_post_id": "p1"}]])
+async def test_initial_browser_post_page_scrolls_when_initial_dom_is_short(tmp_path: Path, posts):
     gateway = FacebookBrowserGateway(True, tmp_path, canary_max_posts=2)
+    scrolled = []
 
     async def fake_canary_posts(profile_url, diagnostic_key=None):
         return posts
 
+    async def fake_scroll(profile_url, cursor):
+        scrolled.append((profile_url, cursor))
+        return {"posts": [], "next_cursor": None, "completed": False}
+
     gateway.canary_posts = fake_canary_posts
+    gateway._scroll_post_page = fake_scroll
 
     page = await gateway.canary_post_page("https://facebook.com/1")
 
     assert page["completed"] is False
-    assert page["next_cursor"] == ("p1" if posts else None)
+    assert scrolled == [("https://facebook.com/1", None)]
+
+
+@pytest.mark.asyncio
+async def test_initial_browser_post_page_uses_full_initial_dom_without_extra_scroll(tmp_path: Path):
+    gateway = FacebookBrowserGateway(True, tmp_path, canary_max_posts=2)
+    posts = [{"source_post_id": "p1"}, {"source_post_id": "p2"}]
+
+    async def fake_canary_posts(profile_url, diagnostic_key=None):
+        return posts
+
+    async def unexpected_scroll(profile_url, cursor):
+        raise AssertionError("a full initial page should establish the cursor directly")
+
+    gateway.canary_posts = fake_canary_posts
+    gateway._scroll_post_page = unexpected_scroll
+
+    page = await gateway.canary_post_page("https://facebook.com/1")
+
+    assert page == {"posts": posts, "next_cursor": "p2", "completed": False}
 
 
 def test_normalize_browser_profile_extracts_card_fields():

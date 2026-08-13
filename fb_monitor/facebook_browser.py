@@ -352,12 +352,16 @@ class FacebookBrowserGateway:
         """Return the next small DOM page after a persistent post identity."""
         if not cursor:
             posts = await self.canary_posts(profile_url, diagnostic_key)
-            next_cursor = str(posts[-1].get("source_post_id") or posts[-1].get("source_url") or "") if posts else ""
-            # A short first page does not prove that the history is exhausted:
-            # Facebook may have rendered the timeline incompletely or omitted
-            # permalink anchors.  Establish a cursor first, then require a
-            # later scrolling pass to find that cursor and verify the end.
-            return {"posts": posts, "next_cursor": next_cursor or None, "completed": False}
+            if len(posts) >= self.canary_max_posts:
+                next_cursor = str(posts[-1].get("source_post_id") or posts[-1].get("source_url") or "")
+                return {"posts": posts, "next_cursor": next_cursor or None, "completed": False}
+            # Facebook often omits permalink anchors from its initial DOM.
+            # A short first page must scroll before deciding that no cursor is
+            # available, otherwise every later visit repeats the empty cache.
+        return await self._scroll_post_page(profile_url, cursor)
+
+    async def _scroll_post_page(self, profile_url: str, cursor: str | None) -> dict[str, Any]:
+        """Scroll the timeline to establish or advance a persistent cursor."""
         if not self.enabled:
             raise FacebookBrowserError("Facebook 直接瀏覽器備援未啟用")
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -382,7 +386,7 @@ class FacebookBrowserGateway:
                 collected: list[dict[str, Any]] = []
                 seen: set[str] = set()
                 stagnant = 0
-                cursor_found = False
+                cursor_found = not bool(cursor)
                 for _ in range(12):
                     raw_posts = await self._timeline_posts(page)
                     before = len(collected)
@@ -405,7 +409,7 @@ class FacebookBrowserGateway:
                     await page.wait_for_timeout(round(random.uniform(2200, 4200)))
                 posts = normalize_browser_canary_posts(collected, self.canary_max_posts, cursor)
                 next_cursor = str(posts[-1].get("source_post_id") or posts[-1].get("source_url") or "") if posts else cursor
-                completed = cursor_found and len(posts) < self.canary_max_posts and stagnant >= 3
+                completed = bool(cursor) and cursor_found and len(posts) < self.canary_max_posts and stagnant >= 3
             finally:
                 await context.close()
         # The persistent profile directory cannot be opened by two Chromium
