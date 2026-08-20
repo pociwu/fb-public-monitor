@@ -12,7 +12,7 @@ def test_deploy_freezes_old_writer_before_backup_and_build():
     verify_while_paused = source.index('paused_running_jobs="$(running_job_count)"')
     stop = source.index("docker compose stop --timeout 30 monitor")
     verify_after_stop = source.index('stopped_running_jobs="$(running_job_count)"')
-    backup = source.index('backup_output="$("$PYTHON_BIN" scripts/backup_database.py backup')
+    backup = source.index('backup_output="$(database_helper backup')
     build = source.index("docker compose up -d --build")
 
     assert tag < pause < verify_while_paused < stop < verify_after_stop < backup < build
@@ -43,19 +43,28 @@ def test_deploy_records_previous_version_metadata_before_rebuild():
     assert inspect_updated < build
 
 
-def test_deploy_keeps_host_writes_outside_container_owned_data_tree():
+def test_deploy_keeps_host_control_writes_outside_container_owned_data_tree():
     source = SCRIPT.read_text(encoding="utf-8")
 
     assert (
         'DEPLOY_STATE_DIR="${FB_MONITOR_DEPLOY_STATE_DIR:-$APP_DIR/deploy-state}"'
         in source
     )
-    assert 'BACKUP_DIR="${FB_MONITOR_BACKUP_DIR:-$APP_DIR/backups/deploy}"' in source
+    assert 'BACKUP_DIR="${FB_MONITOR_BACKUP_DIR:-$DATA_DIR/backups/deploy}"' in source
     assert 'MAINTENANCE_FLAG="$DEPLOY_STATE_DIR/deploy-maintenance"' in source
-    assert 'mkdir -p -- "$DATA_DIR" "$DEPLOY_STATE_DIR" "$BACKUP_DIR"' in source
+    assert 'mkdir -p -- "$DATA_DIR" "$DEPLOY_STATE_DIR"' in source
     assert 'chmod 755 -- "$DEPLOY_STATE_DIR"' in source
-    assert 'chmod 700 -- "$BACKUP_DIR"' in source
-    assert '$DATA_DIR/backups' not in source
+
+
+def test_deploy_reads_and_backs_up_sqlite_through_the_container_owner():
+    source = SCRIPT.read_text(encoding="utf-8")
+
+    assert "database_helper() {" in source
+    assert "docker compose run --rm --no-deps -T monitor" in source
+    assert "python /deploy-tools/backup_database.py" in source
+    assert 'running-jobs --source "$CONTAINER_DATABASE_PATH"' in source
+    assert '--source "$CONTAINER_DATABASE_PATH" --output-dir "$CONTAINER_BACKUP_DIR"' in source
+    assert '"$PYTHON_BIN" scripts/backup_database.py' not in source
 
 
 def test_compose_mounts_the_host_deploy_state_read_only_for_the_scheduler():
@@ -68,5 +77,9 @@ def test_compose_mounts_the_host_deploy_state_read_only_for_the_scheduler():
     assert (
         'FB_MONITOR_DEPLOY_MAINTENANCE_FLAG: '
         '"${FB_MONITOR_DEPLOY_MAINTENANCE_FLAG:-/deploy-state/deploy-maintenance}"'
+        in compose
+    )
+    assert (
+        "./scripts/backup_database.py:/deploy-tools/backup_database.py:ro"
         in compose
     )

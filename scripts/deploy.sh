@@ -3,11 +3,12 @@
 set -euo pipefail
 
 APP_DIR="${FB_MONITOR_DIR:-/home/ubuntu/fb-public-monitor}"
-PYTHON_BIN="${FB_MONITOR_PYTHON:-python3}"
 DATA_DIR="${FB_MONITOR_HOST_DATA_DIR:-$APP_DIR/data}"
 DATABASE_PATH="${FB_MONITOR_DB_PATH:-$DATA_DIR/monitor.sqlite3}"
+CONTAINER_DATABASE_PATH="${FB_MONITOR_CONTAINER_DB_PATH:-/data/monitor.sqlite3}"
 DEPLOY_STATE_DIR="${FB_MONITOR_DEPLOY_STATE_DIR:-$APP_DIR/deploy-state}"
-BACKUP_DIR="${FB_MONITOR_BACKUP_DIR:-$APP_DIR/backups/deploy}"
+BACKUP_DIR="${FB_MONITOR_BACKUP_DIR:-$DATA_DIR/backups/deploy}"
+CONTAINER_BACKUP_DIR="${FB_MONITOR_CONTAINER_BACKUP_DIR:-/data/backups/deploy}"
 MAINTENANCE_FLAG="$DEPLOY_STATE_DIR/deploy-maintenance"
 DRAIN_TIMEOUT_SECONDS="${DEPLOY_DRAIN_TIMEOUT_SECONDS:-1800}"
 DRAIN_POLL_SECONDS="${DEPLOY_DRAIN_POLL_SECONDS:-5}"
@@ -68,9 +69,22 @@ cleanup() {
   return "$status"
 }
 
+database_helper() {
+  # SQLite WAL readers may need to create/access the -shm file even when the
+  # connection itself is read-only.  Run every live-database operation as the
+  # same container UID that owns /data, while bind-mounting the helper from the
+  # checked-out release so this also works with an older last-good image.
+  docker compose run --rm --no-deps -T monitor \
+    python /deploy-tools/backup_database.py "$@"
+}
+
 running_job_count() {
   local count
-  count="$("$PYTHON_BIN" scripts/backup_database.py running-jobs --source "$DATABASE_PATH")"
+  if [[ ! -f "$DATABASE_PATH" ]]; then
+    printf '0'
+    return
+  fi
+  count="$(database_helper running-jobs --source "$CONTAINER_DATABASE_PATH")"
   if [[ ! "$count" =~ ^[0-9]+$ ]]; then
     printf '無法判讀執行中工作數量：%s\n' "$count" >&2
     return 1
@@ -91,11 +105,10 @@ APP_UPDATED_AT="$(git show -s --format=%cI HEAD)"
 
 printf '準備部署版本：%s\n更新時間：%s\n' "$APP_VERSION" "$APP_UPDATED_AT"
 # The monitor container may own DATA_DIR with a UID that differs from the OCI
-# login user.  Host-side deploy artifacts therefore live in dedicated,
-# host-owned directories rather than below the application data bind mount.
-mkdir -p -- "$DATA_DIR" "$DEPLOY_STATE_DIR" "$BACKUP_DIR"
+# login user.  The host only creates the external maintenance directory;
+# database backups below /data are created by database_helper as the owner UID.
+mkdir -p -- "$DATA_DIR" "$DEPLOY_STATE_DIR"
 chmod 755 -- "$DEPLOY_STATE_DIR"
-chmod 700 -- "$BACKUP_DIR"
 if [[ -e "$MAINTENANCE_FLAG" ]]; then
   printf '偵測到既有維護旗標，為避免重疊部署而中止：%s\n' "$MAINTENANCE_FLAG" >&2
   exit 1
@@ -190,8 +203,8 @@ while true; do
 done
 
 if [[ -f "$DATABASE_PATH" ]]; then
-  backup_output="$("$PYTHON_BIN" scripts/backup_database.py backup \
-    --source "$DATABASE_PATH" --output-dir "$BACKUP_DIR" --keep 5)"
+  backup_output="$(database_helper backup \
+    --source "$CONTAINER_DATABASE_PATH" --output-dir "$CONTAINER_BACKUP_DIR" --keep 5)"
   printf '%s\n' "$backup_output"
 else
   printf '尚無資料庫（首次部署）；略過部署前備份：%s\n' "$DATABASE_PATH"

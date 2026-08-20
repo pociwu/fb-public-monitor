@@ -168,7 +168,7 @@ cd /home/ubuntu/fb-public-monitor
 bash scripts/deploy.sh
 ```
 
-`deploy.sh` 會先從 GitHub fast-forward 更新，再將當前 Git 短 commit 與 commit 時間寫入 Docker 映像。所有網頁頁尾會以台北時間顯示實際部署版本與更新時間。部署前備份預設寫入主機擁有的 `backups/deploy/`；排程器維護旗標寫入 `deploy-state/` 並唯讀掛入容器。兩者都不會嘗試更改 container-owned `data/` 的擁有者。
+`deploy.sh` 會先從 GitHub fast-forward 更新，再將當前 Git 短 commit 與 commit 時間寫入 Docker 映像。所有網頁頁尾會以台北時間顯示實際部署版本與更新時間。排程器維護旗標寫入主機擁有的 `deploy-state/` 並唯讀掛入容器；部署前備份則由一次性的 monitor helper 容器以資料擁有者身分寫入 `data/backups/deploy/`，確保 SQLite WAL／SHM 與未 checkpoint 的資料都安全納入。部署不會使用 `sudo`、`chown` 或更改 container-owned `data/` 的擁有者。
 
 `.env`、`config.yaml`、`/data`、`browser-data/` 與部署備份不在 Git 版本控制中，更新程式不會覆寫權杖、監控帳號設定、Facebook 登入狀態或既有資料。公開倉庫只保存不含真實帳號的 `config.example.yaml`。首頁新增或移除監控帳號時會直接更新私有 `config.yaml`，因此該檔案的容器掛載與主機權限必須允許 UID 1000 寫入。
 
