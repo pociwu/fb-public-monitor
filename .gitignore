@@ -7,5 +7,8 @@ __pycache__/
 .codex-remote-attachments/
 data/
 browser-data/
+backups/
+deploy-state/*
+!deploy-state/.gitkeep
 dist/
 *.egg-info/

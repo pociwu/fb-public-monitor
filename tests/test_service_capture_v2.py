@@ -1467,8 +1467,8 @@ async def test_deploy_maintenance_flag_stops_scheduler_before_enqueue_or_dequeue
     tmp_path: Path, monkeypatch
 ):
     service = make_service(tmp_path, monkeypatch)
-    service.settings.data_dir.mkdir(parents=True, exist_ok=True)
-    (service.settings.data_dir / "deploy-maintenance").write_text("drain", encoding="utf-8")
+    service.settings.deploy_maintenance_flag.parent.mkdir(parents=True, exist_ok=True)
+    service.settings.deploy_maintenance_flag.write_text("drain", encoding="utf-8")
     calls: list[str] = []
 
     class StopAfterOneWait:

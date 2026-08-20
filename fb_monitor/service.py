@@ -4155,7 +4155,7 @@ class MonitorService:
                 # container to drain.  Keep health/outbox loops alive, but do
                 # not enqueue or claim another job until the replacement
                 # container removes the flag.
-                if (self.settings.data_dir / "deploy-maintenance").exists():
+                if self.settings.deploy_maintenance_flag.exists():
                     try:
                         await asyncio.wait_for(self.stop_event.wait(), timeout=5)
                     except TimeoutError:

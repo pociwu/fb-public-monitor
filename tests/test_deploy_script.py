@@ -41,3 +41,32 @@ def test_deploy_records_previous_version_metadata_before_rebuild():
 
     assert inspect_version < build
     assert inspect_updated < build
+
+
+def test_deploy_keeps_host_writes_outside_container_owned_data_tree():
+    source = SCRIPT.read_text(encoding="utf-8")
+
+    assert (
+        'DEPLOY_STATE_DIR="${FB_MONITOR_DEPLOY_STATE_DIR:-$APP_DIR/deploy-state}"'
+        in source
+    )
+    assert 'BACKUP_DIR="${FB_MONITOR_BACKUP_DIR:-$APP_DIR/backups/deploy}"' in source
+    assert 'MAINTENANCE_FLAG="$DEPLOY_STATE_DIR/deploy-maintenance"' in source
+    assert 'mkdir -p -- "$DATA_DIR" "$DEPLOY_STATE_DIR" "$BACKUP_DIR"' in source
+    assert 'chmod 755 -- "$DEPLOY_STATE_DIR"' in source
+    assert 'chmod 700 -- "$BACKUP_DIR"' in source
+    assert '$DATA_DIR/backups' not in source
+
+
+def test_compose_mounts_the_host_deploy_state_read_only_for_the_scheduler():
+    compose = (SCRIPT.parents[1] / "compose.yaml").read_text(encoding="utf-8")
+
+    assert (
+        '"${FB_MONITOR_DEPLOY_STATE_DIR:-./deploy-state}:/deploy-state:ro"'
+        in compose
+    )
+    assert (
+        'FB_MONITOR_DEPLOY_MAINTENANCE_FLAG: '
+        '"${FB_MONITOR_DEPLOY_MAINTENANCE_FLAG:-/deploy-state/deploy-maintenance}"'
+        in compose
+    )

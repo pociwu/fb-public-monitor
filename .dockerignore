@@ -2,6 +2,8 @@
 .venv
 data
 browser-data
+backups
+deploy-state
 dist
 .pytest_cache
 __pycache__

@@ -6,8 +6,9 @@ APP_DIR="${FB_MONITOR_DIR:-/home/ubuntu/fb-public-monitor}"
 PYTHON_BIN="${FB_MONITOR_PYTHON:-python3}"
 DATA_DIR="${FB_MONITOR_HOST_DATA_DIR:-$APP_DIR/data}"
 DATABASE_PATH="${FB_MONITOR_DB_PATH:-$DATA_DIR/monitor.sqlite3}"
-BACKUP_DIR="${FB_MONITOR_BACKUP_DIR:-$DATA_DIR/backups/deploy}"
-MAINTENANCE_FLAG="$DATA_DIR/deploy-maintenance"
+DEPLOY_STATE_DIR="${FB_MONITOR_DEPLOY_STATE_DIR:-$APP_DIR/deploy-state}"
+BACKUP_DIR="${FB_MONITOR_BACKUP_DIR:-$APP_DIR/backups/deploy}"
+MAINTENANCE_FLAG="$DEPLOY_STATE_DIR/deploy-maintenance"
 DRAIN_TIMEOUT_SECONDS="${DEPLOY_DRAIN_TIMEOUT_SECONDS:-1800}"
 DRAIN_POLL_SECONDS="${DEPLOY_DRAIN_POLL_SECONDS:-5}"
 HEALTH_TIMEOUT_SECONDS="${DEPLOY_HEALTH_TIMEOUT_SECONDS:-240}"
@@ -89,12 +90,18 @@ APP_VERSION="$(git rev-parse --short HEAD)"
 APP_UPDATED_AT="$(git show -s --format=%cI HEAD)"
 
 printf '準備部署版本：%s\n更新時間：%s\n' "$APP_VERSION" "$APP_UPDATED_AT"
-mkdir -p -- "$DATA_DIR" "$BACKUP_DIR"
+# The monitor container may own DATA_DIR with a UID that differs from the OCI
+# login user.  Host-side deploy artifacts therefore live in dedicated,
+# host-owned directories rather than below the application data bind mount.
+mkdir -p -- "$DATA_DIR" "$DEPLOY_STATE_DIR" "$BACKUP_DIR"
+chmod 755 -- "$DEPLOY_STATE_DIR"
+chmod 700 -- "$BACKUP_DIR"
 if [[ -e "$MAINTENANCE_FLAG" ]]; then
   printf '偵測到既有維護旗標，為避免重疊部署而中止：%s\n' "$MAINTENANCE_FLAG" >&2
   exit 1
 fi
 printf 'version=%s\nstarted_at=%s\n' "$APP_VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$MAINTENANCE_FLAG"
+chmod 644 -- "$MAINTENANCE_FLAG"
 MAINTENANCE_OWNED=1
 printf '已進入部署維護模式：%s\n' "$MAINTENANCE_FLAG"
 

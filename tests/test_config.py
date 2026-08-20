@@ -32,6 +32,23 @@ def test_browser_canary_defaults_are_conservative(tmp_path: Path):
     assert settings.low_disk_gb == 30
     assert settings.browser_album_operations == 20
     assert settings.evidence_cap_bytes == 500 * 1024 * 1024
+    assert settings.deploy_maintenance_flag == settings.data_dir / "deploy-maintenance"
+
+
+def test_deploy_maintenance_flag_can_live_on_a_dedicated_container_mount(
+    tmp_path: Path, monkeypatch
+):
+    config = tmp_path / "config.yaml"
+    config.write_text("profiles: []\n", encoding="utf-8")
+    maintenance_flag = (tmp_path / "deploy-state" / "deploy-maintenance").resolve()
+    monkeypatch.setenv(
+        "FB_MONITOR_DEPLOY_MAINTENANCE_FLAG",
+        str(maintenance_flag),
+    )
+
+    settings = load_settings(config)
+
+    assert settings.deploy_maintenance_flag == maintenance_flag
 
 
 def test_capture_v2_and_browser_guard_settings(tmp_path: Path):

@@ -11,10 +11,12 @@ services:
       # 舊 Actor 無回溯游標；部署預設止血。V2 只有通過契約後才會付費執行。
       APIFY_V1_BACKFILL_ENABLED: "${APIFY_V1_BACKFILL_ENABLED:-0}"
       CAPTURE_V2_ENABLED: "${CAPTURE_V2_ENABLED:-0}"
+      FB_MONITOR_DEPLOY_MAINTENANCE_FLAG: "${FB_MONITOR_DEPLOY_MAINTENANCE_FLAG:-/deploy-state/deploy-maintenance}"
     volumes:
       - ./config.yaml:/app/config.yaml
       - ./data:/data
       - ./browser-data:/browser-data
+      - "${FB_MONITOR_DEPLOY_STATE_DIR:-./deploy-state}:/deploy-state:ro"
     ports:
       - "${WEB_BIND_IP:-127.0.0.1}:8080:8080"
     init: true

@@ -112,6 +112,7 @@ def remove_profile_from_config(path: Path, url: str) -> bool:
 class Settings:
     config_path: Path
     data_dir: Path
+    deploy_maintenance_flag: Path
     timezone: str = "Asia/Taipei"
     visit_min_hours: float = 6
     visit_max_hours: float = 8
@@ -200,6 +201,14 @@ def load_settings(path: str | Path | None = None) -> Settings:
     data_dir = Path(os.getenv("FB_MONITOR_DATA_DIR", storage.get("data_dir", "data")))
     if not data_dir.is_absolute():
         data_dir = (config_path.parent / data_dir).resolve()
+    deploy_maintenance_flag = Path(
+        os.getenv(
+            "FB_MONITOR_DEPLOY_MAINTENANCE_FLAG",
+            str(data_dir / "deploy-maintenance"),
+        )
+    )
+    if not deploy_maintenance_flag.is_absolute():
+        deploy_maintenance_flag = (config_path.parent / deploy_maintenance_flag).resolve()
     profiles = [ProfileConfig(**item) for item in raw.get("profiles", [])]
     if len(profiles) > MAX_PROFILES:
         raise ValueError(f"profiles 最多只能設定 {MAX_PROFILES} 個")
@@ -220,6 +229,7 @@ def load_settings(path: str | Path | None = None) -> Settings:
     settings = Settings(
         config_path=config_path,
         data_dir=data_dir,
+        deploy_maintenance_flag=deploy_maintenance_flag,
         timezone=raw.get("timezone", "Asia/Taipei"),
         visit_min_hours=float(schedule.get("visit_min_hours", 6)),
         visit_max_hours=float(schedule.get("visit_max_hours", 8)),

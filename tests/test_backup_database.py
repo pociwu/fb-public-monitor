@@ -87,3 +87,27 @@ def test_corrupt_source_never_publishes_a_backup(tmp_path: Path):
 
     assert not list(output.glob("monitor-*.sqlite3"))
     assert not list(output.glob("*.tmp"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits model OCI ownership")
+def test_backup_writes_to_host_directory_when_application_data_is_read_only(
+    tmp_path: Path,
+):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    source = data_dir / "monitor.sqlite3"
+    create_database(source).close()
+    os.chmod(source, 0o444)
+    os.chmod(data_dir, 0o555)
+    output = tmp_path / "backups" / "deploy"
+
+    try:
+        target, removed = backup_database(source, output)
+    finally:
+        # pytest must be able to remove its temporary directory after the test.
+        os.chmod(data_dir, 0o755)
+
+    assert removed == []
+    assert target.parent == output.resolve()
+    assert target.is_file()
+    integrity_check(target)
