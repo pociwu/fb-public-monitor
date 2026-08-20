@@ -9,12 +9,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import httpx
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageChops, ImageOps, ImageStat, UnidentifiedImageError
 
 from .db import Database, utcnow
+from .normalize import normalize_url
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,32 @@ class MediaRef:
 
 MEDIA_WORDS = ("media", "image", "photo", "picture", "profilepic", "avatar", "cover", "video", "attachment", "playable")
 GENERIC_URL_KEYS = {"url", "uri", "source", "src", "link", "downloadurl", "sourceurl"}
+
+
+def media_representation_key(url: str | None) -> str:
+    """Identify a downloadable representation without rotating CDN tokens.
+
+    ``normalize_url`` intentionally maps every rendition of one Facebook CDN
+    object to the same asset.  Download readiness needs one finer level: a low
+    thumbnail cannot satisfy a high-resolution request.  Keep stable rendition
+    parameters (for example ``stp``/``ctp``/dimensions), while discarding
+    expiry and signature fields.
+    """
+    value = str(url or "")
+    if not value.startswith(("http://", "https://")):
+        return value
+    parts = urlsplit(value)
+    host = (parts.hostname or "").casefold()
+    if "fbcdn.net" not in host and not host.startswith("scontent-"):
+        return normalize_url(value)
+    stable_query = sorted(
+        (key, item)
+        for key, item in parse_qsl(parts.query, keep_blank_values=True)
+        if not key.casefold().startswith("_nc_")
+        and key.casefold() not in {"oh", "oe"}
+    )
+    suffix = urlencode(stable_query)
+    return f"facebook-cdn-representation:{parts.path}" + (f"?{suffix}" if suffix else "")
 
 
 def _role_for(path: list[str], kind: str) -> str:
@@ -100,9 +127,106 @@ class MediaStore:
             return None
         try:
             with Image.open(path) as image:
-                return image.size
+                return ImageOps.exif_transpose(image).size
         except (OSError, UnidentifiedImageError):
             return None
+
+    @classmethod
+    def image_quality(
+        cls,
+        path: str | Path | None,
+        mime: str | None,
+        size_bytes: int | None = None,
+    ) -> tuple[int, int, int]:
+        """Return a stable quality ordering led by effective pixel area."""
+        dimensions = cls.image_dimensions(path, mime)
+        if not dimensions:
+            return (0, 0, int(size_bytes or 0))
+        width, height = dimensions
+        return (width * height, max(width, height), int(size_bytes or 0))
+
+    @staticmethod
+    def images_visually_equivalent(
+        left: str | Path | None,
+        right: str | Path | None,
+        *,
+        max_mean_difference: float = 8.0,
+        max_rms_difference: float = 16.0,
+    ) -> bool:
+        """Confirm a perceptual-hash candidate before deleting either file.
+
+        Average hashes alone collide frequently (especially for blurred or
+        mostly solid thumbnails).  Compare EXIF-corrected RGB pixels at a
+        common size and require nearly identical aspect ratios as a second,
+        independent check.
+        """
+        if not left or not right:
+            return False
+        try:
+            with Image.open(left) as left_image, Image.open(right) as right_image:
+                left_image = ImageOps.exif_transpose(left_image).convert("RGB")
+                right_image = ImageOps.exif_transpose(right_image).convert("RGB")
+                left_ratio = left_image.width / max(1, left_image.height)
+                right_ratio = right_image.width / max(1, right_image.height)
+                if abs(left_ratio - right_ratio) / max(left_ratio, right_ratio, 0.001) > 0.01:
+                    return False
+                sample_size = (64, 64)
+                left_sample = left_image.resize(sample_size, Image.Resampling.LANCZOS)
+                right_sample = right_image.resize(sample_size, Image.Resampling.LANCZOS)
+                statistics = ImageStat.Stat(ImageChops.difference(left_sample, right_sample))
+                mean_difference = sum(statistics.mean) / len(statistics.mean)
+                rms_difference = sum(statistics.rms) / len(statistics.rms)
+                return (
+                    mean_difference <= max_mean_difference
+                    and rms_difference <= max_rms_difference
+                )
+        except (OSError, UnidentifiedImageError, ValueError):
+            return False
+
+    @classmethod
+    def image_records_equivalent(
+        cls,
+        left: dict[str, Any],
+        right: dict[str, Any],
+        *,
+        max_hash_distance: int = 2,
+    ) -> bool:
+        """Return true only for verified representations of one full image.
+
+        CDN object identity and aHash are candidate generators, never deletion
+        proof.  Both candidates still have to decode, keep the same aspect
+        ratio, and pass the EXIF-corrected RGB comparison.  This deliberately
+        rejects crops, blurred placeholders and near-hash collisions.
+        """
+        if cls.image_quality(
+            left.get("path"), left.get("mime_type"), left.get("size_bytes")
+        )[0] <= 0 or cls.image_quality(
+            right.get("path"), right.get("mime_type"), right.get("size_bytes")
+        )[0] <= 0:
+            return False
+
+        left_url = normalize_url(str(left.get("source_url") or ""))
+        right_url = normalize_url(str(right.get("source_url") or ""))
+        same_cdn_object = bool(
+            left_url
+            and left_url == right_url
+            and left_url.startswith("facebook-cdn:")
+        )
+        close_hash = False
+        left_hash = str(left.get("perceptual_hash") or "")
+        right_hash = str(right.get("perceptual_hash") or "")
+        try:
+            close_hash = bool(
+                left_hash
+                and right_hash
+                and (int(left_hash, 16) ^ int(right_hash, 16)).bit_count()
+                <= max_hash_distance
+            )
+        except ValueError:
+            close_hash = False
+        if not (same_cdn_object or close_hash):
+            return False
+        return cls.images_visually_equivalent(left.get("path"), right.get("path"))
 
     @staticmethod
     def perceptual_hash(path: Path, mime: str) -> str | None:
@@ -110,9 +234,10 @@ class MediaStore:
             return None
         try:
             with Image.open(path) as image:
-                image = image.convert("L").resize((8, 8))
-                average = sum(image.getdata()) / 64
-                bits = "".join("1" if value >= average else "0" for value in image.getdata())
+                image = ImageOps.exif_transpose(image).convert("L").resize((8, 8))
+                pixels = image.tobytes()
+                average = sum(pixels) / len(pixels)
+                bits = "".join("1" if value >= average else "0" for value in pixels)
                 return f"{int(bits, 2):016x}"
         except (OSError, UnidentifiedImageError):
             return None

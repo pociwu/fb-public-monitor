@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .db import Database, utcnow
-from .media import MediaRef, MediaStore, extract_media
+from .media import MediaRef, MediaStore, extract_media, media_representation_key
 from .normalize import content_hash, normalize_text, normalize_url, stable_projection
 from .timeutil import display_time, telegram_time
 
@@ -168,8 +168,7 @@ class Ingester:
         if not existing and dedupe_key:
             existing = self.db.row("SELECT * FROM entities WHERE profile_id=? AND kind='comment' AND dedupe_key=?", (profile_id, dedupe_key))
         if existing and existing["current_hash"] == digest:
-            if kind == "profile":
-                await self._upgrade_low_resolution_avatar(existing, media_refs)
+            await self._refresh_unchanged_media(existing, media_refs)
             self.db.execute("UPDATE entities SET notification_hash=COALESCE(notification_hash,?),last_seen_at=?,present=1,missing_successes=0 WHERE id=?", (digest, now, existing["id"]))
             return int(existing["id"]), ext_id, False
         notify_change = notify and not (existing and existing.get("notification_hash") is None)
@@ -219,37 +218,69 @@ class Ingester:
             )
         return entity_id, ext_id, True
 
-    async def _upgrade_low_resolution_avatar(self, entity: dict[str, Any], refs: list[MediaRef]) -> None:
+    async def _refresh_unchanged_media(
+        self,
+        entity: dict[str, Any],
+        refs: list[MediaRef],
+    ) -> None:
+        """Persist new representations even when entity metadata is unchanged.
+
+        Normalized Facebook CDN URLs intentionally omit rotating query
+        parameters, so a 24px and 720px URL do not create fake entity
+        versions.  They still must traverse the media pipeline: otherwise the
+        first thumbnail permanently masks a later high-resolution candidate.
+        """
         version_id = entity.get("current_version_id")
-        avatar = next(((position, ref) for position, ref in enumerate(refs) if ref.role == "profile_picture"), None)
-        if not version_id or not avatar:
+        if not version_id:
             return
-        current = self.db.row(
-            """SELECT m.* FROM media m JOIN entity_media em ON em.media_id=m.id
-            WHERE em.entity_id=? AND em.version_id=? AND em.role='profile_picture' AND m.status='ready'
-            ORDER BY COALESCE(m.size_bytes,0) DESC,m.id DESC LIMIT 1""",
-            (entity["id"], version_id),
-        )
-        current_size = self.media.image_dimensions(current.get("path"), current.get("mime_type")) if current else None
-        if current_size and min(current_size) >= 128:
-            return
-        position, ref = avatar
-        result = await self.media.download(ref.url)
-        if result.get("status") != "ready":
-            return
-        upgraded_size = self.media.image_dimensions(result.get("path"), result.get("mime_type"))
-        if not upgraded_size or (current_size and upgraded_size[0] * upgraded_size[1] <= current_size[0] * current_size[1]):
-            return
-        self._link_media(int(entity["id"]), int(version_id), result, ref.role, ref.json_path, position, None, None)
+        for position, ref in enumerate(refs):
+            representation_key = media_representation_key(ref.url)
+            exact_ready = self.db.row(
+                """SELECT m.id FROM media m
+                JOIN entity_media em ON em.media_id=m.id
+                LEFT JOIN media_aliases ma
+                  ON ma.media_id=m.id AND ma.alias_type='representation_url'
+                WHERE em.entity_id=? AND em.version_id=? AND em.role=?
+                  AND m.status='ready'
+                  AND (m.source_url=? OR ma.alias_value=?)
+                LIMIT 1""",
+                (
+                    entity["id"],
+                    version_id,
+                    ref.role,
+                    ref.url,
+                    representation_key,
+                ),
+            )
+            if exact_ready:
+                continue
+            result = await self.media.download(ref.url)
+            self._link_media(
+                int(entity["id"]),
+                int(version_id),
+                result,
+                ref.role,
+                ref.json_path,
+                position,
+                None,
+                None,
+            )
 
     def _link_media(self, entity_id: int, version_id: int, result: dict[str, Any], role: str, discovery_path: str, position: int, event_id: int | None, previous_version_id: int | None) -> None:
         now = utcnow()
         sha = result.get("sha256")
+        source_url = str(result.get("source_url") or "")
+        dimensions = self.media.image_dimensions(result.get("path"), result.get("mime_type"))
+        width, height = dimensions if dimensions else (None, None)
         with self.db.connect() as conn:
             if sha:
                 conn.execute(
                     """INSERT INTO media(sha256,source_url,mime_type,size_bytes,path,perceptual_hash,status,first_seen_at,last_attempt_at,retry_until,error)
-                    VALUES(?,?,?,?,?,?,'ready',?,?,NULL,NULL) ON CONFLICT(sha256) DO UPDATE SET status='ready',path=excluded.path,perceptual_hash=COALESCE(excluded.perceptual_hash,media.perceptual_hash)""",
+                    VALUES(?,?,?,?,?,?,'ready',?,?,NULL,NULL) ON CONFLICT(sha256) DO UPDATE SET
+                    source_url=excluded.source_url,mime_type=COALESCE(excluded.mime_type,media.mime_type),
+                    size_bytes=COALESCE(excluded.size_bytes,media.size_bytes),status='ready',path=excluded.path,
+                    perceptual_hash=COALESCE(excluded.perceptual_hash,media.perceptual_hash),
+                    last_attempt_at=excluded.last_attempt_at,retry_until=NULL,error=NULL""",
                     (sha, result["source_url"], result.get("mime_type"), result.get("size_bytes"), result.get("path"), result.get("perceptual_hash"), now, now),
                 )
                 media_id = conn.execute("SELECT id FROM media WHERE sha256=?", (sha,)).fetchone()[0]
@@ -267,6 +298,43 @@ class Ingester:
                 discovery_path=excluded.discovery_path,position=COALESCE(entity_media.position,excluded.position)""",
                 (entity_id, version_id, media_id, role, discovery_path, position),
             )
+            profile_row = conn.execute(
+                "SELECT profile_id FROM entities WHERE id=?",
+                (entity_id,),
+            ).fetchone()
+            if profile_row and source_url:
+                representation_key = media_representation_key(source_url)
+                conn.execute(
+                    """INSERT INTO media_aliases(
+                    profile_id,entity_id,media_id,canonical_media_id,provider,
+                    alias_type,alias_value,source_url,width,height,mime_type,sha256,
+                    first_seen_at,last_seen_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(profile_id,alias_type,alias_value) DO UPDATE SET
+                      entity_id=excluded.entity_id,media_id=excluded.media_id,
+                      canonical_media_id=excluded.canonical_media_id,
+                      source_url=excluded.source_url,width=COALESCE(excluded.width,media_aliases.width),
+                      height=COALESCE(excluded.height,media_aliases.height),
+                      mime_type=COALESCE(excluded.mime_type,media_aliases.mime_type),
+                      sha256=COALESCE(excluded.sha256,media_aliases.sha256),
+                      last_seen_at=excluded.last_seen_at""",
+                    (
+                        profile_row["profile_id"],
+                        entity_id,
+                        media_id,
+                        normalize_url(source_url) or str(sha or media_id),
+                        "ingest",
+                        "representation_url",
+                        representation_key,
+                        source_url,
+                        width,
+                        height,
+                        result.get("mime_type"),
+                        sha,
+                        now,
+                        now,
+                    ),
+                )
             previous_shas: set[str] = set()
             if previous_version_id:
                 previous_shas = {row[0] for row in conn.execute("SELECT m.sha256 FROM media m JOIN entity_media em ON em.media_id=m.id WHERE em.version_id=?", (previous_version_id,)).fetchall()}
@@ -278,8 +346,316 @@ class Ingester:
                     (event_id, "media", payload, now, now),
                 )
 
-        if event_id and result.get("status") == "ready" and sha:
-            self.db.bind_media_notification(event_id, str(sha), result.get("perceptual_hash"))
+        notification_sha = str(sha or "")
+        if result.get("status") == "ready" and sha and str(result.get("mime_type") or "").startswith("image/"):
+            winner = self._keep_highest_resolution(entity_id, version_id, role, int(media_id))
+            if winner:
+                notification_sha = str(winner.get("sha256") or notification_sha)
+
+        if event_id and result.get("status") == "ready" and notification_sha:
+            # Storage equivalence has already been confirmed using CDN identity
+            # or pHash plus RGB pixels.  Notification de-duplication therefore
+            # uses the selected file SHA only; forwarding an unverified aHash
+            # would let two different, mostly-solid images cancel each other.
+            self.db.bind_media_notification(event_id, notification_sha, None)
+
+    def _keep_highest_resolution(
+        self,
+        entity_id: int,
+        version_id: int,
+        role: str,
+        linked_media_id: int,
+    ) -> dict[str, Any] | None:
+        """Collapse verified representations and retain only the best file.
+
+        Matching CDN object paths and aHash matches are only candidates.  The
+        shared media verifier also requires matching aspect ratio and RGB
+        content, preventing crops, placeholders or collisions from deleting an
+        unrelated image.
+        """
+        rows = self.db.rows(
+            """SELECT DISTINCT m.* FROM media m JOIN entity_media em ON em.media_id=m.id
+            WHERE em.entity_id=? AND em.role=?
+              AND m.status='ready' AND m.mime_type LIKE 'image/%'
+            ORDER BY m.id""",
+            (entity_id, role),
+        )
+        if not rows:
+            return None
+
+        groups: list[list[dict[str, Any]]] = []
+        for row in rows:
+            placed = False
+            for group in groups:
+                representative = group[0]
+                if self.media.image_records_equivalent(row, representative):
+                    group.append(row)
+                    placed = True
+                    break
+            if not placed:
+                groups.append([row])
+
+        selected = next(
+            (row for row in rows if int(row["id"]) == linked_media_id),
+            None,
+        )
+        replacements: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for group in groups:
+            winner = max(
+                group,
+                key=lambda item: (
+                    *self.media.image_quality(
+                        item.get("path"), item.get("mime_type"), item.get("size_bytes")
+                    ),
+                    -int(item["id"]),
+                ),
+            )
+            # A row marked ready can still contain a truncated or corrupt file.
+            # Never remove other representations unless a real image supplies
+            # the winning effective pixel count.
+            if self.media.image_quality(
+                winner.get("path"), winner.get("mime_type"), winner.get("size_bytes")
+            )[0] <= 0:
+                continue
+            if any(int(item["id"]) == linked_media_id for item in group):
+                selected = winner
+            for loser in group:
+                if int(loser["id"]) != int(winner["id"]):
+                    replacements.append((loser, winner))
+        if replacements:
+            self._replace_media_representations(replacements)
+        return selected
+
+    def _replace_media_representation(
+        self,
+        loser: dict[str, Any],
+        winner: dict[str, Any],
+    ) -> None:
+        self._replace_media_representations([(loser, winner)])
+
+    def consolidate_media_representations(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        actual_sha256: dict[int, str] | None = None,
+    ) -> int:
+        """Safely merge retained media and return the number of removed rows.
+
+        Exact file bytes are conclusive for every MIME type.  Image similarity
+        is only accepted through ``MediaStore.image_records_equivalent``.  The
+        winner is chosen by decoded pixel quality, and all database references
+        are redirected in one transaction by ``_replace_media_representations``.
+        """
+        actual = actual_sha256 or {}
+        groups: list[list[dict[str, Any]]] = []
+        for row in rows:
+            row_id = int(row["id"])
+            row_actual = str(actual.get(row_id) or "")
+            placed = False
+            for group in groups:
+                representative = group[0]
+                representative_actual = str(actual.get(int(representative["id"])) or "")
+                exact_bytes = bool(row_actual and row_actual == representative_actual)
+                if exact_bytes or self.media.image_records_equivalent(row, representative):
+                    group.append(row)
+                    placed = True
+                    break
+            if not placed:
+                groups.append([row])
+
+        replacements: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for group in groups:
+            if len(group) < 2:
+                continue
+            common_actual = str(actual.get(int(group[0]["id"])) or "")
+            exact_group = bool(
+                common_actual
+                and all(
+                    str(actual.get(int(item["id"])) or "") == common_actual
+                    for item in group
+                )
+            )
+            winner = max(
+                group,
+                key=lambda item: (
+                    int(exact_group and str(item.get("sha256") or "") == common_actual),
+                    *self.media.image_quality(
+                        item.get("path"), item.get("mime_type"), item.get("size_bytes")
+                    ),
+                    -int(item["id"]),
+                ),
+            )
+            for loser in group:
+                if int(loser["id"]) != int(winner["id"]):
+                    replacements.append((loser, winner))
+        if replacements:
+            self._replace_media_representations(replacements)
+        return len({int(loser["id"]) for loser, _winner in replacements})
+
+    def _replace_media_representations(
+        self,
+        replacements: list[tuple[dict[str, Any], dict[str, Any]]],
+    ) -> None:
+        """Atomically redirect every DB reference, then remove orphan files."""
+        unique: dict[int, tuple[dict[str, Any], dict[str, Any]]] = {}
+        for loser, winner in replacements:
+            loser_id = int(loser["id"])
+            winner_id = int(winner["id"])
+            if loser_id != winner_id:
+                unique[loser_id] = (loser, winner)
+        if not unique:
+            return
+
+        cleanup: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        with self.db.connect() as conn:
+            for loser, winner in unique.values():
+                loser_id = int(loser["id"])
+                winner_id = int(winner["id"])
+                links = conn.execute(
+                    """SELECT entity_id,version_id,role,discovery_path,position
+                    FROM entity_media WHERE media_id=?""",
+                    (loser_id,),
+                ).fetchall()
+                for link in links:
+                    conn.execute(
+                        """INSERT INTO entity_media(
+                        entity_id,version_id,media_id,role,discovery_path,position
+                        ) VALUES(?,?,?,?,?,?)
+                        ON CONFLICT(entity_id,version_id,media_id) DO UPDATE SET
+                          role=COALESCE(entity_media.role,excluded.role),
+                          discovery_path=COALESCE(entity_media.discovery_path,excluded.discovery_path),
+                          position=CASE
+                            WHEN entity_media.position IS NULL THEN excluded.position
+                            WHEN excluded.position IS NULL THEN entity_media.position
+                            ELSE MIN(entity_media.position,excluded.position)
+                          END""",
+                        (
+                            link["entity_id"],
+                            link["version_id"],
+                            winner_id,
+                            link["role"],
+                            link["discovery_path"],
+                            link["position"],
+                        ),
+                    )
+                conn.execute("DELETE FROM entity_media WHERE media_id=?", (loser_id,))
+
+                dimensions = self.media.image_dimensions(
+                    winner.get("path"),
+                    winner.get("mime_type"),
+                )
+                width, height = dimensions if dimensions else (None, None)
+                conn.execute(
+                    """UPDATE media_aliases SET
+                    media_id=?,sha256=?,mime_type=COALESCE(?,mime_type),
+                    width=COALESCE(?,width),height=COALESCE(?,height)
+                    WHERE media_id=?""",
+                    (
+                        winner_id,
+                        winner.get("sha256"),
+                        winner.get("mime_type"),
+                        width,
+                        height,
+                        loser_id,
+                    ),
+                )
+
+                conn.execute(
+                    """UPDATE outbox SET media_sha256=?,media_perceptual_hash=?
+                    WHERE media_sha256=? AND status='pending' AND kind='media'""",
+                    (
+                        winner.get("sha256"),
+                        winner.get("perceptual_hash"),
+                        loser.get("sha256"),
+                    ),
+                )
+                for outbox in conn.execute(
+                    """SELECT id,event_id,payload_json FROM outbox
+                    WHERE status='pending' AND kind='media'"""
+                ).fetchall():
+                    try:
+                        payload = json.loads(outbox["payload_json"] or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    if str(payload.get("path") or "") != str(loser.get("path") or ""):
+                        continue
+                    payload["path"] = winner.get("path")
+                    payload["mime_type"] = winner.get("mime_type") or payload.get("mime_type")
+                    if "sha256" in payload:
+                        payload["sha256"] = winner.get("sha256")
+                    serialized = json.dumps(payload, ensure_ascii=False)
+                    duplicate = conn.execute(
+                        """SELECT id,status FROM outbox
+                        WHERE event_id IS ? AND kind='media' AND payload_json=? AND id<>?
+                        ORDER BY id LIMIT 1""",
+                        (outbox["event_id"], serialized, outbox["id"]),
+                    ).fetchone()
+                    if duplicate:
+                        # UNIQUE(event_id,kind,payload_json) spans every status.
+                        # Once two rows resolve to one winner, retain only the
+                        # oldest delivery record so the transaction can publish
+                        # one correct pending path without a constraint race.
+                        discard_id = (
+                            int(outbox["id"])
+                            if duplicate["status"] != "pending"
+                            else max(int(outbox["id"]), int(duplicate["id"]))
+                        )
+                        conn.execute("DELETE FROM outbox WHERE id=?", (discard_id,))
+                        if discard_id == int(outbox["id"]):
+                            continue
+                    conn.execute(
+                        "UPDATE outbox SET payload_json=? WHERE id=?",
+                        (serialized, outbox["id"]),
+                    )
+
+                remaining_links = conn.execute(
+                    """SELECT
+                    EXISTS(SELECT 1 FROM entity_media WHERE media_id=?) OR
+                    EXISTS(SELECT 1 FROM media_aliases WHERE media_id=?)""",
+                    (loser_id, loser_id),
+                ).fetchone()[0]
+                if remaining_links:
+                    raise RuntimeError(f"低解析度媒體仍被引用：{loser_id}")
+                conn.execute("DELETE FROM media WHERE id=?", (loser_id,))
+                cleanup.append((loser, winner))
+
+        for loser, winner in cleanup:
+            self._remove_unreferenced_media_files(loser, winner)
+
+    def _remove_unreferenced_media_files(
+        self,
+        loser: dict[str, Any],
+        winner: dict[str, Any],
+    ) -> None:
+        loser_id = int(loser["id"])
+        if self.db.row("SELECT id FROM media WHERE id=?", (loser_id,)):
+            return
+        loser_path = Path(str(loser.get("path") or ""))
+        winner_path = Path(str(winner.get("path") or ""))
+        inside_media_root = False
+        try:
+            media_root = self.media.root.resolve()
+            resolved = loser_path.resolve()
+            inside_media_root = (
+                resolved != winner_path.resolve()
+                and resolved != media_root
+                and media_root in resolved.parents
+            )
+            if inside_media_root and loser_path.is_file():
+                loser_path.unlink()
+        except OSError:
+            pass
+        loser_sha = str(loser.get("sha256") or "")
+        thumbnail_root = self.media.root.parent / "cache" / "thumbnails"
+        if inside_media_root and loser_sha and thumbnail_root.is_dir():
+            resolved_thumbnail_root = thumbnail_root.resolve()
+            for thumbnail in thumbnail_root.glob(f"{loser_sha}-*.webp"):
+                try:
+                    resolved_thumbnail = thumbnail.resolve()
+                    if resolved_thumbnail_root in resolved_thumbnail.parents:
+                        thumbnail.unlink()
+                except OSError:
+                    pass
 
     async def reprocess_existing(self) -> dict[str, int]:
         """Re-read retained raw versions without creating history or item notifications."""

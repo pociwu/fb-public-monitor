@@ -1,0 +1,78 @@
+{% extends "base.html" %}{% block title %}Capture V2 狀態 · FB Monitor{% endblock %}
+{% block content %}
+<section class="profile-titlebar">
+  <div><a href="/">← 返回儀表板</a><h1>Capture V2 狀態</h1><p class="muted">付費回溯、游標與原始資料的可稽核狀態；本頁的操作只排工作，不會直接呼叫 Actor。</p></div>
+  {% if selected_profile %}<a class="button secondary" href="/capture-v2">顯示全部帳號</a>{% endif %}
+</section>
+{% if notice %}<p class="notice success">{{ notice }}</p>{% endif %}
+{% if error %}<p class="notice error">{{ error }}</p>{% endif %}
+
+<section class="stats">
+  <article><span>Capture V2</span><strong>{{ '已啟用' if enabled else '未啟用' }}</strong><small>功能開關</small></article>
+  <article><span>V1 付費回溯</span><strong>{{ '仍啟用' if v1_backfill_enabled else '安全停用' }}</strong><small>進行中 {{ v1_jobs.active or 0 }} · 已暫停 {{ v1_jobs.paused or 0 }}</small></article>
+  <article><span>貼文游標契約</span><strong>{{ contracts|selectattr('valid')|list|length }} / {{ contracts|length }}</strong><small>只驗證 posts cursor，不代表媒體完整</small></article>
+  <article><span>顯示範圍</span><strong>{{ selected_profile.display_name or selected_profile.name if selected_profile else '全部' }}</strong><small>{{ coverage|length }} 個 coverage · {{ batches|length }} 個付費批次</small></article>
+</section>
+
+<section class="panel">
+  <div class="panel-heading"><div><h2>候選 Actor 貼文游標契約</h2><small>只有狀態 passed，且指紋和當前輸入 mapping 完全一致，才能開始付費貼文續抓。本契約只驗證兩頁各 10 篇的游標前進、重播與 knownPostIds 邊界；不證明相簿、影片、公開照片頁或留言已完整。</small></div></div>
+  <div class="capture-contract-grid">
+  {% for contract in contracts %}
+    <article class="capture-contract">
+      <div class="panel-heading"><strong>{{ contract.role }} Actor</strong><span class="badge {{ 'passed' if contract.valid else contract.status }}">{% if contract.valid %}已通過{% elif contract.status == 'passed' %}指紋已失效{% else %}{{ contract.status }}{% endif %}</span></div>
+      <p class="break-all">{{ contract.actor_id }}</p>
+      <small>儲存狀態：{{ contract.status }}{% if contract.latest_run_status %} · 最後測試：{{ contract.latest_run_status }}{% endif %}<br>指紋：<span class="break-all capture-fingerprint">{{ contract.fingerprint }}</span><br>當前預期：<span class="break-all capture-fingerprint">{{ contract.expected_fingerprint }}</span>{% if contract.updated_at %}<br>更新：{{ contract.updated_display }}{% endif %}{% if contract.latest_run_error %}<br>錯誤：{{ contract.latest_run_error }}{% endif %}</small>
+    </article>
+  {% else %}<p class="empty">未設定候選 Actor。</p>{% endfor %}
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-heading"><div><h2>契約測試 grant</h2><small>一次明確核准建立一輪全域共用上限 ${{ "%.2f"|format(contract_budget) }}；不會對每個帳號或候選 Actor 各自重複核准。主要 Actor 失敗後，備援只能使用同輪剩餘，或先結束本輪再明確核准新輪。</small></div></div>
+  {% if contract_grant %}
+  <div class="capture-kv">
+    <span>Grant #{{ contract_grant.id }}</span><span class="badge {{ contract_grant.status }}">{{ contract_grant.status }}</span>
+    <span>上限 ${{ "%.4f"|format(contract_grant.max_usd or 0) }}</span>
+    <span>已計費 ${{ "%.4f"|format(contract_grant.spent_usd or 0) }}</span>
+    <span>保留／模糊 ${{ "%.4f"|format(contract_grant.reserved_usd or 0) }}</span>
+    <span>剩餘 ${{ "%.4f"|format(contract_grant.remaining_usd or 0) }}</span>
+    <span>到期 {{ contract_grant.expires_at_display }}</span>
+  </div>
+  {% if contract_grant.allocations %}<details class="capture-evidence"><summary>本輪分配紀錄</summary><ul>{% for allocation in contract_grant.allocations %}<li>{{ allocation.actor_id }} · {{ allocation.job_status or '無工作' }} · 核准 ${{ "%.4f"|format(allocation.authorized_usd or 0) }} · 已計費 ${{ "%.4f"|format(allocation.spent_usd or 0) }} · 保留 ${{ "%.4f"|format(allocation.reserved_usd or 0) }}</li>{% endfor %}</ul></details>{% endif %}
+  {% else %}<p class="muted">尚無契約測試 grant。未核准前不會排入付費 Actor。</p>{% endif %}
+  <div class="capture-actions">
+    <form method="post" action="/capture-v2/contract-grants" onsubmit="return confirm('核准一輪全域共用的貼文游標契約測試？總上限 ${{ '%.2f'|format(contract_budget) }}。')"><button class="button" type="submit"{% if not enabled or contract_grant and contract_grant.status == 'active' or contracts|selectattr('valid')|list %} disabled{% endif %}>核准新一輪 ${{ "%.2f"|format(contract_budget) }}</button></form>
+    {% if contract_grant and contract_grant.status == 'active' %}<form method="post" action="/capture-v2/contract-grants/{{ contract_grant.id }}/close" onsubmit="return confirm('結束本輪未使用的餘額？如有模糊付費 run 將拒絕結束。')"><button class="button secondary" type="submit">結束本輪</button></form>{% endif %}
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-heading"><div><h2>帳號操作</h2><small>只有已經匿名、身分一致確認公開的 fixture 可執行契約測試。操作人還必須確認該 fixture 預期至少有 25 篇歷史公開貼文；實際 contract 仍只驗證前 20 篇和一次邊界呼叫。</small></div></div>
+  <div class="queue-table"><table><thead><tr><th>帳號</th><th>Apify</th><th>契約測試</th><th>續抓</th></tr></thead><tbody>
+  {% for profile in profiles %}
+    <tr><td><a href="/capture-v2?profile_id={{ profile.id }}">{{ profile.display_name or profile.name }}</a><br><small class="break-all">{{ profile.url }}</small><br><small>{{ profile.contract_eligibility_reason }}</small></td><td><span class="badge {{ 'failed' if profile.apify_frozen else 'ok' }}">{{ '已凍結' if profile.apify_frozen else '可用' }}</span></td><td><div class="capture-actions">{% for contract in contracts %}<form method="post" action="/profiles/{{ profile.id }}/capture-v2/contract-test" onsubmit="return confirm('執行 {{ contract.role }} Actor 貼文游標契約測試？會使用本輪 grant 剩餘額度。')"><input type="hidden" name="actor_id" value="{{ contract.actor_id }}"><label><input type="checkbox" name="fixture_ack" value="1" required> 已確認預期有 25+ 篇公開貼文</label><button class="button secondary" type="submit"{% if not enabled or not profile.contract_eligible or not contract_grant or contract_grant.status != 'active' or contracts|selectattr('valid')|list %} disabled{% endif %}>{{ contract.role }}測試</button></form>{% endfor %}</div></td><td><form method="post" action="/profiles/{{ profile.id }}/capture-v2/continue" onsubmit="return confirm('建立或重用此帳號的 Capture V2 epoch，並排入貼文續抓？')"><button class="button" type="submit"{% if not enabled or profile.apify_frozen or not contracts|selectattr('valid')|list %} disabled{% endif %}>繼續回溯</button></form></td></tr>
+  {% else %}<tr><td colspan="4" class="muted">沒有啟用中的帳號。</td></tr>{% endfor %}
+  </tbody></table></div>
+</section>
+
+<section class="panel">
+  <h2>特別帳號 epoch</h2>
+  {% if special_profile %}<p><strong>{{ special_profile.display_name or special_profile.name }}</strong> <span class="break-all">{{ special_profile.url }}</span></p>{% if special_epoch %}<div class="capture-kv"><span>Epoch #{{ special_epoch.id }}</span><span class="badge {{ special_epoch.status }}">{{ special_epoch.status }}</span><span>{{ '進行中' if special_epoch.is_active else '已結束' }}</span><span>觸發：{{ special_epoch.trigger_reason }}</span><span>預留：${{ "%.2f"|format(special_epoch.reserved_budget_usd or 0) }}</span><span>更新：{{ special_epoch.updated_at_display }}</span></div>{% else %}<p class="muted">尚未建立 Capture V2 epoch。</p>{% endif %}{% else %}<p class="muted">設定的特別帳號尚未在監控名單中。</p>{% endif %}
+</section>
+
+<section class="panel">
+  <h2>Coverage streams</h2>
+  <div class="queue-table capture-table"><table><thead><tr><th>帳號 / Epoch</th><th>範圍</th><th>狀態</th><th>游標</th><th>結果計數</th><th>更新</th></tr></thead><tbody>
+  {% for item in coverage %}<tr><td><a href="/profiles/{{ item.profile_id }}">{{ item.profile_name }}</a><br><small>Epoch #{{ item.epoch_id }} · {{ item.epoch_status }}{% if item.is_active %} · active{% endif %}</small></td><td>{{ item.stream }} / {{ item.surface }}<br><small>{{ item.scope_type }}{% if item.scope_id %}：{{ item.scope_id }}{% endif %}{% if item.provider %}<br>{{ item.provider }}{% endif %}{% if item.contract_actor_id %}<br>{{ item.contract_actor_id }}{% endif %}</small></td><td><span class="badge {{ item.status }}">{{ item.status }}</span>{% if item.limited_reason %}<br><small>{{ item.limited_reason }}</small>{% endif %}{% if item.terminal_evidence %}<details class="capture-evidence"><summary>終點證據</summary><pre>{{ item.terminal_evidence_json }}</pre></details>{% endif %}</td><td><small>輸入：<span class="break-all">{{ item.input_cursor or '—' }}</span><br>輸出：<span class="break-all">{{ item.output_cursor or '—' }}</span><br>low：{{ item.low_watermark or '—' }}<br>high：{{ item.high_watermark or '—' }}</small></td><td>已見 {{ item.seen_count }}<br><small>新增 {{ item.new_count }} · 更新 {{ item.updated_count }} · 重複 {{ item.duplicate_count }}</small></td><td>{{ item.updated_at_display }}{% if item.next_job_at %}<br><small>下次：{{ item.next_job_at_display }}</small>{% endif %}</td></tr>
+  {% else %}<tr><td colspan="6" class="muted">尚無 coverage 記錄。</td></tr>{% endfor %}
+  </tbody></table></div>
+</section>
+
+<section class="panel">
+  <h2>付費來源批次</h2>
+  <div class="queue-table capture-table"><table><thead><tr><th>批次 / 帳號</th><th>Actor / 狀態</th><th>游標</th><th>回傳</th><th>費用</th><th>Raw / 錯誤</th></tr></thead><tbody>
+  {% for batch in batches %}<tr><td>#{{ batch.id }} · {{ batch.profile_name }}<br><small>{{ batch.stream }} / {{ batch.surface }}<br>{{ batch.updated_at_display }}</small></td><td><span class="badge {{ batch.status }}">{{ batch.status }}</span><br><small class="break-all">{{ batch.actor_id }}</small>{% if batch.run_id %}<br><small>run：{{ batch.run_id }}</small>{% endif %}{% if batch.dataset_id %}<br><small>dataset：{{ batch.dataset_id }}</small>{% endif %}</td><td><small>輸入：<span class="break-all">{{ batch.input_cursor or '—' }}</span><br>輸出：<span class="break-all">{{ batch.output_cursor or '—' }}</span></small></td><td>raw {{ batch.raw_result_count }} / parsed {{ batch.parsed_result_count }}<br><small>新增 {{ batch.new_result_count }} · 更新 {{ batch.updated_result_count }} · 重複 {{ batch.duplicate_result_count }}</small></td><td>${{ "%.4f"|format(batch.charged_usd or 0) }}</td><td>{% if batch.raw_path %}<small class="break-all">{{ batch.raw_path }}</small>{% else %}<span class="muted">尚無 raw</span>{% endif %}{% if batch.raw_sha256 %}<br><small>SHA-256：<span class="break-all capture-fingerprint">{{ batch.raw_sha256 }}</span></small>{% endif %}{% if batch.error %}<br><span class="capture-error">{{ batch.error }}</span>{% endif %}</td></tr>
+  {% else %}<tr><td colspan="6" class="muted">尚無付費批次。</td></tr>{% endfor %}
+  </tbody></table></div>
+</section>
+{% endblock %}

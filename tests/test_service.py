@@ -50,8 +50,20 @@ schedule:
         encoding="utf-8",
     )
     monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("APIFY_V1_BACKFILL_ENABLED", "1")
     service = MonitorService(load_settings(config))
     await allow_official_usage(service)
+    # This legacy V1 test starts from an already-confirmed public profile.
+    # General profile providers no longer promote an account to public.
+    await service.ingester.ingest(
+        1,
+        "profile",
+        {"id": "100", "name": "Watched", "url": "https://facebook.com/100"},
+        notify=False,
+    )
+    service.db.execute(
+        "UPDATE profiles SET public_state='public',fb_id='100',serp_last_checked_at='2999-01-01T00:00:00+00:00' WHERE id=1"
+    )
     post_limits: list[int] = []
 
     async def fake_call(actor_id, payload, max_charge_usd=None):
@@ -100,8 +112,10 @@ actors:
         encoding="utf-8",
     )
     monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("APIFY_V1_BACKFILL_ENABLED", "1")
     service = MonitorService(load_settings(config))
     await allow_official_usage(service)
+    service.db.execute("UPDATE profiles SET public_state='public' WHERE id=1")
     calls = []
 
     async def fake_call(actor_id, payload, max_charge_usd=None):
@@ -138,8 +152,10 @@ schedule:
         encoding="utf-8",
     )
     monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("APIFY_V1_BACKFILL_ENABLED", "1")
     service = MonitorService(load_settings(config))
     await allow_official_usage(service)
+    service.db.execute("UPDATE profiles SET public_state='public' WHERE id=1")
 
     async def fake_call(actor_id, payload, max_charge_usd=None):
         if "pages-scraper" in actor_id:
@@ -174,6 +190,7 @@ browser_canary:
         encoding="utf-8",
     )
     monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("APIFY_V1_BACKFILL_ENABLED", "1")
     monkeypatch.setenv("FACEBOOK_BROWSER_ENABLED", "1")
     service = MonitorService(load_settings(config))
     await service.ingester.ingest(
@@ -207,11 +224,15 @@ browser_canary:
     await service.visit_profile(1)
 
     assert {row["external_id"] for row in service.db.rows("SELECT external_id FROM entities WHERE kind='post'")} == {
-        "old", "api-post", "browser-post",
+        "old", "api-post",
     }
     assert reconciled == []
     assert service.db.row("SELECT browser_canary_last_attempt_at FROM profiles WHERE id=1")["browser_canary_last_attempt_at"]
     assert service.db.row("SELECT COUNT(*) count FROM events WHERE event_type='browser_canary'")["count"] == 1
+    assert service.db.row("SELECT COUNT(*) count FROM events WHERE event_type='browser_post_unlisted'")["count"] == 1
+    assert service.db.row(
+        "SELECT notification_group_id FROM events WHERE event_type='browser_post_unlisted'"
+    )["notification_group_id"] is None
 
 
 @pytest.mark.asyncio
@@ -234,13 +255,75 @@ async def test_browser_canary_matches_post_permalink_alias_to_existing_entity(tm
         1,
         [{
             "source_url": "https://facebook.com/permalink.php?story_fbid=pfbid123&id=100",
-            "text": "same",
+            "text": "enriched by logged browser",
             "ingest_source": "facebook_browser_canary",
         }],
         notify=False,
     )
 
     assert service.db.row("SELECT COUNT(*) count FROM entities WHERE profile_id=1 AND kind='post'")["count"] == 1
+    normalized = json.loads(service.db.row(
+        """SELECT v.normalized_json FROM entities e
+        JOIN versions v ON v.id=e.current_version_id
+        WHERE e.profile_id=1 AND e.kind='post'"""
+    )["normalized_json"])
+    assert normalized["text"] == "enriched by logged browser"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("public_state", ["unknown", "private", "public"])
+async def test_logged_browser_never_adds_unlisted_posts_to_public_inventory(
+    tmp_path: Path,
+    monkeypatch,
+    public_state: str,
+):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    service = MonitorService(load_settings(config))
+    service.db.execute(
+        "UPDATE profiles SET public_state=? WHERE id=1",
+        (public_state,),
+    )
+
+    result = await service._ingest_browser_canary_posts(
+        1,
+        [{
+            "source_post_id": "logged-only",
+            "source_url": "https://facebook.com/100/posts/logged-only",
+            "text": "visible only in the logged-in session",
+            "ingest_source": "facebook_browser_canary",
+        }],
+        notify=True,
+    )
+    repeated = await service._ingest_browser_canary_posts(
+        1,
+        [{
+            "source_post_id": "logged-only",
+            "source_url": "https://facebook.com/100/posts/logged-only",
+            "text": "visible only in the logged-in session",
+            "ingest_source": "facebook_browser_canary",
+        }],
+        notify=True,
+    )
+
+    assert result == {"enriched": 0, "skipped_unlisted": 1}
+    assert repeated == result
+    assert service.db.row(
+        "SELECT COUNT(*) count FROM entities WHERE profile_id=1 AND kind='post'"
+    )["count"] == 0
+    diagnostic = service.db.row(
+        "SELECT * FROM events WHERE profile_id=1 AND event_type='browser_post_unlisted'"
+    )
+    assert diagnostic is not None
+    assert service.db.row(
+        "SELECT COUNT(*) count FROM events WHERE profile_id=1 AND event_type='browser_post_unlisted'"
+    )["count"] == 1
+    assert diagnostic["notification_group_id"] is None
+    assert service.db.row("SELECT COUNT(*) count FROM notification_groups")["count"] == 0
 
 
 @pytest.mark.asyncio
@@ -253,6 +336,16 @@ async def test_manual_browser_visit_updates_profile_and_canary_posts(tmp_path: P
     monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
     monkeypatch.setenv("FACEBOOK_BROWSER_ENABLED", "1")
     service = MonitorService(load_settings(config))
+    await service.ingester.ingest(
+        1,
+        "post",
+        {
+            "postId": "p1",
+            "source_url": "https://facebook.com/100/posts/p1",
+            "text": "enumerated by public source",
+        },
+        notify=False,
+    )
 
     async def fake_profile(url, diagnostic_key=None):
         return {"name": "Browser Name", "profile_data_source": "Facebook 直接瀏覽器"}
@@ -260,7 +353,7 @@ async def test_manual_browser_visit_updates_profile_and_canary_posts(tmp_path: P
     async def fake_posts(url, diagnostic_key=None, cursor=None):
         assert cursor is None
         return {
-            "posts": [{"source_post_id": "p1", "source_url": "https://facebook.com/100/posts/p1", "text": "post"}],
+            "posts": [{"source_post_id": "p1", "source_url": "https://facebook.com/100/posts/p1", "text": "enriched by browser"}],
             "next_cursor": "p1",
             "completed": False,
         }
@@ -274,6 +367,12 @@ async def test_manual_browser_visit_updates_profile_and_canary_posts(tmp_path: P
     assert profile["browser_post_cursor"] == "p1"
     assert profile["browser_post_backfill_done"] == 0
     assert service.db.row("SELECT COUNT(*) count FROM entities WHERE profile_id=1 AND kind='post'")["count"] == 1
+    normalized = json.loads(service.db.row(
+        """SELECT v.normalized_json FROM entities e
+        JOIN versions v ON v.id=e.current_version_id
+        WHERE e.profile_id=1 AND e.kind='post'"""
+    )["normalized_json"])
+    assert normalized["text"] == "enriched by browser"
     assert service.db.row("SELECT COUNT(*) count FROM events WHERE event_type='browser_manual_visit'")["count"] == 1
 
 
@@ -368,6 +467,7 @@ async def test_visit_with_incomplete_backfill_queues_backfill_without_regular_pr
         encoding="utf-8",
     )
     monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("APIFY_V1_BACKFILL_ENABLED", "1")
     service = MonitorService(load_settings(config))
     await service.ingester.ingest(
         1,
@@ -403,6 +503,7 @@ def test_latest_only_completed_profile_is_requeued_for_backfill(tmp_path: Path, 
         encoding="utf-8",
     )
     monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("APIFY_V1_BACKFILL_ENABLED", "1")
     service = MonitorService(load_settings(config))
     service.db.execute(
         """INSERT INTO entities(
@@ -423,6 +524,27 @@ def test_latest_only_completed_profile_is_requeued_for_backfill(tmp_path: Path, 
     assert service.db.row(
         "SELECT COUNT(*) count FROM jobs WHERE profile_id=1 AND job_type='backfill' AND status='pending'"
     )["count"] == 1
+
+
+def test_latest_only_v1_repair_is_inert_when_legacy_backfill_is_disabled(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.delenv("APIFY_V1_BACKFILL_ENABLED", raising=False)
+    service = MonitorService(load_settings(config))
+    service.db.execute(
+        "UPDATE profiles SET public_state='public',backfill_done=1,last_full_audit_at=? WHERE id=1",
+        (datetime.now(UTC).isoformat(),),
+    )
+    service.db.execute("DELETE FROM jobs")
+
+    service._seed_latest_only_backfill_repair()
+
+    assert service.db.row("SELECT backfill_done FROM profiles WHERE id=1")["backfill_done"] == 1
+    assert service.db.row("SELECT COUNT(*) count FROM jobs WHERE job_type='backfill'")["count"] == 0
 
 
 @pytest.mark.asyncio
@@ -819,10 +941,15 @@ schedule:
 
     profile = service.db.row("SELECT * FROM profiles WHERE id=1")
     assert calls == ["https://facebook.com/100"]
-    assert profile["public_state"] == "public"
+    assert profile["public_state"] == "unknown"
     assert profile["fb_id"] == "100"
-    assert profile["serp_last_checked_at"] is not None
+    assert profile["serp_last_checked_at"] is None
     assert '"profile_data_source": "Bright Data"' in profile["profile_details_json"]
+    observation = service.db.row(
+        "SELECT * FROM access_observations WHERE profile_id=1 ORDER BY id DESC LIMIT 1"
+    )
+    assert observation["source"] == "profile_refresh:bright_data"
+    assert observation["verdict"] == "suspected_public"
     assert service.db.row("SELECT COUNT(*) count FROM events WHERE event_type='brightdata_fallback'")["count"] == 1
 
 
@@ -863,8 +990,13 @@ schedule:
 
     profile = service.db.row("SELECT * FROM profiles WHERE id=1")
     assert browser_calls == ["https://facebook.com/100"]
-    assert profile["public_state"] == "public"
+    assert profile["public_state"] == "unknown"
     assert '"profile_data_source": "Facebook 直接瀏覽器"' in profile["profile_details_json"]
+    observation = service.db.row(
+        "SELECT * FROM access_observations WHERE profile_id=1 ORDER BY id DESC LIMIT 1"
+    )
+    assert observation["source"] == "profile_refresh:authenticated_browser"
+    assert observation["verdict"] == "authenticated_visible"
     assert service.db.row("SELECT COUNT(*) count FROM events WHERE event_type='facebook_browser_fallback'")["count"] == 1
 
 

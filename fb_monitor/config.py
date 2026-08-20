@@ -28,6 +28,8 @@ class ProfileConfig:
 class ActorConfig:
     profile: str = "apify/facebook-pages-scraper"
     posts: str = "unseenuser/fb-profile"
+    posts_v2_primary: str = "spbotdel/facebook-profile-posts-all-photos-scraper"
+    posts_v2_fallback: str = "unseenuser/fb-posts"
     comments: str = "apify/facebook-comments-scraper"
     profile_input: dict[str, Any] = field(default_factory=dict)
     posts_input: dict[str, Any] = field(default_factory=dict)
@@ -115,16 +117,16 @@ class Settings:
     visit_max_hours: float = 8
     spacing_min_minutes: float = 20
     spacing_max_minutes: float = 30
-    recent_posts: int = 10
+    recent_posts: int = 20
     always_full_fetch_urls: tuple[str, ...] = ()
     always_full_fetch_max_posts: int = 50
     backfill_posts: int = 20
-    full_audit_days: int = 7
+    full_audit_days: int = 30
     serpapi_profile_refresh_hours: float = 48
     browser_canary_enabled: bool = True
     browser_canary_max_posts: int = 2
     browser_canary_cooldown_hours: float = 72
-    low_disk_gb: float = 10
+    low_disk_gb: float = 30
     media_retry_days: int = 30
     monthly_budget_usd: float = 5
     budget_warning_ratio: float = 0.8
@@ -150,6 +152,25 @@ class Settings:
     scheduler_enabled: bool = True
     app_version: str = "development"
     app_updated_at: str = ""
+    capture_v2_enabled: bool = False
+    apify_v1_backfill_enabled: bool = False
+    special_profile_id: str = "100027675104517"
+    special_detection_hours: float = 2
+    special_capture_reserve_usd: float = 4
+    special_detection_budget_usd: float = 0.55
+    actor_contract_test_budget_usd: float = 0.20
+    actor_contract_test_grant_hours: float = 24
+    browser_account_min_minutes: float = 30
+    browser_account_max_minutes: float = 60
+    browser_cross_account_min_minutes: float = 2
+    browser_cross_account_max_minutes: float = 5
+    browser_album_operations: int = 20
+    browser_batch_seconds: int = 180
+    browser_daily_batches: int = 8
+    browser_breaker_hours: int = 24
+    browser_breaker_repeat_hours: int = 72
+    evidence_retention_days: int = 180
+    evidence_cap_bytes: int = 500 * 1024 * 1024
 
     @property
     def db_path(self) -> Path:
@@ -168,6 +189,9 @@ def load_settings(path: str | Path | None = None) -> Settings:
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     schedule = raw.get("schedule", {})
     browser_canary = raw.get("browser_canary", {})
+    capture_v2 = raw.get("capture_v2", {})
+    browser_guard = raw.get("browser_guard", {})
+    evidence = raw.get("evidence", {})
     storage = raw.get("storage", {})
     budget = raw.get("budget", {})
     web = raw.get("web", {})
@@ -186,12 +210,14 @@ def load_settings(path: str | Path | None = None) -> Settings:
     actors = ActorConfig(
         profile=actors_raw.get("profile", actor_defaults.profile),
         posts=actors_raw.get("posts", actor_defaults.posts),
+        posts_v2_primary=actors_raw.get("posts_v2_primary", actor_defaults.posts_v2_primary),
+        posts_v2_fallback=actors_raw.get("posts_v2_fallback", actor_defaults.posts_v2_fallback),
         comments=actors_raw.get("comments", actor_defaults.comments),
         profile_input=actors_raw.get("profile_input", {}),
         posts_input=actors_raw.get("posts_input", {}),
         comments_input=actors_raw.get("comments_input", {}),
     )
-    return Settings(
+    settings = Settings(
         config_path=config_path,
         data_dir=data_dir,
         timezone=raw.get("timezone", "Asia/Taipei"),
@@ -199,19 +225,19 @@ def load_settings(path: str | Path | None = None) -> Settings:
         visit_max_hours=float(schedule.get("visit_max_hours", 8)),
         spacing_min_minutes=float(schedule.get("spacing_min_minutes", 20)),
         spacing_max_minutes=float(schedule.get("spacing_max_minutes", 30)),
-        recent_posts=int(schedule.get("recent_posts", 10)),
+        recent_posts=max(1, int(schedule.get("recent_posts", 20))),
         always_full_fetch_urls=tuple(
             normalize_profile_url(str(url))
             for url in (schedule.get("always_full_fetch_urls") or [])
         ),
         always_full_fetch_max_posts=max(1, min(50, int(schedule.get("always_full_fetch_max_posts", 50)))),
         backfill_posts=int(schedule.get("backfill_posts", 20)),
-        full_audit_days=int(schedule.get("full_audit_days", 7)),
+        full_audit_days=int(schedule.get("full_audit_days", 30)),
         serpapi_profile_refresh_hours=float(schedule.get("serpapi_profile_refresh_hours", 48)),
         browser_canary_enabled=bool(browser_canary.get("enabled", True)),
         browser_canary_max_posts=max(0, min(2, int(browser_canary.get("max_posts", 2)))),
         browser_canary_cooldown_hours=max(24, float(browser_canary.get("cooldown_hours", 72))),
-        low_disk_gb=float(storage.get("low_disk_gb", 10)),
+        low_disk_gb=float(storage.get("low_disk_gb", 30)),
         media_retry_days=int(storage.get("media_retry_days", 30)),
         monthly_budget_usd=float(budget.get("monthly_usd", 5)),
         budget_warning_ratio=float(budget.get("warning_ratio", 0.8)),
@@ -237,7 +263,39 @@ def load_settings(path: str | Path | None = None) -> Settings:
         scheduler_enabled=os.getenv("FB_MONITOR_SCHEDULER", "1") not in {"0", "false", "False"},
         app_version=os.getenv("APP_VERSION", "development"),
         app_updated_at=os.getenv("APP_UPDATED_AT", ""),
+        capture_v2_enabled=os.getenv(
+            "CAPTURE_V2_ENABLED", str(capture_v2.get("enabled", "0"))
+        ).lower() in {"1", "true", "yes", "on"},
+        apify_v1_backfill_enabled=os.getenv(
+            "APIFY_V1_BACKFILL_ENABLED", str(capture_v2.get("v1_backfill_enabled", "0"))
+        ).lower() in {"1", "true", "yes", "on"},
+        special_profile_id=str(capture_v2.get("special_profile_id", "100027675104517")),
+        special_detection_hours=max(0.25, float(capture_v2.get("special_detection_hours", 2))),
+        special_capture_reserve_usd=max(0.0, float(capture_v2.get("special_capture_reserve_usd", 4))),
+        special_detection_budget_usd=max(0.0, float(capture_v2.get("special_detection_budget_usd", 0.55))),
+        actor_contract_test_budget_usd=max(
+            0.0, min(0.20, float(capture_v2.get("contract_test_budget_usd", 0.20)))
+        ),
+        actor_contract_test_grant_hours=max(
+            1.0, float(capture_v2.get("contract_test_grant_hours", 24))
+        ),
+        browser_account_min_minutes=max(1.0, float(browser_guard.get("account_min_minutes", 30))),
+        browser_account_max_minutes=max(1.0, float(browser_guard.get("account_max_minutes", 60))),
+        browser_cross_account_min_minutes=max(0.5, float(browser_guard.get("cross_account_min_minutes", 2))),
+        browser_cross_account_max_minutes=max(0.5, float(browser_guard.get("cross_account_max_minutes", 5))),
+        browser_album_operations=max(1, min(20, int(browser_guard.get("album_operations", 20)))),
+        browser_batch_seconds=max(30, min(180, int(browser_guard.get("batch_seconds", 180)))),
+        browser_daily_batches=max(1, int(browser_guard.get("daily_batches", 8))),
+        browser_breaker_hours=max(1, int(browser_guard.get("breaker_hours", 24))),
+        browser_breaker_repeat_hours=max(1, int(browser_guard.get("breaker_repeat_hours", 72))),
+        evidence_retention_days=max(1, int(evidence.get("retention_days", 180))),
+        evidence_cap_bytes=max(1024 * 1024, int(evidence.get("cap_mib", 500)) * 1024 * 1024),
     )
+    if settings.capture_v2_enabled and settings.apify_v1_backfill_enabled:
+        raise ValueError(
+            "CAPTURE_V2_ENABLED 與 APIFY_V1_BACKFILL_ENABLED 不可同時啟用"
+        )
+    return settings
 
 
 def actor_input(template: dict[str, Any], **values: Any) -> dict[str, Any]:

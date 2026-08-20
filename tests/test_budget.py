@@ -113,3 +113,43 @@ async def test_frozen_profile_never_checks_usage_or_calls_apify(tmp_path: Path, 
     assert usage_checked is False
     assert actor_called is False
     assert service.db.row("SELECT COUNT(*) count FROM actor_runs")["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_actor_rechecks_unified_freeze_after_official_usage_await(
+    tmp_path: Path, monkeypatch
+):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\n"
+        "storage:\n  data_dir: data\nbudget:\n  monthly_usd: 5\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    service = MonitorService(load_settings(config))
+    actor_called = False
+
+    async def usage():
+        service.db.set_profile_source_control(
+            1, "apify", frozen=True, reason="freeze during official usage await"
+        )
+        return MonthlyUsage(
+            0.1,
+            "2026-08-09T00:00:00+00:00",
+            "2026-09-08T23:59:59+00:00",
+        )
+
+    async def actor_call(*args, **kwargs):
+        nonlocal actor_called
+        actor_called = True
+        raise AssertionError("frozen profile must not call Apify")
+
+    service.apify.monthly_usage = usage
+    service.apify.call = actor_call
+
+    with pytest.raises(ApifyFrozen):
+        await service._actor("posts", "actor", {}, profile_id=1)
+
+    assert actor_called is False
+    assert service.db.profile_source_frozen(1, "apify") is True
+    assert service.db.row("SELECT COUNT(*) count FROM actor_runs")["count"] == 0

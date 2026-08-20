@@ -8,7 +8,7 @@
   <script src="/static/app.js" defer></script>
 </head>
 <body>
-<header><a href="/" class="brand">FB Public Monitor</a><nav><a href="/">儀表板</a><a href="/storage">硬碟用量</a><a href="/jobs">工作紀錄</a><a href="/diagnostics">診斷</a></nav></header>
+<header><a href="/" class="brand">FB Public Monitor</a><nav><a href="/">儀表板</a><a href="/capture-v2">Capture V2</a><a href="/storage">硬碟用量</a><a href="/jobs">工作紀錄</a><a href="/diagnostics">診斷</a></nav></header>
 <main>{% block content %}{% endblock %}</main>
 <div class="lightbox" id="lightbox" hidden aria-modal="true" role="dialog"><button class="lightbox-close" type="button" aria-label="關閉">×</button><button class="lightbox-prev" type="button" aria-label="上一張">‹</button><img alt="媒體預覽"><button class="lightbox-next" type="button" aria-label="下一張">›</button><a class="lightbox-download button" download>下載原檔</a></div>
 <footer>監控介面 · 存取範圍由 WEB_BIND_IP 控制<br><small>版本：{{ app_version }}{% if app_updated_display %} · 更新時間：{{ app_updated_display }}{% endif %}</small></footer>

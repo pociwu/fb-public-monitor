@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 
@@ -7,6 +8,35 @@ from PIL import Image
 from fb_monitor.config import load_settings
 from fb_monitor.serpapi import SerpApiAccount
 from fb_monitor.web import create_app
+
+
+def _capture_v2_test_app(tmp_path: Path, monkeypatch, *, enabled: bool = True):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """profiles:
+  - name: special
+    url: https://www.facebook.com/100027675104517
+  - name: regular
+    url: https://www.facebook.com/200
+storage:
+  data_dir: data
+actors:
+  posts_v2_primary: example/posts-primary
+  posts_v2_fallback: example/posts-fallback
+  posts_input:
+    startUrls: "{urls}"
+capture_v2:
+  enabled: true
+  v1_backfill_enabled: false
+  special_profile_id: "100027675104517"
+  contract_test_budget_usd: 0.20
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("CAPTURE_V2_ENABLED", "1" if enabled else "0")
+    monkeypatch.setenv("APIFY_V1_BACKFILL_ENABLED", "0")
+    return create_app(load_settings(config))
 
 
 def test_dashboard_health_and_diagnostics_routes(tmp_path: Path, monkeypatch):
@@ -529,3 +559,356 @@ storage:
         assert "已停止監控並保留歷史資料" in removed.text
         assert db.row("SELECT enabled FROM profiles WHERE id=?", (profile["id"],))["enabled"] == 0
         assert db.row("SELECT COUNT(*) count FROM jobs WHERE profile_id=? AND status='pending'", (profile["id"],))["count"] == 0
+
+
+def test_capture_v2_status_dashboard_and_profile_show_auditable_progress(tmp_path: Path, monkeypatch):
+    app = _capture_v2_test_app(tmp_path, monkeypatch)
+    db = app.state.db
+    actor_id = app.state.settings.actors.posts_v2_primary
+    fingerprint = app.state.service._posts_v2_fingerprint(actor_id)
+    contract = db.upsert_actor_contract(
+        provider="apify",
+        actor_id=actor_id,
+        purpose="posts_backfill",
+        schema_fingerprint=fingerprint,
+        status="passed",
+        evidence={"cursor": True},
+    )
+    epoch, _ = db.get_or_create_capture_epoch(
+        1,
+        "public_transition",
+        status="ready",
+        priority=-300,
+        scope={"all_public_history": True},
+        reserved_budget_usd=4,
+    )
+    stream = db.upsert_coverage_stream(
+        int(epoch["id"]),
+        stream="posts",
+        surface="timeline_posts",
+        provider="apify",
+        contract_id=int(contract["id"]),
+    )
+    db.update_coverage_stream(
+        int(stream["id"]),
+        status="in_progress",
+        input_cursor="cursor-in",
+        output_cursor="cursor-out",
+        seen_count=8,
+        new_count=3,
+        duplicate_count=5,
+    )
+    db.update_coverage_stream(
+        int(stream["id"]),
+        status="complete",
+        terminal_evidence_json={"cursor_exhausted": True, "last_cursor": "cursor-out"},
+    )
+    batch, _ = db.prepare_paid_source_batch(
+        profile_id=1,
+        epoch_id=int(epoch["id"]),
+        coverage_stream_id=int(stream["id"]),
+        contract_id=int(contract["id"]),
+        provider="apify",
+        actor_id=actor_id,
+        intent="manual_continue",
+        observation_window="page-1",
+        normalized_input={"url": "https://www.facebook.com/100027675104517"},
+        input_cursor="cursor-in",
+    )
+    batch = db.transition_paid_source_batch(int(batch["id"]), "launching", run_id="run-1")
+    batch = db.transition_paid_source_batch(int(batch["id"]), "run_started", dataset_id="dataset-1")
+    batch = db.transition_paid_source_batch(
+        int(batch["id"]),
+        "raw_saved",
+        raw_path="raw/capture-v2/batch-1.json.gz",
+        raw_sha256="a" * 64,
+        charged_usd=0.0123,
+        raw_result_count=8,
+        output_cursor="cursor-out",
+    )
+    batch = db.transition_paid_source_batch(
+        int(batch["id"]),
+        "imported",
+        parsed_result_count=8,
+        new_result_count=3,
+        duplicate_result_count=5,
+    )
+    db.transition_paid_source_batch(int(batch["id"]), "committed")
+    failed, _ = db.prepare_paid_source_batch(
+        profile_id=1,
+        epoch_id=int(epoch["id"]),
+        coverage_stream_id=int(stream["id"]),
+        contract_id=int(contract["id"]),
+        provider="apify",
+        actor_id=actor_id,
+        intent="manual_continue",
+        observation_window="page-2",
+        normalized_input={"cursor": "cursor-out"},
+        input_cursor="cursor-out",
+    )
+    db.transition_paid_source_batch(int(failed["id"]), "failed", error="fixture actor failure")
+
+    with TestClient(app) as client:
+        dashboard = client.get("/")
+        status = client.get("/capture-v2?profile_id=1")
+        profile = client.get("/profiles/1")
+
+    assert dashboard.status_code == 200
+    assert 'href="/capture-v2"' in dashboard.text
+    assert status.status_code == 200
+    for expected in (
+        "Capture V2 狀態",
+        "V1 付費回溯",
+        "安全停用",
+        actor_id,
+        fingerprint,
+        "cursor-in",
+        "cursor-out",
+        "終點證據",
+        "cursor_exhausted",
+        "新增 3",
+        "重複 5",
+        "$0.0123",
+        "committed",
+        "raw/capture-v2/batch-1.json.gz",
+        "fixture actor failure",
+    ):
+        assert expected in status.text
+    assert profile.status_code == 200
+    assert "Capture V2 回溯" in profile.text
+    assert "posts / timeline_posts" in profile.text
+    assert "cursor-out" in profile.text
+
+
+def test_capture_v2_contract_test_only_queues_one_job_and_obeys_freeze(tmp_path: Path, monkeypatch):
+    app = _capture_v2_test_app(tmp_path, monkeypatch)
+    db = app.state.db
+    db.execute("DELETE FROM jobs")
+    primary = app.state.settings.actors.posts_v2_primary
+    fallback = app.state.settings.actors.posts_v2_fallback
+    db.record_access_observation(
+        1,
+        source="anonymous_browser",
+        auth_scope="anonymous",
+        verdict="confirmed_public",
+        target_fb_id="100027675104517",
+        observed_fb_id="100027675104517",
+        identity_match=True,
+    )
+
+    with TestClient(app) as client:
+        page = client.get("/capture-v2?profile_id=1")
+        granted = client.post("/capture-v2/contract-grants", follow_redirects=False)
+        grant = db.contract_test_grant_ledger()
+        first = client.post(
+            "/profiles/1/capture-v2/contract-test",
+            data={"actor_id": primary, "fixture_ack": "1"},
+            follow_redirects=False,
+        )
+        repeated = client.post(
+            "/profiles/1/capture-v2/contract-test",
+            data={"actor_id": primary, "fixture_ack": "1"},
+            follow_redirects=False,
+        )
+        db.set_profile_source_control(2, "apify", frozen=True, reason="test")
+        frozen = client.post(
+            "/profiles/2/capture-v2/contract-test",
+            data={"actor_id": fallback, "fixture_ack": "1"},
+            follow_redirects=False,
+        )
+
+    assert page.status_code == 200
+    assert "全域共用上限 $0.20" in page.text
+    assert granted.status_code == 303 and "notice=" in granted.headers["location"]
+    assert grant and grant["status"] == "active"
+    assert first.status_code == repeated.status_code == frozen.status_code == 303
+    assert "notice=" in first.headers["location"]
+    assert "error=" in frozen.headers["location"]
+    jobs = db.rows("SELECT * FROM jobs WHERE job_type='contract_test_posts_v2'")
+    assert len(jobs) == 1
+    assert jobs[0]["profile_id"] == 1
+    payload = json.loads(jobs[0]["payload_json"])
+    assert payload["actor_id"] == primary
+    assert payload["max_budget_usd"] == 0.20
+    assert payload["contract_grant_id"] == grant["id"]
+    assert payload["contract_test_id"].startswith(f"grant:{grant['id']}:")
+    assert jobs[0]["dedupe_key"].startswith(f"contract-grant:{grant['id']}:{primary}:")
+    assert db.row("SELECT COUNT(*) count FROM actor_runs")["count"] == 0
+
+
+def test_capture_v2_paid_mutations_reject_cross_site_browser_forms(tmp_path: Path, monkeypatch):
+    app = _capture_v2_test_app(tmp_path, monkeypatch)
+    db = app.state.db
+    db.execute("DELETE FROM jobs")
+    db.record_access_observation(
+        1,
+        source="anonymous_browser",
+        auth_scope="anonymous",
+        verdict="confirmed_public",
+        target_fb_id="100027675104517",
+        observed_fb_id="100027675104517",
+        identity_match=True,
+    )
+    primary = app.state.settings.actors.posts_v2_primary
+
+    with TestClient(app) as client:
+        malicious_grant = client.post(
+            "/capture-v2/contract-grants",
+            headers={"Origin": "https://attacker.invalid"},
+        )
+        same_origin_grant = client.post(
+            "/capture-v2/contract-grants",
+            headers={"Origin": "http://testserver:80"},
+            follow_redirects=False,
+        )
+        malicious_test = client.post(
+            "/profiles/1/capture-v2/contract-test",
+            data={"actor_id": primary, "fixture_ack": "1"},
+            headers={"Referer": "https://attacker.invalid/form"},
+        )
+        malicious_continue = client.post(
+            "/profiles/1/capture-v2/continue",
+            headers={"Origin": "null"},
+        )
+        malicious_regular_scan = client.post(
+            "/profiles/1/scan",
+            headers={"Origin": "https://attacker.invalid"},
+        )
+        headerless_cli_scan = client.post(
+            "/profiles/1/scan",
+            follow_redirects=False,
+        )
+
+    assert malicious_grant.status_code == 403
+    assert same_origin_grant.status_code == 303
+    assert malicious_test.status_code == malicious_continue.status_code == 403
+    assert malicious_regular_scan.status_code == 403
+    assert headerless_cli_scan.status_code == 303
+    assert db.row("SELECT COUNT(*) count FROM jobs")["count"] == 1
+    assert db.row("SELECT COUNT(*) count FROM contract_test_grants")["count"] == 1
+
+
+def test_capture_v2_contract_fixture_rejects_newer_strong_private_evidence(
+    tmp_path: Path, monkeypatch
+):
+    app = _capture_v2_test_app(tmp_path, monkeypatch)
+    db = app.state.db
+    db.execute("DELETE FROM jobs")
+    db.record_access_observation(
+        1,
+        source="anonymous_browser",
+        auth_scope="anonymous",
+        verdict="confirmed_public",
+        target_fb_id="100027675104517",
+        observed_fb_id="100027675104517",
+        identity_match=True,
+        observed_at="2026-08-19T00:00:00+00:00",
+    )
+    db.record_access_observation(
+        1,
+        source="anonymous_browser",
+        auth_scope="anonymous",
+        verdict="confirmed_private",
+        target_fb_id="100027675104517",
+        observed_fb_id="100027675104517",
+        identity_match=True,
+        observed_at="2026-08-20T00:00:00+00:00",
+    )
+    primary = app.state.settings.actors.posts_v2_primary
+
+    with TestClient(app) as client:
+        page = client.get("/capture-v2?profile_id=1")
+        client.post("/capture-v2/contract-grants", follow_redirects=False)
+        queued = client.post(
+            "/profiles/1/capture-v2/contract-test",
+            data={"actor_id": primary, "fixture_ack": "1"},
+            follow_redirects=False,
+        )
+
+    assert page.status_code == 200
+    assert "最新強存取證據為 confirmed_private" in page.text
+    assert queued.status_code == 303 and "error=" in queued.headers["location"]
+    assert db.row("SELECT COUNT(*) count FROM jobs")["count"] == 0
+
+
+def test_capture_v2_continue_requires_exact_passed_contract_and_is_idempotent(tmp_path: Path, monkeypatch):
+    app = _capture_v2_test_app(tmp_path, monkeypatch)
+    db = app.state.db
+    db.execute("DELETE FROM jobs")
+    actor_id = app.state.settings.actors.posts_v2_primary
+    with TestClient(app) as client:
+        missing = client.post("/profiles/1/capture-v2/continue", follow_redirects=False)
+        db.upsert_actor_contract(
+            provider="apify",
+            actor_id=actor_id,
+            purpose="posts_backfill",
+            schema_fingerprint="stale-fingerprint",
+            status="passed",
+        )
+        stale = client.post("/profiles/1/capture-v2/continue", follow_redirects=False)
+        fingerprint = app.state.service._posts_v2_fingerprint(actor_id)
+        contract = db.upsert_actor_contract(
+            provider="apify",
+            actor_id=actor_id,
+            purpose="posts_backfill",
+            schema_fingerprint=fingerprint,
+            status="passed",
+        )
+        unverified = client.post(
+            "/profiles/1/capture-v2/continue", follow_redirects=False
+        )
+        assert "error=" in unverified.headers["location"]
+        assert db.row(
+            "SELECT COUNT(*) count FROM capture_epochs WHERE profile_id=1"
+        )["count"] == 0
+        db.record_access_observation(
+            1,
+            source="anonymous_browser",
+            auth_scope="anonymous",
+            verdict="confirmed_public",
+            target_fb_id="100",
+            observed_fb_id="100",
+            identity_match=True,
+        )
+        first = client.post("/profiles/1/capture-v2/continue", follow_redirects=False)
+        repeated = client.post("/profiles/1/capture-v2/continue", follow_redirects=False)
+        db.set_profile_source_control(2, "apify", frozen=True, reason="test")
+        frozen = client.post("/profiles/2/capture-v2/continue", follow_redirects=False)
+
+    assert "error=" in missing.headers["location"]
+    assert "error=" in stale.headers["location"]
+    assert first.status_code == repeated.status_code == frozen.status_code == 303
+    assert "notice=" in first.headers["location"]
+    assert "error=" in frozen.headers["location"]
+    assert db.row("SELECT COUNT(*) count FROM capture_epochs WHERE profile_id=1 AND is_active=1")["count"] == 1
+    stream = db.row("SELECT * FROM coverage_streams WHERE contract_id=?", (contract["id"],))
+    assert stream and stream["stream"] == "posts" and stream["surface"] == "timeline_posts"
+    jobs = db.rows("SELECT * FROM jobs WHERE job_type='capture_posts_v2'")
+    assert len(jobs) == 1
+    assert json.loads(jobs[0]["payload_json"]) == {
+        "epoch_id": stream["epoch_id"],
+        "coverage_stream_id": stream["id"],
+        "surface": "timeline_posts",
+    }
+    assert jobs[0]["epoch_id"] == stream["epoch_id"]
+    assert db.row("SELECT COUNT(*) count FROM actor_runs")["count"] == 0
+
+
+def test_capture_v2_actions_fail_closed_when_feature_is_disabled(tmp_path: Path, monkeypatch):
+    app = _capture_v2_test_app(tmp_path, monkeypatch, enabled=False)
+    db = app.state.db
+    db.execute("DELETE FROM jobs")
+    with TestClient(app) as client:
+        page = client.get("/capture-v2")
+        contract = client.post(
+            "/profiles/1/capture-v2/contract-test", follow_redirects=False
+        )
+        capture = client.post("/profiles/1/capture-v2/continue", follow_redirects=False)
+
+    assert page.status_code == 200
+    assert "未啟用" in page.text
+    assert "安全停用" in page.text
+    assert contract.status_code == capture.status_code == 303
+    assert "error=" in contract.headers["location"]
+    assert "error=" in capture.headers["location"]
+    assert db.row("SELECT COUNT(*) count FROM jobs")["count"] == 0

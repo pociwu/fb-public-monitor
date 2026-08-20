@@ -24,8 +24,37 @@ def normalize_url(value: str | None) -> str:
     # Keep the immutable object path so a URL refresh is not a content update.
     if "fbcdn.net" in parts.netloc.lower() or parts.netloc.lower().startswith("scontent-"):
         return f"facebook-cdn:{parts.path}"
-    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k.lower() not in TRACKING_KEYS and not k.startswith("_nc_")]
-    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/"), urlencode(query), ""))
+    query = [
+        (k, v)
+        for k, v in parse_qsl(parts.query, keep_blank_values=True)
+        if k.lower() not in TRACKING_KEYS and not k.startswith("_nc_")
+    ]
+    hostname = (parts.hostname or "").casefold()
+    netloc = parts.netloc.lower()
+    path = parts.path.rstrip("/")
+
+    # Facebook serves the same permalink from its desktop, mobile and basic
+    # HTML hosts.  Collapse those aliases before URL-level de-duplication.
+    if hostname in {
+        "facebook.com",
+        "www.facebook.com",
+        "m.facebook.com",
+        "mbasic.facebook.com",
+        "mobile.facebook.com",
+        "touch.facebook.com",
+    }:
+        netloc = "www.facebook.com"
+
+        # Both forms are emitted by Facebook for the same photo.  Other query
+        # values (set, type, theatre, etc.) describe how it was reached rather
+        # than the media identity, so retain only the stable fbid.
+        if path.casefold() in {"/photo", "/photo.php"}:
+            fbid = next((v for k, v in query if k.casefold() == "fbid" and v), "")
+            if fbid:
+                path = "/photo.php"
+                query = [("fbid", fbid)]
+
+    return urlunsplit((parts.scheme.lower(), netloc, path, urlencode(query), ""))
 
 
 def facebook_post_identity(value: str | None) -> str:
@@ -33,10 +62,13 @@ def facebook_post_identity(value: str | None) -> str:
     if not value:
         return ""
     parts = urlsplit(value)
-    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query = {key.casefold(): item for key, item in parse_qsl(parts.query, keep_blank_values=True)}
     story_fbid = query.get("story_fbid")
     if story_fbid:
         return story_fbid
+    photo_fbid = query.get("fbid")
+    if photo_fbid and parts.path.rstrip("/").casefold() in {"/photo", "/photo.php"}:
+        return photo_fbid
     match = re.search(r"/(?:posts|photos|videos|reel|share/p)/([^/?#]+)", parts.path, flags=re.IGNORECASE)
     return match.group(1) if match else ""
 

@@ -7,6 +7,10 @@ services:
         APP_UPDATED_AT: "${APP_UPDATED_AT:-}"
     restart: unless-stopped
     env_file: .env
+    environment:
+      # 舊 Actor 無回溯游標；部署預設止血。V2 只有通過契約後才會付費執行。
+      APIFY_V1_BACKFILL_ENABLED: "${APIFY_V1_BACKFILL_ENABLED:-0}"
+      CAPTURE_V2_ENABLED: "${CAPTURE_V2_ENABLED:-0}"
     volumes:
       - ./config.yaml:/app/config.yaml
       - ./data:/data

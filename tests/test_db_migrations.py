@@ -86,3 +86,32 @@ def test_schema_reopens_unverifiable_browser_backfill_completion(tmp_path: Path)
         "SELECT browser_post_cursor,browser_post_backfill_done FROM profiles WHERE url='https://facebook.com/1'"
     )
     assert profile == {"browser_post_cursor": None, "browser_post_backfill_done": 0}
+
+
+def test_legacy_jobs_get_capture_links_and_active_dedupe_index(tmp_path: Path):
+    path = tmp_path / "legacy-jobs.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """CREATE TABLE jobs (
+          id INTEGER PRIMARY KEY, profile_id INTEGER, job_type TEXT NOT NULL,
+          priority INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+          payload_json TEXT NOT NULL DEFAULT '{}', available_at TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0, error TEXT, created_at TEXT NOT NULL,
+          started_at TEXT, finished_at TEXT
+        )"""
+    )
+    connection.execute(
+        """INSERT INTO jobs(profile_id,job_type,priority,available_at,created_at)
+        VALUES(NULL,'legacy',10,'old','old')"""
+    )
+    connection.commit()
+    connection.close()
+
+    db = Database(path)
+
+    columns = {row["name"] for row in db.rows("PRAGMA table_info(jobs)")}
+    assert {"dedupe_key", "epoch_id", "batch_id"} <= columns
+    assert db.row(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_jobs_active_dedupe'"
+    )
+    assert db.row("SELECT COUNT(*) AS total FROM jobs")["total"] == 1

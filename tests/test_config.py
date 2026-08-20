@@ -25,6 +25,96 @@ def test_browser_canary_defaults_are_conservative(tmp_path: Path):
     assert settings.browser_canary_enabled is True
     assert settings.browser_canary_max_posts == 2
     assert settings.browser_canary_cooldown_hours == 72
+    assert settings.capture_v2_enabled is False
+    assert settings.apify_v1_backfill_enabled is False
+    assert settings.recent_posts == 20
+    assert settings.full_audit_days == 30
+    assert settings.low_disk_gb == 30
+    assert settings.browser_album_operations == 20
+    assert settings.evidence_cap_bytes == 500 * 1024 * 1024
+
+
+def test_capture_v2_and_browser_guard_settings(tmp_path: Path):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """profiles: []
+capture_v2:
+  enabled: true
+  v1_backfill_enabled: false
+  special_profile_id: "123"
+  contract_test_budget_usd: 0.19
+  contract_test_grant_hours: 12
+browser_guard:
+  account_min_minutes: 40
+  account_max_minutes: 70
+  album_operations: 99
+  batch_seconds: 999
+evidence:
+  retention_days: 90
+  cap_mib: 321
+actors:
+  posts_v2_primary: example/primary
+  posts_v2_fallback: example/fallback
+""",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config)
+
+    assert settings.capture_v2_enabled is True
+    assert settings.apify_v1_backfill_enabled is False
+    assert settings.special_profile_id == "123"
+    assert settings.actor_contract_test_budget_usd == pytest.approx(0.19)
+    assert settings.actor_contract_test_grant_hours == pytest.approx(12)
+    assert settings.browser_account_min_minutes == 40
+    assert settings.browser_account_max_minutes == 70
+    assert settings.browser_album_operations == 20
+    assert settings.browser_batch_seconds == 180
+    assert settings.evidence_retention_days == 90
+    assert settings.evidence_cap_bytes == 321 * 1024 * 1024
+    assert settings.actors.posts_v2_primary == "example/primary"
+    assert settings.actors.posts_v2_fallback == "example/fallback"
+
+
+def test_posts_cursor_contract_round_has_hard_twenty_cent_cap(tmp_path: Path):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles: []\ncapture_v2:\n  contract_test_budget_usd: 9.99\n",
+        encoding="utf-8",
+    )
+
+    assert load_settings(config).actor_contract_test_budget_usd == pytest.approx(0.20)
+
+
+@pytest.mark.parametrize(
+    ("capture_v2", "v1_backfill"),
+    [("1", "1"), ("true", "yes")],
+)
+def test_config_rejects_capture_v2_and_v1_backfill_enabled_together(
+    tmp_path: Path, monkeypatch, capture_v2: str, v1_backfill: str
+):
+    config = tmp_path / "config.yaml"
+    config.write_text("profiles: []\n", encoding="utf-8")
+    monkeypatch.setenv("CAPTURE_V2_ENABLED", capture_v2)
+    monkeypatch.setenv("APIFY_V1_BACKFILL_ENABLED", v1_backfill)
+
+    with pytest.raises(ValueError, match="不可同時啟用"):
+        load_settings(config)
+
+
+def test_yaml_rejects_capture_v2_and_v1_backfill_enabled_together(
+    tmp_path: Path, monkeypatch
+):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles: []\ncapture_v2:\n  enabled: true\n  v1_backfill_enabled: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("CAPTURE_V2_ENABLED", raising=False)
+    monkeypatch.delenv("APIFY_V1_BACKFILL_ENABLED", raising=False)
+
+    with pytest.raises(ValueError, match="不可同時啟用"):
+        load_settings(config)
 
 
 def test_config_rejects_more_than_sixteen(tmp_path: Path):

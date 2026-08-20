@@ -4,6 +4,7 @@ config.yaml
 __pycache__/
 *.py[cod]
 .venv/
+.codex-remote-attachments/
 data/
 browser-data/
 dist/

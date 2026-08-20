@@ -9,7 +9,7 @@ from difflib import unified_diff
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote
+from urllib.parse import parse_qs, quote, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -30,6 +30,33 @@ from .timeutil import display_time, parse_time, timezone_module_fallback
 PACKAGE = Path(__file__).parent
 templates = Jinja2Templates(directory=str(PACKAGE / "templates"))
 MANUAL_VISIT_COOLDOWN_MINUTES = 10
+
+
+def _web_origin(value: str) -> tuple[str, str, int] | None:
+    parsed = urlsplit(value.strip())
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    try:
+        port = parsed.port or (443 if scheme == "https" else 80)
+    except ValueError:
+        return None
+    return scheme, parsed.hostname.lower(), port
+
+
+def _require_paid_action_same_origin(request: Request) -> None:
+    """Reject browser cross-site POSTs while preserving headerless CLI calls.
+
+    Browsers send Origin and/or Referer for form submissions.  A script or curl
+    invocation may send neither, so absence is intentionally allowed; any
+    supplied browser provenance must match the effective request origin.
+    """
+    expected = _web_origin(str(request.base_url))
+    for header in ("origin", "referer"):
+        value = request.headers.get(header)
+        supplied = _web_origin(value) if value else None
+        if value and (supplied is None or supplied != expected):
+            raise HTTPException(403, "付費操作拒絕跨來源請求")
 
 
 def _json(value: str | None) -> Any:
@@ -153,6 +180,126 @@ def _attach_current_media(db: Database, entities: list[dict[str, Any]]) -> None:
         entity["media_count"] = len(entity["media"])
         entity["image_count"] = sum(media["kind"] == "image" for media in entity["media"])
         entity["video_count"] = sum(media["kind"] == "video" for media in entity["media"])
+
+
+def _capture_v2_summary(db: Database, enabled: bool) -> dict[str, Any]:
+    """Return a compact dashboard summary without mutating capture state."""
+    counts = db.row(
+        """SELECT
+        (SELECT COUNT(*) FROM capture_epochs WHERE is_active=1) AS active_epochs,
+        (SELECT COUNT(*) FROM coverage_streams) AS coverage_total,
+        (SELECT COUNT(*) FROM coverage_streams WHERE status='complete') AS coverage_complete,
+        (SELECT COUNT(*) FROM paid_source_batches
+         WHERE status NOT IN ('committed','failed')) AS open_batches"""
+    ) or {}
+    return {
+        "enabled": enabled,
+        "active_epochs": int(counts.get("active_epochs") or 0),
+        "coverage_total": int(counts.get("coverage_total") or 0),
+        "coverage_complete": int(counts.get("coverage_complete") or 0),
+        "open_batches": int(counts.get("open_batches") or 0),
+    }
+
+
+def _capture_v2_contracts(
+    db: Database,
+    service: MonitorService,
+    cfg: Settings,
+) -> list[dict[str, Any]]:
+    """Decorate the latest contract evidence for every configured candidate Actor."""
+    actor_ids = list(
+        dict.fromkeys(
+            actor_id.strip()
+            for actor_id in (cfg.actors.posts_v2_primary, cfg.actors.posts_v2_fallback)
+            if actor_id.strip()
+        )
+    )
+    if not actor_ids:
+        return []
+    placeholders = ",".join("?" for _ in actor_ids)
+    rows = db.rows(
+        f"""SELECT ac.*,
+        (SELECT cr.status FROM contract_runs cr WHERE cr.contract_id=ac.id
+         ORDER BY cr.id DESC LIMIT 1) AS latest_run_status,
+        (SELECT cr.error FROM contract_runs cr WHERE cr.contract_id=ac.id
+         ORDER BY cr.id DESC LIMIT 1) AS latest_run_error
+        FROM actor_contracts ac
+        WHERE ac.provider='apify' AND ac.purpose='posts_backfill'
+          AND ac.actor_id IN ({placeholders})
+        ORDER BY ac.updated_at DESC,ac.id DESC""",
+        tuple(actor_ids),
+    )
+    grouped: dict[str, list[dict[str, Any]]] = {actor_id: [] for actor_id in actor_ids}
+    for row in rows:
+        grouped.setdefault(str(row["actor_id"]), []).append(row)
+    candidates: list[dict[str, Any]] = []
+    for index, actor_id in enumerate(actor_ids):
+        expected_fingerprint = service._posts_v2_fingerprint(actor_id)
+        matching = next(
+            (
+                row
+                for row in grouped.get(actor_id, [])
+                if str(row.get("schema_fingerprint") or "") == expected_fingerprint
+            ),
+            None,
+        )
+        row = matching or next(iter(grouped.get(actor_id, [])), None)
+        valid = service._valid_posts_v2_contract(actor_id)
+        candidate = dict(row or {})
+        candidate.update(
+            {
+                "actor_id": actor_id,
+                "role": "主要" if index == 0 else "備援",
+                "status": str(candidate.get("status") or "pending"),
+                "valid": valid is not None,
+                "fingerprint": str(candidate.get("schema_fingerprint") or expected_fingerprint),
+                "expected_fingerprint": expected_fingerprint,
+                "fingerprint_matches": bool(
+                    candidate
+                    and str(candidate.get("schema_fingerprint") or "") == expected_fingerprint
+                ),
+                "updated_display": display_time(candidate.get("updated_at"), cfg.timezone),
+            }
+        )
+        candidates.append(candidate)
+    return candidates
+
+
+def _capture_v2_fixture_eligibility(
+    db: Database, profile_id: int
+) -> tuple[bool, str]:
+    """Require the latest identity-bound strong observation to be public.
+
+    A historical public observation is not enough after a newer anonymous or
+    contract-qualified strong observation has confirmed the profile private.
+    Weak API hints and indeterminate observations do not replace strong
+    evidence, so they are intentionally excluded from this ordering.
+    """
+    latest = db.row(
+        """SELECT verdict,source,auth_scope,observed_at
+        FROM access_observations
+        WHERE profile_id=? AND identity_match=1
+          AND (
+            auth_scope='anonymous'
+            OR source='contract_explicit'
+            OR source LIKE 'contract:%'
+          )
+        ORDER BY observed_at DESC,id DESC LIMIT 1""",
+        (profile_id,),
+    )
+    if not latest:
+        return False, "尚無匿名、身分一致的強存取證據"
+    if str(latest.get("verdict") or "") != "confirmed_public":
+        return False, f"最新強存取證據為 {latest.get('verdict') or '無法判定'}"
+    return True, "可作為已確認公開的貼文游標契約 fixture"
+
+
+def _decorate_capture_rows(rows: list[dict[str, Any]], cfg: Settings) -> None:
+    for row in rows:
+        for field in ("created_at", "updated_at", "started_at", "completed_at", "next_job_at"):
+            row[f"{field}_display"] = display_time(row.get(field), cfg.timezone)
+        if "terminal_evidence_json" in row:
+            row["terminal_evidence"] = _json(row.get("terminal_evidence_json"))
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -290,11 +437,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         storage_latest = decorate_snapshot(storage_rows[0], storage_rows[1] if len(storage_rows) > 1 else None) if storage_rows else None
         official_usage = db.apify_usage_snapshot()
         serpapi_usage = db.serpapi_usage_snapshot()
+        capture_v2 = _capture_v2_summary(db, cfg.capture_v2_enabled)
         if official_usage:
             official_usage["cycle_start_display"] = display_time(official_usage.get("cycle_start_at"), cfg.timezone)
             official_usage["cycle_end_display"] = display_time(official_usage.get("cycle_end_at"), cfg.timezone)
             official_usage["fetched_display"] = display_time(official_usage.get("fetched_at"), cfg.timezone)
-        return templates.TemplateResponse(request, "dashboard.html", {"profiles": profiles, "usage": usage, "official_usage": official_usage, "serpapi_usage": serpapi_usage, "pending": pending, "outbox": outbox, "outbox_counts": outbox_counts, "outbox_rows": outbox_rows, "maintenance_runs": maintenance_runs, "media": media, "storage_latest": storage_latest, "budget": cfg.monthly_budget_usd, "monitored": monitored, "max_profiles": MAX_PROFILES, "browser_enabled": cfg.facebook_browser_enabled, "notice": notice, "error": error})
+        return templates.TemplateResponse(request, "dashboard.html", {"profiles": profiles, "usage": usage, "official_usage": official_usage, "serpapi_usage": serpapi_usage, "pending": pending, "outbox": outbox, "outbox_counts": outbox_counts, "outbox_rows": outbox_rows, "maintenance_runs": maintenance_runs, "media": media, "storage_latest": storage_latest, "budget": cfg.monthly_budget_usd, "monitored": monitored, "max_profiles": MAX_PROFILES, "browser_enabled": cfg.facebook_browser_enabled, "capture_v2": capture_v2, "notice": notice, "error": error})
 
     @app.get("/storage")
     def storage_detail(request: Request):
@@ -317,8 +465,374 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             {"current": history[0] if history else None, "history": history},
         )
 
+    @app.get("/capture-v2")
+    def capture_v2_status(
+        request: Request,
+        profile_id: int | None = Query(None, ge=1),
+        notice: str = "",
+        error: str = "",
+    ):
+        db: Database = request.app.state.db
+        selected_profile = None
+        if profile_id is not None:
+            selected_profile = db.row("SELECT * FROM profiles WHERE id=?", (profile_id,))
+            if not selected_profile:
+                raise HTTPException(404)
+
+        contracts = _capture_v2_contracts(db, service, cfg)
+        contract_grant = db.contract_test_grant_ledger()
+        if contract_grant:
+            for field in ("created_at", "expires_at", "closed_at"):
+                contract_grant[f"{field}_display"] = display_time(
+                    contract_grant.get(field), cfg.timezone
+                )
+            for allocation in contract_grant.get("allocations", []):
+                allocation["created_at_display"] = display_time(
+                    allocation.get("created_at"), cfg.timezone
+                )
+        profiles = db.rows(
+            "SELECT id,name,display_name,url,fb_id,enabled,apify_frozen FROM profiles WHERE enabled=1 ORDER BY COALESCE(sort_order,id),id"
+        )
+        for profile in profiles:
+            profile["apify_frozen"] = db.profile_source_frozen(int(profile["id"]), "apify")
+            eligible, reason = _capture_v2_fixture_eligibility(
+                db, int(profile["id"])
+            )
+            profile["contract_eligible"] = not profile["apify_frozen"] and eligible
+            profile["contract_eligibility_reason"] = (
+                "Apify 已凍結" if profile["apify_frozen"] else reason
+            )
+
+        special = db.row(
+            """SELECT * FROM profiles WHERE enabled=1 AND
+            (fb_id=? OR url LIKE ? OR name=? OR name=?) ORDER BY id LIMIT 1""",
+            (
+                cfg.special_profile_id,
+                f"%{cfg.special_profile_id}%",
+                cfg.special_profile_id,
+                f"FB-{cfg.special_profile_id}",
+            ),
+        )
+        special_epoch = None
+        if special:
+            special_epoch = db.row(
+                """SELECT ce.* FROM capture_epochs ce WHERE ce.profile_id=?
+                ORDER BY ce.is_active DESC,ce.id DESC LIMIT 1""",
+                (special["id"],),
+            )
+            if special_epoch:
+                _decorate_capture_rows([special_epoch], cfg)
+
+        coverage_where = "WHERE ce.profile_id=?" if profile_id is not None else ""
+        coverage_params: tuple[Any, ...] = (profile_id,) if profile_id is not None else ()
+        coverage = db.rows(
+            f"""SELECT cs.*,ce.profile_id,ce.status AS epoch_status,ce.is_active,
+            COALESCE(p.display_name,p.name) AS profile_name,p.url AS profile_url,
+            ac.actor_id AS contract_actor_id,ac.schema_fingerprint AS contract_fingerprint
+            FROM coverage_streams cs
+            JOIN capture_epochs ce ON ce.id=cs.epoch_id
+            JOIN profiles p ON p.id=ce.profile_id
+            LEFT JOIN actor_contracts ac ON ac.id=cs.contract_id
+            {coverage_where}
+            ORDER BY ce.is_active DESC,ce.id DESC,cs.id""",
+            coverage_params,
+        )
+        _decorate_capture_rows(coverage, cfg)
+
+        batch_where = "WHERE pb.profile_id=?" if profile_id is not None else ""
+        batches = db.rows(
+            f"""SELECT pb.*,COALESCE(p.display_name,p.name) AS profile_name,
+            cs.stream,cs.surface
+            FROM paid_source_batches pb
+            JOIN profiles p ON p.id=pb.profile_id
+            JOIN coverage_streams cs ON cs.id=pb.coverage_stream_id
+            {batch_where}
+            ORDER BY pb.id DESC LIMIT 200""",
+            coverage_params,
+        )
+        _decorate_capture_rows(batches, cfg)
+
+        v1_jobs = db.row(
+            """SELECT
+            SUM(CASE WHEN status IN ('pending','running') THEN 1 ELSE 0 END) AS active,
+            SUM(CASE WHEN status='paused_contract' THEN 1 ELSE 0 END) AS paused
+            FROM jobs WHERE job_type IN ('backfill','backfill_comments','audit')"""
+        ) or {}
+        return templates.TemplateResponse(
+            request,
+            "capture_v2.html",
+            {
+                "enabled": cfg.capture_v2_enabled,
+                "v1_backfill_enabled": cfg.apify_v1_backfill_enabled,
+                "v1_jobs": v1_jobs,
+                "contracts": contracts,
+                "profiles": profiles,
+                "selected_profile": selected_profile,
+                "special_profile": special,
+                "special_epoch": special_epoch,
+                "coverage": coverage,
+                "batches": batches,
+                "contract_budget": cfg.actor_contract_test_budget_usd,
+                "contract_grant": contract_grant,
+                "notice": notice,
+                "error": error,
+            },
+        )
+
+    @app.post("/capture-v2/contract-grants")
+    def create_capture_v2_contract_grant(request: Request):
+        _require_paid_action_same_origin(request)
+        db: Database = request.app.state.db
+        redirect = "/capture-v2"
+        if not cfg.capture_v2_enabled:
+            return RedirectResponse(
+                url=f"{redirect}?error={quote('Capture V2 功能尚未啟用')}", status_code=303
+            )
+        if any(contract.get("valid") for contract in _capture_v2_contracts(db, service, cfg)):
+            return RedirectResponse(
+                url=f"{redirect}?error={quote('當前貼文游標契約已通過，不需要再新增付費測試輪次')}",
+                status_code=303,
+            )
+        try:
+            grant = db.create_contract_test_grant(
+                max_usd=cfg.actor_contract_test_budget_usd,
+                valid_hours=cfg.actor_contract_test_grant_hours,
+                authorized_by="web_same_origin",
+                note="operator approved posts cursor contract round",
+            )
+        except ValueError as exc:
+            return RedirectResponse(
+                url=f"{redirect}?error={quote(str(exc))}", status_code=303
+            )
+        return RedirectResponse(
+            url=(
+                f"{redirect}?notice="
+                + quote(
+                    f"已核准第 {grant['id']} 輪貼文游標契約測試；"
+                    f"全輪共用上限 ${float(grant['max_usd']):.2f}"
+                )
+            ),
+            status_code=303,
+        )
+
+    @app.post("/capture-v2/contract-grants/{grant_id}/close")
+    def close_capture_v2_contract_grant(request: Request, grant_id: int):
+        _require_paid_action_same_origin(request)
+        db: Database = request.app.state.db
+        try:
+            db.close_contract_test_grant(grant_id)
+        except ValueError as exc:
+            return RedirectResponse(
+                url=f"/capture-v2?error={quote(str(exc))}", status_code=303
+            )
+        return RedirectResponse(
+            url=f"/capture-v2?notice={quote(f'已結束第 {grant_id} 輪契約測試')}",
+            status_code=303,
+        )
+
+    @app.post("/profiles/{profile_id}/capture-v2/contract-test")
+    async def queue_capture_v2_contract_test(request: Request, profile_id: int):
+        _require_paid_action_same_origin(request)
+        redirect = f"/capture-v2?profile_id={profile_id}"
+        if not cfg.capture_v2_enabled:
+            return RedirectResponse(
+                url=f"{redirect}&error={quote('Capture V2 功能尚未啟用')}", status_code=303
+            )
+        db: Database = request.app.state.db
+        profile = db.row(
+            "SELECT id,display_name,name FROM profiles WHERE id=? AND enabled=1", (profile_id,)
+        )
+        if not profile:
+            raise HTTPException(404)
+        if db.profile_source_frozen(profile_id, "apify"):
+            return RedirectResponse(
+                url=f"{redirect}&error={quote('此帳號的 Apify 已凍結，未建立契約測試工作')}",
+                status_code=303,
+            )
+        eligible, _ = _capture_v2_fixture_eligibility(db, profile_id)
+        if not eligible:
+            return RedirectResponse(
+                url=f"{redirect}&error={quote('契約 fixture 尚無匿名、身分一致的已公開證據')}",
+                status_code=303,
+            )
+        params = parse_qs((await request.body()).decode("utf-8"))
+        if str((params.get("fixture_ack") or [""])[0]) != "1":
+            return RedirectResponse(
+                url=f"{redirect}&error={quote('請先確認 fixture 有足夠的公開歷史貼文，且本測試只驗證貼文游標')}",
+                status_code=303,
+            )
+        actor_id = str((params.get("actor_id") or [cfg.actors.posts_v2_primary])[0]).strip()
+        allowed_actors = {
+            actor.strip()
+            for actor in (cfg.actors.posts_v2_primary, cfg.actors.posts_v2_fallback)
+            if actor.strip()
+        }
+        if actor_id not in allowed_actors:
+            return RedirectResponse(
+                url=f"{redirect}&error={quote('Actor 不在 Capture V2 候選名單中')}",
+                status_code=303,
+            )
+        if any(service._valid_posts_v2_contract(candidate) for candidate in allowed_actors):
+            return RedirectResponse(
+                url=f"{redirect}&error={quote('當前貼文游標契約已通過，未再建立付費測試')}",
+                status_code=303,
+            )
+        grant = db.contract_test_grant_ledger()
+        if not grant or str(grant.get("status")) != "active":
+            return RedirectResponse(
+                url=f"{redirect}&error={quote('尚無有效的全輪 $0.20 契約測試 grant；請先明確核准新輪次')}",
+                status_code=303,
+            )
+        fingerprint = service._posts_v2_fingerprint(actor_id)
+        try:
+            _, created, allocation = db.queue_contract_test_job(
+                grant_id=int(grant["id"]),
+                profile_id=profile_id,
+                actor_id=actor_id,
+                schema_fingerprint=fingerprint,
+                fixture_ack=True,
+            )
+        except ValueError as exc:
+            return RedirectResponse(
+                url=f"{redirect}&error={quote(str(exc))}", status_code=303
+            )
+        label = profile.get("display_name") or profile.get("name") or "Facebook"
+        message = (
+            f"已排入 {label} 的 {actor_id} 貼文游標契約測試"
+            f"（本輪剩餘核准 ${float(allocation['authorized_usd']):.4f}）"
+            if created
+            else f"{label} 的 {actor_id} 契約測試已在佇列中"
+        )
+        return RedirectResponse(url=f"{redirect}&notice={quote(message)}", status_code=303)
+
+    @app.post("/profiles/{profile_id}/capture-v2/continue")
+    def queue_capture_v2_continue(request: Request, profile_id: int):
+        _require_paid_action_same_origin(request)
+        redirect = f"/capture-v2?profile_id={profile_id}"
+        if not cfg.capture_v2_enabled:
+            return RedirectResponse(
+                url=f"{redirect}&error={quote('Capture V2 功能尚未啟用')}", status_code=303
+            )
+        db: Database = request.app.state.db
+        profile = db.row("SELECT * FROM profiles WHERE id=? AND enabled=1", (profile_id,))
+        if not profile:
+            raise HTTPException(404)
+        if db.profile_source_frozen(profile_id, "apify"):
+            return RedirectResponse(
+                url=f"{redirect}&error={quote('此帳號的 Apify 已凍結，未建立續抓工作')}",
+                status_code=303,
+            )
+        eligible, _ = _capture_v2_fixture_eligibility(db, profile_id)
+        if not eligible:
+            return RedirectResponse(
+                url=f"{redirect}&error={quote('尚無匿名、身分一致的已公開證據；禁止建立付費回溯工作')}",
+                status_code=303,
+            )
+        actor_ids = list(
+            dict.fromkeys(
+                actor.strip()
+                for actor in (cfg.actors.posts_v2_primary, cfg.actors.posts_v2_fallback)
+                if actor.strip()
+            )
+        )
+        contract = None
+        for actor_id in actor_ids:
+            contract = service._valid_posts_v2_contract(actor_id)
+            if contract is not None:
+                break
+        if not contract:
+            return RedirectResponse(
+                url=f"{redirect}&error={quote('沒有符合目前程式指紋且已通過的貼文 Actor 契約，請先執行契約測試')}",
+                status_code=303,
+            )
+        actor_id = str(contract["actor_id"])
+        special = (
+            str(profile.get("fb_id") or "") == cfg.special_profile_id
+            or cfg.special_profile_id in str(profile.get("url") or "")
+        )
+        priority = -300 if special else -100
+        epoch, _ = db.get_or_create_capture_epoch(
+            profile_id,
+            "manual_continue",
+            status="ready",
+            priority=priority,
+            scope={
+                "all_public_history": True,
+                "capture_intent": "manual_continue",
+                "surfaces": ["timeline_posts"],
+                "manual": True,
+            },
+            reserved_budget_usd=cfg.special_capture_reserve_usd if special else 0,
+        )
+        db.execute(
+            "UPDATE capture_epochs SET status='ready',updated_at=? WHERE id=? AND status='awaiting_contract'",
+            (utcnow(), epoch["id"]),
+        )
+        coverage_stream = db.upsert_coverage_stream(
+            int(epoch["id"]),
+            stream="posts",
+            surface="timeline_posts",
+            provider="apify",
+            contract_id=int(contract["id"]),
+            status="pending",
+        )
+        if (
+            str(coverage_stream.get("status") or "") == "pending"
+            and not (
+                coverage_stream.get("input_cursor")
+                or coverage_stream.get("output_cursor")
+            )
+        ):
+            recovery = service._capture_v2_recovery_checkpoint(
+                profile_id,
+                int(contract["id"]),
+            )
+            if recovery and str(recovery.get("output_cursor") or "").strip():
+                resume_cursor = str(recovery["output_cursor"])
+                db.update_coverage_stream(
+                    int(coverage_stream["id"]),
+                    input_cursor=resume_cursor,
+                    output_cursor=resume_cursor,
+                    provider_checkpoint_json={
+                        "resumed_from_coverage_id": int(recovery["id"]),
+                        "resumed_from_cursor": resume_cursor,
+                    },
+                )
+                coverage_stream = db.row(
+                    "SELECT * FROM coverage_streams WHERE id=?",
+                    (coverage_stream["id"],),
+                ) or coverage_stream
+        if str(coverage_stream.get("status") or "") == "complete":
+            return RedirectResponse(
+                url=f"{redirect}&notice={quote('此回溯範圍已有終點證據並標記完成，未重複排付費工作')}",
+                status_code=303,
+            )
+        fingerprint = str(contract.get("schema_fingerprint") or "")
+        _, created = db.queue_unique_job(
+            profile_id=profile_id,
+            job_type="capture_posts_v2",
+            priority=priority,
+            dedupe_key=(
+                f"capture-v2:continue:{profile_id}:{epoch['id']}:{coverage_stream['id']}:{fingerprint}"
+            ),
+            payload={
+                "epoch_id": int(epoch["id"]),
+                "coverage_stream_id": int(coverage_stream["id"]),
+                "surface": "timeline_posts",
+            },
+            epoch_id=int(epoch["id"]),
+        )
+        label = profile.get("display_name") or profile.get("name") or "Facebook"
+        message = (
+            f"已排入 {label} 的 Capture V2 貼文續抓"
+            if created
+            else f"{label} 的 Capture V2 貼文續抓已在佇列中"
+        )
+        return RedirectResponse(url=f"{redirect}&notice={quote(message)}", status_code=303)
+
     @app.post("/profiles")
     async def add_profile(request: Request):
+        _require_paid_action_same_origin(request)
         db: Database = request.app.state.db
         params = parse_qs((await request.body()).decode("utf-8"))
         submitted_url = (params.get("url") or [""])[0]
@@ -336,6 +850,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/profiles/reorder")
     async def reorder_profiles(request: Request):
+        _require_paid_action_same_origin(request)
         db: Database = request.app.state.db
         payload = await request.json()
         profile_ids = payload.get("profile_ids") if isinstance(payload, dict) else None
@@ -349,6 +864,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/profiles/scan-all")
     def scan_all_profiles(request: Request):
+        _require_paid_action_same_origin(request)
         db: Database = request.app.state.db
         profile_ids = [int(row["id"]) for row in db.rows("SELECT id FROM profiles WHERE enabled=1 ORDER BY id")]
         db.queue_profile_visits(profile_ids)
@@ -356,6 +872,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/profiles/{profile_id}/scan")
     def scan_profile(request: Request, profile_id: int):
+        _require_paid_action_same_origin(request)
         db: Database = request.app.state.db
         profile = db.row("SELECT id FROM profiles WHERE id=? AND enabled=1", (profile_id,))
         if not profile:
@@ -368,6 +885,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/profiles/{profile_id}/browser-scan")
     def browser_scan_profile(request: Request, profile_id: int):
+        _require_paid_action_same_origin(request)
         if not cfg.facebook_browser_enabled:
             return RedirectResponse(url=f"/?error={quote('Facebook 直接瀏覽器尚未啟用')}", status_code=303)
         db: Database = request.app.state.db
@@ -383,6 +901,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/profiles/{profile_id}/apify-freeze")
     def toggle_profile_apify(request: Request, profile_id: int):
+        _require_paid_action_same_origin(request)
         db: Database = request.app.state.db
         profile = db.row(
             "SELECT id,display_name,name,apify_frozen FROM profiles WHERE id=? AND enabled=1",
@@ -398,6 +917,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/profiles/{profile_id}/refresh-name")
     def refresh_profile_name(request: Request, profile_id: int):
+        _require_paid_action_same_origin(request)
         db: Database = request.app.state.db
         profile = db.row(
             "SELECT id,display_name,name FROM profiles WHERE id=? AND enabled=1",
@@ -418,6 +938,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/profiles/{profile_id}/remove")
     def remove_profile(request: Request, profile_id: int):
+        _require_paid_action_same_origin(request)
         db: Database = request.app.state.db
         profile = db.row("SELECT id,name,url FROM profiles WHERE id=? AND enabled=1", (profile_id,))
         if not profile:
@@ -437,6 +958,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/outbox/{outbox_id}/cancel")
     def cancel_outbox(request: Request, outbox_id: int):
+        _require_paid_action_same_origin(request)
         db: Database = request.app.state.db
         row = db.row("SELECT * FROM outbox WHERE id=?", (outbox_id,))
         if not row:
@@ -450,6 +972,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/outbox/clear")
     def clear_outbox(request: Request):
+        _require_paid_action_same_origin(request)
         db: Database = request.app.state.db
         now = __import__("fb_monitor.db", fromlist=["utcnow"]).utcnow()
         db.execute("UPDATE notification_groups SET status='cancelled',cancelled_at=? WHERE status='pending'", (now,))
@@ -469,6 +992,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         profile = db.row("SELECT * FROM profiles WHERE id=?", (profile_id,))
         if not profile:
             raise HTTPException(404)
+        profile["apify_frozen"] = db.profile_source_frozen(profile_id, "apify")
         _attach_browser_capture(profile, cfg)
         _attach_profile_name_history(db, profile)
         size, offset = 20, (page - 1) * 20
@@ -502,7 +1026,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             entity["content"]["timestamp"] = display_time(entity["content"].get("timestamp"), cfg.timezone)
             entity["published_display"] = display_time(entity.get("published_at"), cfg.timezone)
         _attach_current_media(db, entities)
-        return templates.TemplateResponse(request, "profile.html", {"profile": profile, "entities": entities, "kind": kind, "q": q, "media_filter": media_filter, "page": page, "pages": max(1, ((count or {"count": 0})["count"] + size - 1) // size)})
+        capture_epoch = db.row(
+            """SELECT * FROM capture_epochs WHERE profile_id=?
+            ORDER BY is_active DESC,id DESC LIMIT 1""",
+            (profile_id,),
+        )
+        capture_coverage: list[dict[str, Any]] = []
+        if capture_epoch:
+            _decorate_capture_rows([capture_epoch], cfg)
+            capture_coverage = db.rows(
+                "SELECT * FROM coverage_streams WHERE epoch_id=? ORDER BY stream,surface,id",
+                (capture_epoch["id"],),
+            )
+            _decorate_capture_rows(capture_coverage, cfg)
+        capture_contract_ready = any(
+            service._valid_posts_v2_contract(actor_id) is not None
+            for actor_id in dict.fromkeys(
+                actor.strip()
+                for actor in (cfg.actors.posts_v2_primary, cfg.actors.posts_v2_fallback)
+                if actor.strip()
+            )
+        )
+        return templates.TemplateResponse(request, "profile.html", {"profile": profile, "entities": entities, "kind": kind, "q": q, "media_filter": media_filter, "page": page, "pages": max(1, ((count or {"count": 0})["count"] + size - 1) // size), "capture_v2_enabled": cfg.capture_v2_enabled, "capture_epoch": capture_epoch, "capture_coverage": capture_coverage, "capture_contract_ready": capture_contract_ready, "capture_contract_budget": cfg.actor_contract_test_budget_usd})
 
     @app.get("/profiles/{profile_id}/browser-screenshot")
     def browser_screenshot(request: Request, profile_id: int):
@@ -618,6 +1163,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "visit": "定期拜訪", "browser_visit": "立即瀏覽器拜訪", "backfill": "首次回溯", "audit": "完整核對",
             "repair_scan": "修復掃描", "migrate_raw": "歷史資料轉換",
             "migrate_profile_pics": "大頭照欄位更新", "dedupe_database": "資料庫去重",
+            "contract_test_posts_v2": "Capture V2 Actor 契約測試",
+            "capture_posts_v2": "Capture V2 貼文續抓",
         }
         status_labels = {"pending": "等待中", "running": "執行中", "done": "完成", "failed": "失敗", "cancelled": "已取消", "deferred_budget": "額度延後"}
         for row in rows:

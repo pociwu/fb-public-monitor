@@ -10,22 +10,53 @@ schedule:
   visit_max_hours: 8
   spacing_min_minutes: 20
   spacing_max_minutes: 30
-  recent_posts: 10
-  # Optional: skip the one-post probe for selected profiles.
+  # V2 增量巡檢會把最近 20 個已知 ID 送給通過契約的 Actor 作停止邊界；
+  # 不再先付費抓一篇已知貼文。
+  recent_posts: 20
   always_full_fetch_urls: []
   always_full_fetch_max_posts: 50
   backfill_posts: 20
-  full_audit_days: 7
+  # 完成回溯後，每月只核對最近 5 篇；不會清除歷史游標。
+  full_audit_days: 30
   serpapi_profile_refresh_hours: 48
+
+capture_v2:
+  # 安全部署預設關閉。先在網頁執行 Actor 契約測試並確認通過，再改為 true。
+  enabled: false
+  # 舊 unseenuser/fb-profile 沒有可靠游標，禁止再用它作歷史回溯。
+  v1_backfill_enabled: false
+  special_profile_id: "100027675104517"
+  special_detection_hours: 2
+  special_capture_reserve_usd: 4.00
+  special_detection_budget_usd: 0.55
+  # 每一輪人工核准的 posts-cursor 契約測試共用這個總額，不是每帳號／Actor 各 $0.20。
+  contract_test_budget_usd: 0.20
+  contract_test_grant_hours: 24
 
 browser_canary:
   enabled: true
   max_posts: 2
   cooldown_hours: 72
 
+browser_guard:
+  # 登入 Chromium 只補 API 缺口，不用來證明匿名公開或完整歷史。
+  account_min_minutes: 30
+  account_max_minutes: 60
+  cross_account_min_minutes: 2
+  cross_account_max_minutes: 5
+  album_operations: 20
+  batch_seconds: 180
+  daily_batches: 8
+  breaker_hours: 24
+  breaker_repeat_hours: 72
+
+evidence:
+  retention_days: 180
+  cap_mib: 500
+
 storage:
   data_dir: /data
-  low_disk_gb: 10
+  low_disk_gb: 30
   media_retry_days: 30
 
 budget:
@@ -48,7 +79,11 @@ web:
 
 actors:
   profile: apify/facebook-pages-scraper
+  # V1 只保留相容性，不得用來宣稱完整回溯。
   posts: unseenuser/fb-profile
+  # V2 候選 Actor 必須先通過 cursor / replay / knownPostIds 契約測試。
+  posts_v2_primary: spbotdel/facebook-profile-posts-all-photos-scraper
+  posts_v2_fallback: unseenuser/fb-posts
   comments: apify/facebook-comments-scraper
   # Actor schema 日後改變時，可在下列 mapping 覆寫輸入欄位。
   profile_input: {}
