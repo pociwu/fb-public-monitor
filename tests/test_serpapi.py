@@ -1,6 +1,6 @@
 import pytest
 
-from fb_monitor.serpapi import SerpApiGateway, SerpApiQuotaExceeded, profile_id_from_url
+from fb_monitor.serpapi import SerpApiGateway, SerpApiNoResults, SerpApiQuotaExceeded, profile_id_from_url
 
 
 def test_profile_id_from_supported_facebook_urls():
@@ -50,3 +50,45 @@ async def test_profile_does_not_search_when_account_has_no_credits(monkeypatch):
         await gateway.profile("https://www.facebook.com/123")
     assert caught.value.account.searches_left == 0
     assert calls == ["https://serpapi.com/account.json"]
+
+
+@pytest.mark.asyncio
+async def test_profile_tries_stable_alias_after_empty_result(monkeypatch):
+    gateway = SerpApiGateway("secret")
+    searched = []
+
+    async def fake_get(url, params):
+        if "account" in url:
+            return {"plan_name": "Free", "searches_per_month": 250, "total_searches_left": 10}
+        searched.append(params["profile_id"])
+        if params["profile_id"] == "old-slug":
+            return {"error": "Facebook Profile hasn't returned any results for this query."}
+        return {"profile_results": {"id": "123", "name": "Alice"}}
+
+    monkeypatch.setattr(gateway, "_get_json", fake_get)
+    result = await gateway.profile(
+        "https://www.facebook.com/old-slug",
+        aliases=("123",),
+        empty_retry_seconds=0,
+    )
+    assert searched == ["old-slug", "123"]
+    assert result.searches_used == 2
+    assert [attempt["status"] for attempt in result.attempts] == ["empty", "success"]
+
+
+@pytest.mark.asyncio
+async def test_profile_records_two_empty_results_then_stops(monkeypatch):
+    gateway = SerpApiGateway("secret")
+    searched = []
+
+    async def fake_get(url, params):
+        if "account" in url:
+            return {"plan_name": "Free", "searches_per_month": 250, "total_searches_left": 10}
+        searched.append(params["profile_id"])
+        return {"error": "Facebook Profile hasn't returned any results for this query."}
+
+    monkeypatch.setattr(gateway, "_get_json", fake_get)
+    with pytest.raises(SerpApiNoResults) as caught:
+        await gateway.profile("https://www.facebook.com/123", empty_retry_seconds=0)
+    assert searched == ["123", "123"]
+    assert len(caught.value.attempts) == 2

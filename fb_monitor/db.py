@@ -135,6 +135,16 @@ CREATE TABLE IF NOT EXISTS serpapi_usage_snapshot (
   this_hour_searches INTEGER NOT NULL, rate_limit_per_hour INTEGER NOT NULL,
   fetched_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS serpapi_profile_attempts (
+  id INTEGER PRIMARY KEY,
+  profile_id INTEGER NOT NULL REFERENCES profiles(id),
+  query_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('success','empty','error')),
+  error TEXT,
+  attempted_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_serpapi_profile_attempts_profile
+  ON serpapi_profile_attempts(profile_id,attempted_at DESC);
 CREATE TABLE IF NOT EXISTS audit_seen (
   profile_id INTEGER NOT NULL REFERENCES profiles(id), audit_token TEXT NOT NULL,
   kind TEXT NOT NULL, external_id TEXT NOT NULL,
@@ -3018,6 +3028,31 @@ class Database:
 
     def serpapi_usage_snapshot(self) -> dict[str, Any] | None:
         return self.row("SELECT * FROM serpapi_usage_snapshot WHERE id=1")
+
+    def record_serpapi_profile_attempts(
+        self, profile_id: int, attempts: list[dict[str, Any]]
+    ) -> None:
+        """Persist each charged profile-search outcome for reliability reports."""
+        if not attempts:
+            return
+        now = utcnow()
+        rows = [
+            (
+                profile_id,
+                str(attempt.get("query") or ""),
+                str(attempt.get("status") or "error"),
+                str(attempt.get("error") or "")[:1000] or None,
+                str(attempt.get("attempted_at") or now),
+            )
+            for attempt in attempts
+        ]
+        with self.connect() as conn:
+            conn.executemany(
+                """INSERT INTO serpapi_profile_attempts(
+                  profile_id,query_id,status,error,attempted_at
+                ) VALUES(?,?,?,?,?)""",
+                rows,
+            )
 
     def migration_applied(self, name: str) -> bool:
         return self.row("SELECT name FROM schema_migrations WHERE name=?", (name,)) is not None

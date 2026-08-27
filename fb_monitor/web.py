@@ -437,12 +437,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         storage_latest = decorate_snapshot(storage_rows[0], storage_rows[1] if len(storage_rows) > 1 else None) if storage_rows else None
         official_usage = db.apify_usage_snapshot()
         serpapi_usage = db.serpapi_usage_snapshot()
+        serpapi_reliability = db.rows(
+            """SELECT COALESCE(p.display_name,p.name) name,
+            CASE WHEN p.fb_id <> '' AND p.fb_id NOT GLOB '*[^0-9]*' THEN p.fb_id ELSE '' END AS fb_id,
+            SUM(CASE WHEN spa.status='success' THEN 1 ELSE 0 END) success_count,
+            SUM(CASE WHEN spa.status='empty' THEN 1 ELSE 0 END) empty_count,
+            SUM(CASE WHEN spa.status='error' THEN 1 ELSE 0 END) error_count,
+            MAX(CASE WHEN spa.status='success' THEN spa.attempted_at END) last_success_at,
+            MAX(spa.attempted_at) last_attempt_at
+            FROM profiles p LEFT JOIN serpapi_profile_attempts spa
+              ON spa.profile_id=p.id AND spa.attempted_at>=datetime('now','-30 days')
+            WHERE p.enabled=1 GROUP BY p.id ORDER BY success_count DESC,empty_count ASC,p.id"""
+        )
+        for row in serpapi_reliability:
+            total = int(row.get("success_count") or 0) + int(row.get("empty_count") or 0) + int(row.get("error_count") or 0)
+            row["total_count"] = total
+            row["success_rate"] = round(100 * int(row.get("success_count") or 0) / total) if total else None
+            row["last_success_display"] = display_time(row.get("last_success_at"), cfg.timezone)
+            row["last_attempt_display"] = display_time(row.get("last_attempt_at"), cfg.timezone)
         capture_v2 = _capture_v2_summary(db, cfg.capture_v2_enabled)
         if official_usage:
             official_usage["cycle_start_display"] = display_time(official_usage.get("cycle_start_at"), cfg.timezone)
             official_usage["cycle_end_display"] = display_time(official_usage.get("cycle_end_at"), cfg.timezone)
             official_usage["fetched_display"] = display_time(official_usage.get("fetched_at"), cfg.timezone)
-        return templates.TemplateResponse(request, "dashboard.html", {"profiles": profiles, "usage": usage, "official_usage": official_usage, "serpapi_usage": serpapi_usage, "pending": pending, "outbox": outbox, "outbox_counts": outbox_counts, "outbox_rows": outbox_rows, "maintenance_runs": maintenance_runs, "media": media, "storage_latest": storage_latest, "budget": cfg.monthly_budget_usd, "monitored": monitored, "max_profiles": MAX_PROFILES, "browser_enabled": cfg.facebook_browser_enabled, "capture_v2": capture_v2, "notice": notice, "error": error})
+        return templates.TemplateResponse(request, "dashboard.html", {"profiles": profiles, "usage": usage, "official_usage": official_usage, "serpapi_usage": serpapi_usage, "serpapi_reliability": serpapi_reliability, "pending": pending, "outbox": outbox, "outbox_counts": outbox_counts, "outbox_rows": outbox_rows, "maintenance_runs": maintenance_runs, "media": media, "storage_latest": storage_latest, "budget": cfg.monthly_budget_usd, "monitored": monitored, "max_profiles": MAX_PROFILES, "browser_enabled": cfg.facebook_browser_enabled, "capture_v2": capture_v2, "notice": notice, "error": error})
 
     @app.get("/storage")
     def storage_detail(request: Request):

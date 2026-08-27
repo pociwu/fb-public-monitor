@@ -58,7 +58,7 @@ from .media import MediaStore, extract_media
 from .normalize import content_hash, facebook_post_identity, normalize_url
 from .raw_retention import cleanup_capture_raw
 from .telegram import TelegramSender
-from .serpapi import SerpApiError, SerpApiGateway, SerpApiQuotaExceeded, profile_id_from_url
+from .serpapi import SerpApiError, SerpApiGateway, SerpApiNoResults, SerpApiQuotaExceeded, profile_id_from_url
 from .storage import collect_storage_snapshot, daily_storage_message
 from .timeutil import telegram_time
 
@@ -173,6 +173,48 @@ class MonitorService:
         self.stop_event = asyncio.Event()
         self._maintenance_lock = asyncio.Lock()
         self._config_mtime = settings.config_path.stat().st_mtime
+
+    def _serpapi_aliases(self, profile: dict[str, Any]) -> tuple[str, ...]:
+        """Return only identity-bearing aliases, never an unverified display name."""
+        candidates: list[str] = [str(profile.get("fb_id") or "")]
+        try:
+            details = json.loads(str(profile.get("profile_details_json") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            details = {}
+        if isinstance(details, dict):
+            for key in ("id", "profile_id", "profileId", "username", "handle", "url", "facebookUrl", "pageUrl"):
+                value = str(details.get(key) or "").strip()
+                if not value:
+                    continue
+                if value.startswith(("http://", "https://")):
+                    try:
+                        value = profile_id_from_url(value)
+                    except SerpApiError:
+                        continue
+                if value and " " not in value and len(value) <= 200:
+                    candidates.append(value)
+        primary = profile_id_from_url(str(profile["url"]))
+        return tuple(value for value in dict.fromkeys(candidates) if value and value != primary)
+
+    async def _lookup_serpapi_profile(self, profile: dict[str, Any]):
+        """Use the bounded retry policy while preserving simple test doubles."""
+        try:
+            return await self.serpapi.profile(
+                str(profile["url"]),
+                aliases=self._serpapi_aliases(profile),
+                max_attempts=self.settings.serpapi_max_attempts,
+                empty_retry_seconds=self.settings.serpapi_empty_retry_seconds,
+            )
+        except TypeError as exc:
+            # Older plug-ins and isolated test doubles may still expose the
+            # original one-argument adapter.  Real gateway TypeErrors are not
+            # masked unless they are the signature mismatch itself.
+            if "unexpected keyword" not in str(exc):
+                raise
+            return await self.serpapi.profile(str(profile["url"]))
+
+    def _record_serpapi_attempts(self, profile_id: int, attempts: list[dict[str, Any]]) -> None:
+        self.db.record_serpapi_profile_attempts(profile_id, attempts)
 
     @staticmethod
     def _lease_is_active(row: dict[str, Any]) -> bool:
@@ -1872,9 +1914,10 @@ class MonitorService:
         error = ""
         try:
             if selected is ProbeSource.SERPAPI:
-                result = await self.serpapi.profile(str(profile["url"]))
-                result.account.searches_left = max(0, result.account.searches_left - 1)
-                result.account.this_month_usage += 1
+                result = await self._lookup_serpapi_profile(profile)
+                self._record_serpapi_attempts(int(profile["id"]), result.attempts)
+                result.account.searches_left = max(0, result.account.searches_left - result.searches_used)
+                result.account.this_month_usage += result.searches_used
                 self.db.save_serpapi_usage(result.account)
                 item = dict(result.item)
             elif selected is ProbeSource.APIFY:
@@ -1884,6 +1927,12 @@ class MonitorService:
             else:
                 error = decision.reason
         except (SerpApiError, BrightDataError, ApifyFrozen, BudgetExceeded, RuntimeError) as exc:
+            if isinstance(exc, SerpApiNoResults):
+                self._record_serpapi_attempts(int(profile["id"]), exc.attempts)
+            elif isinstance(exc, SerpApiError) and selected is ProbeSource.SERPAPI:
+                self._record_serpapi_attempts(int(profile["id"]), [{
+                    "query": profile_id_from_url(str(profile["url"])), "status": "error", "error": str(exc),
+                }])
             error = str(exc)
             if selected is not ProbeSource.BRIGHT_DATA and self.settings.brightdata_api_token:
                 try:
@@ -4612,7 +4661,27 @@ class MonitorService:
                     },
                 )
                 await self._try_brightdata_fallback(profile, str(exc))
+            except SerpApiNoResults as exc:
+                self._record_serpapi_attempts(profile_id, exc.attempts)
+                hour = datetime.now(UTC).strftime("%Y-%m-%dT%H")
+                self.db.add_event(
+                    f"serpapi:{profile_id}:{hour}:empty",
+                    "serpapi_empty",
+                    {
+                        "title": "SerpApi 個人檔案查無結果",
+                        "text": (
+                            f"已用 {len(exc.attempts)} 次受控查詢仍無結果；將改用備援來源。\n"
+                            f"監控網址：{profile['url']}"
+                        ),
+                        "source_url": profile["url"],
+                    },
+                    profile_id,
+                )
+                await self._try_brightdata_fallback(profile, str(exc))
             except SerpApiError as exc:
+                self._record_serpapi_attempts(profile_id, [{
+                    "query": profile_id_from_url(str(profile["url"])), "status": "error", "error": str(exc),
+                }])
                 hour = datetime.now(UTC).strftime("%Y-%m-%dT%H")
                 self.db.add_event(
                     f"serpapi:{profile_id}:{hour}:failed",
@@ -5125,12 +5194,13 @@ class MonitorService:
         return datetime.now(UTC) - checked >= timedelta(hours=self.settings.serpapi_profile_refresh_hours)
 
     async def _refresh_serpapi_profile(self, profile: dict[str, Any]) -> None:
-        result = await self.serpapi.profile(str(profile["url"]))
+        result = await self._lookup_serpapi_profile(profile)
+        self._record_serpapi_attempts(int(profile["id"]), result.attempts)
         account = result.account
         # Account API is queried immediately before the successful search, so
         # reflect the just-consumed search in the local dashboard snapshot.
-        account.searches_left = max(0, account.searches_left - 1)
-        account.this_month_usage += 1
+        account.searches_left = max(0, account.searches_left - result.searches_used)
+        account.this_month_usage += result.searches_used
         self.db.save_serpapi_usage(account)
         item = dict(result.item)
         item["profile_data_source"] = "SerpApi"

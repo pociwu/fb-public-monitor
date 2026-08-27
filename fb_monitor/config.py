@@ -124,6 +124,8 @@ class Settings:
     backfill_posts: int = 20
     full_audit_days: int = 30
     serpapi_profile_refresh_hours: float = 48
+    serpapi_max_attempts: int = 2
+    serpapi_empty_retry_seconds: float = 30
     browser_canary_enabled: bool = True
     browser_canary_max_posts: int = 2
     browser_canary_cooldown_hours: float = 72
@@ -244,6 +246,8 @@ def load_settings(path: str | Path | None = None) -> Settings:
         backfill_posts=int(schedule.get("backfill_posts", 20)),
         full_audit_days=int(schedule.get("full_audit_days", 30)),
         serpapi_profile_refresh_hours=float(schedule.get("serpapi_profile_refresh_hours", 48)),
+        serpapi_max_attempts=max(1, min(2, int(schedule.get("serpapi_max_attempts", 2)))),
+        serpapi_empty_retry_seconds=max(0.0, min(300.0, float(schedule.get("serpapi_empty_retry_seconds", 30)))),
         browser_canary_enabled=bool(browser_canary.get("enabled", True)),
         browser_canary_max_posts=max(0, min(2, int(browser_canary.get("max_posts", 2)))),
         browser_canary_cooldown_hours=max(24, float(browser_canary.get("cooldown_hours", 72))),

@@ -19,6 +19,9 @@ schedule:
   # 完成回溯後，每月只核對最近 5 篇；不會清除歷史游標。
   full_audit_days: 30
   serpapi_profile_refresh_hours: 48
+  # 空結果時最多再嘗試一次；每次搜尋都可能消耗一筆 SerpApi 額度。
+  serpapi_max_attempts: 2
+  serpapi_empty_retry_seconds: 30
 
 capture_v2:
   # 安全部署預設關閉。先在網頁執行 Actor 契約測試並確認通過，再改為 true。
