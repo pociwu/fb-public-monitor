@@ -27,6 +27,168 @@ async def test_ingest_versions_and_deduplicates(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_photo_is_stable_entity_and_silent_backfill_has_no_outbox(
+    tmp_path: Path,
+    monkeypatch,
+):
+    db = Database(tmp_path / "db.sqlite")
+    db.execute(
+        "INSERT INTO profiles(name,display_name,url,created_at,updated_at) "
+        "VALUES('p','測試帳號','https://facebook.com/100','x','x')"
+    )
+    store = MediaStore(db, tmp_path, 0, 30)
+
+    async def fake_download(url):
+        return {
+            "status": "ready",
+            "sha256": "same-photo-bytes",
+            "path": str(tmp_path / "photo.jpg"),
+            "mime_type": "image/jpeg",
+            "size_bytes": 123,
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(store, "download", fake_download)
+    ingester = Ingester(db, tmp_path, store)
+    first_item = {
+        "photoUrl": "https://m.facebook.com/photo.php?fbid=987654321&set=a.123",
+        "image": "https://scontent-a.xx.fbcdn.net/v/photo/object.jpg?_nc_sid=one&oh=old",
+        "caption": "公開照片說明",
+        "publishTime": "2026-08-30T12:34:00+08:00",
+    }
+    entity_id, photo_id, changed = await ingester.ingest(
+        1, "photo", first_item, notify=False
+    )
+
+    assert changed is True
+    assert photo_id == "987654321"
+    entity = db.row("SELECT * FROM entities WHERE id=?", (entity_id,))
+    assert entity["kind"] == "photo"
+    assert entity["source_url"] == first_item["photoUrl"]
+    assert db.row("SELECT COUNT(*) count FROM entity_media")["count"] == 1
+    assert db.row("SELECT COUNT(*) count FROM outbox")["count"] == 0
+
+    event = db.row("SELECT payload_json FROM events WHERE entity_id=?", (entity_id,))
+    payload = json.loads(event["payload_json"])
+    assert payload["title"] == "【新增照片】測試帳號"
+    assert "說明：公開照片說明" in payload["text"]
+    version = db.row("SELECT markdown_path FROM versions WHERE entity_id=?", (entity_id,))
+    markdown = Path(version["markdown_path"]).read_text(encoding="utf-8")
+    assert "# 公開照片" in markdown
+    assert "- 類型：照片" in markdown
+    assert "2026-08-30 12:34" in markdown
+
+    # Mobile/desktop permalink aliases and rotating CDN signatures must not
+    # create a second entity or version for the same public photo.
+    second_item = {
+        **first_item,
+        "photoUrl": "https://www.facebook.com/photo/?set=a.123&fbid=987654321&type=3",
+        "image": "https://scontent-b.xx.fbcdn.net/v/photo/object.jpg?_nc_sid=two&oh=new",
+    }
+    second_entity_id, second_photo_id, changed = await ingester.ingest(
+        1, "photo", second_item, notify=False
+    )
+    assert second_entity_id == entity_id
+    assert second_photo_id == photo_id
+    assert changed is False
+    assert db.row("SELECT COUNT(*) count FROM entities WHERE kind='photo'")["count"] == 1
+    assert db.row("SELECT COUNT(*) count FROM versions WHERE entity_id=?", (entity_id,))["count"] == 1
+    assert db.row("SELECT COUNT(*) count FROM outbox")["count"] == 0
+
+    assert ingester.notify_persisted(entity_id) is True
+    persisted = db.row(
+        "SELECT * FROM events WHERE event_key=?",
+        (f"persisted-photo:{entity_id}:{entity['current_hash']}",),
+    )
+    assert persisted is not None
+    queued = db.rows(
+        "SELECT kind,media_sha256,payload_json FROM outbox ORDER BY id"
+    )
+    assert [row["kind"] for row in queued] == ["summary", "media"]
+    assert queued[1]["media_sha256"] == "same-photo-bytes"
+    assert json.loads(queued[1]["payload_json"])["path"] == str(
+        tmp_path / "photo.jpg"
+    )
+    assert ingester.notify_persisted(entity_id) is False
+    assert db.row("SELECT COUNT(*) count FROM outbox")["count"] == 2
+    db.execute("DELETE FROM outbox WHERE kind='media'")
+    assert ingester.notify_persisted(entity_id) is False
+    assert db.row("SELECT COUNT(*) count FROM outbox WHERE kind='media'")["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_persisted_photo_notifications_dedupe_media_globally_by_sha(
+    tmp_path: Path,
+    monkeypatch,
+):
+    db = Database(tmp_path / "db.sqlite")
+    db.execute(
+        "INSERT INTO profiles(name,url,created_at,updated_at) "
+        "VALUES('p','https://facebook.com/100','x','x')"
+    )
+    store = MediaStore(db, tmp_path, 0, 30)
+
+    async def fake_download(url):
+        return {
+            "status": "ready",
+            "sha256": "identical-file-sha",
+            "path": str(tmp_path / "same.jpg"),
+            "mime_type": "image/jpeg",
+            "size_bytes": 321,
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(store, "download", fake_download)
+    ingester = Ingester(db, tmp_path, store)
+    first_entity, _, _ = await ingester.ingest(
+        1,
+        "photo",
+        {
+            "photoUrl": "https://facebook.com/photo/?fbid=111111",
+            "image": "https://cdn.example/first.jpg",
+        },
+        notify=False,
+    )
+    second_entity, _, _ = await ingester.ingest(
+        1,
+        "photo",
+        {
+            "photoUrl": "https://facebook.com/photo/?fbid=222222",
+            "image": "https://cdn.example/second-name.jpg",
+        },
+        notify=False,
+    )
+
+    assert first_entity != second_entity
+    assert ingester.notify_persisted(first_entity) is True
+    assert ingester.notify_persisted(second_entity) is True
+    assert db.row("SELECT COUNT(*) count FROM outbox WHERE kind='summary'")[
+        "count"
+    ] == 2
+    assert db.row("SELECT COUNT(*) count FROM outbox WHERE kind='media'")[
+        "count"
+    ] == 1
+    assert db.row(
+        "SELECT media_sha256 FROM outbox WHERE kind='media'"
+    )["media_sha256"] == "identical-file-sha"
+
+
+def test_photo_without_facebook_permalink_uses_stable_cdn_object_identity():
+    from fb_monitor.ingest import external_id
+
+    first_id = external_id(
+        {"image": "https://scontent-a.xx.fbcdn.net/v/photo/object.jpg?_nc_sid=one&oh=old"},
+        "photo",
+    )
+    second_id = external_id(
+        {"image": "https://scontent-b.xx.fbcdn.net/v/photo/object.jpg?_nc_sid=two&oh=new"},
+        "photo",
+    )
+
+    assert first_id == second_id
+
+
+@pytest.mark.asyncio
 async def test_unchanged_profile_upgrades_low_resolution_avatar(tmp_path: Path, monkeypatch):
     db = Database(tmp_path / "db.sqlite")
     db.execute("INSERT INTO profiles(name,url,created_at,updated_at) VALUES('p','https://facebook.com/100','x','x')")

@@ -6,9 +6,14 @@ import re
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError, async_playwright
+from playwright.async_api import (
+    Error as PlaywrightError,
+    Page,
+    TimeoutError as PlaywrightTimeoutError,
+    async_playwright,
+)
 
 from .normalize import facebook_post_identity, normalize_url
 
@@ -157,6 +162,27 @@ def _facebook_permalink_owner(value: object) -> str:
     # They cannot independently prove that the article belongs to the watched
     # account, so verification deliberately rejects them here.
     return ""
+
+
+def _facebook_photo_media_identity(value: object) -> str:
+    """Return the photo itself, not an album/set segment from a viewer URL."""
+    url = str(value or "")
+    if not url or not _is_facebook_host(url):
+        return ""
+    parsed = urlsplit(url)
+    query = {key.casefold(): item for key, item in parse_qs(parsed.query).items()}
+    if values := query.get("fbid"):
+        return str(values[0]).strip()
+    parts = [unquote(part).strip() for part in parsed.path.split("/") if part.strip()]
+    folded = [part.casefold() for part in parts]
+    if "photos" not in folded:
+        return ""
+    after = parts[folded.index("photos") + 1 :]
+    # Album-shaped URLs look like /owner/photos/a.<set-id>/<photo-id>.
+    # The old generic post helper returned a.<set-id>, merging every photo in
+    # that album into one entity. Prefer the final numeric/media token.
+    candidates = [part for part in after if part and not part.casefold().startswith("a.")]
+    return candidates[-1] if candidates else ""
 
 
 def public_content_proof(raw: dict[str, Any], profile_url: str) -> dict[str, Any] | None:
@@ -500,6 +526,11 @@ class FacebookBrowserGateway:
         self.album_batch_max_operations = 20
         self.album_batch_max_new_photos = 20
         self.album_batch_max_seconds = 180
+        self.profile_photo_grid_batch_max_scrolls = 20
+        self.profile_photo_grid_stable_rounds = 3
+        self.profile_photo_grid_replay_wait_ms = 200
+        self.profile_photo_grid_replay_max_seconds = 45
+        self.profile_photo_permalink_max_attempts = 3
         self._canary_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self._expanded_canary_cache: set[str] = set()
 
@@ -781,6 +812,9 @@ class FacebookBrowserGateway:
         *,
         operation_limit: int | None = None,
         deadline: float | None = None,
+        photo_link_selector: str | None = None,
+        collect_initial_images: bool = True,
+        diagnostic_key: str | None = None,
     ) -> tuple[list[str], dict[str, Any]]:
         state = dict(progress or {})
         if not post_url:
@@ -788,38 +822,61 @@ class FacebookBrowserGateway:
         state["schema_version"] = 2
         state["post_url"] = normalize_url(post_url)
         collected = [str(url) for url in state.get("collected_photos") or [] if url]
+        collected_items: list[dict[str, str]] = []
+        seen_item_ids: set[str] = set()
+        for raw_item in state.get("collected_items") or []:
+            if not isinstance(raw_item, dict):
+                continue
+            item_id = str(raw_item.get("id") or "").strip()
+            viewer_url = normalize_url(str(raw_item.get("url") or ""))
+            image_url = str(raw_item.get("image") or "").strip()
+            if not item_id or not viewer_url or not image_url or item_id in seen_item_ids:
+                continue
+            collected_items.append({"id": item_id, "url": viewer_url, "image": image_url})
+            seen_item_ids.add(item_id)
         seen = {str(value) for value in state.get("seen_assets") or [] if value}
         seen.update(normalize_url(url) for url in collected)
         seen_media_ids = {str(value) for value in state.get("seen_media_ids") or [] if value}
         new_photos = 0
         operations = 0
 
-        def remember(url: str) -> None:
+        def remember(url: str, media_id: str = "", viewer_url: str = "") -> None:
             nonlocal new_photos
             asset = normalize_url(url)
-            if not url or not asset or asset in seen:
+            if not url or not asset:
                 return
-            collected.append(url)
-            seen.add(asset)
-            new_photos += 1
+            if asset not in seen:
+                collected.append(url)
+                seen.add(asset)
+                new_photos += 1
+            viewer = normalize_url(viewer_url)
+            item_id = str(media_id or facebook_post_identity(viewer) or asset)
+            if viewer and _is_facebook_host(viewer) and item_id not in seen_item_ids:
+                collected_items.append({"id": item_id, "url": viewer, "image": url})
+                seen_item_ids.add(item_id)
 
         response = await page.goto(post_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
         if response and response.status >= 400:
             raise FacebookBrowserError(f"Facebook 貼文頁面 HTTP {response.status}")
         await page.wait_for_timeout(round(random.uniform(2200, 3800)))
-        await self._raise_for_access_wall(page)
-        for url in await self._large_facebook_images(
-            page,
-            "[role='main'] [role='article'] img, main [role='article'] img",
-        ):
-            remember(url)
+        await self._raise_for_access_wall(page, diagnostic_key)
+        if collect_initial_images:
+            for url in await self._large_facebook_images(
+                page,
+                "[role='main'] [role='article'] img, main [role='article'] img",
+            ):
+                remember(url)
 
         if bool(state.get("completed")):
             return collected, state
 
-        photo_links = await page.locator(
-            "[role='main'] [role='article'] a[href*='/photo'], main [role='article'] a[href*='/photo']"
-        ).evaluate_all("nodes => nodes.map(node => node.href || '').filter(Boolean)")
+        link_selector = photo_link_selector or (
+            "[role='main'] [role='article'] a[href*='/photo'], "
+            "main [role='article'] a[href*='/photo']"
+        )
+        photo_links = await page.locator(link_selector).evaluate_all(
+            "nodes => nodes.map(node => node.href || '').filter(Boolean)"
+        )
         first_photo_url = next(
             (normalize_url(str(url)) for url in photo_links if is_facebook_permalink(url)),
             "",
@@ -833,6 +890,7 @@ class FacebookBrowserGateway:
                 "seen_assets": sorted(seen),
                 "seen_media_ids": sorted(seen_media_ids),
                 "collected_photos": collected,
+                "collected_items": collected_items,
                 "resume_url": "",
                 "completed": False,
                 "terminal_reason": "",
@@ -845,7 +903,7 @@ class FacebookBrowserGateway:
 
         await page.goto(viewer_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
         await page.wait_for_timeout(round(random.uniform(1800, 3200)))
-        await self._raise_for_access_wall(page)
+        await self._raise_for_access_wall(page, diagnostic_key)
         first_media_id = str(state.get("first_media_id") or "")
         viewer_seen: set[str] = set()
         successful_transitions = 0
@@ -889,8 +947,23 @@ class FacebookBrowserGateway:
                 if not first_media_id:
                     first_media_id = media_id
                 seen_media_ids.add(media_id)
-            remember(current)
-            resume_url = normalize_url(str(getattr(page, "url", "") or "")) or viewer_url
+            page_url = normalize_url(str(getattr(page, "url", "") or ""))
+            parsed_page_url = urlsplit(page_url)
+            page_query = {key.casefold(): value for key, value in parse_qs(parsed_page_url.query).items()}
+            page_path = parsed_page_url.path.rstrip("/").casefold()
+            if not (
+                page_query.get("fbid")
+                or "/photos/" in page_path
+                or page_path in {"/photo", "/photo.php"}
+            ):
+                page_url = ""
+            photo_url = page_url or (
+                f"https://www.facebook.com/photo.php?fbid={quote(media_id, safe='')}"
+                if media_id
+                else ""
+            )
+            remember(current, media_id, photo_url)
+            resume_url = photo_url or viewer_url
             if position and total and position >= total:
                 completed = True
                 terminal_reason = "declared_last_position"
@@ -919,7 +992,7 @@ class FacebookBrowserGateway:
                 stalled_reason = "viewer_did_not_advance"
                 break
             successful_transitions += 1
-            await self._raise_for_access_wall(page)
+            await self._raise_for_access_wall(page, diagnostic_key)
             await page.wait_for_timeout(round(random.uniform(3000, 7000)))
         state.update({
             "schema_version": 2,
@@ -927,6 +1000,7 @@ class FacebookBrowserGateway:
             "seen_assets": sorted(seen),
             "seen_media_ids": sorted(seen_media_ids),
             "collected_photos": collected,
+            "collected_items": collected_items,
             "first_media_id": first_media_id,
             "resume_url": "" if completed else resume_url,
             "completed": completed,
@@ -939,6 +1013,740 @@ class FacebookBrowserGateway:
             "updated_at": time.time(),
         })
         return collected, state
+
+    async def public_profile_photos(
+        self,
+        profile_url: str,
+        progress: dict[str, Any] | None = None,
+        diagnostic_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Collect one resumable batch from a profile's public Photos surface.
+
+        Collection is deliberately two-phase.  The anonymous ``photos_by``
+        grid is first scrolled to a stable bottom and its target-photo
+        permalinks are checkpointed.  Only then are those permalinks opened
+        individually, at most twenty originals per invocation.  A viewer's
+        position/total describes one album and is therefore never accepted as
+        proof that the account-wide Photos surface is complete.
+        """
+        if not self.enabled:
+            raise FacebookBrowserError("Facebook 直接瀏覽器備援未啟用")
+        profile_identity = _facebook_profile_identity(profile_url)
+        if not profile_identity:
+            raise FacebookBrowserError("Facebook 個人檔案網址無法辨識")
+        photos_url = (
+            f"https://www.facebook.com/{quote(profile_identity, safe='._-')}/photos_by"
+        )
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        async with async_playwright() as playwright:
+            try:
+                context = await playwright.chromium.launch_persistent_context(
+                    str(self.data_dir),
+                    headless=True,
+                    locale="zh-TW",
+                    timezone_id="Asia/Taipei",
+                    viewport={"width": 1365, "height": 900},
+                    args=["--disable-dev-shm-usage"],
+                )
+            except Exception as exc:
+                raise FacebookBrowserError(f"無法啟動 Chromium 公開相片續抓：{exc}") from exc
+            try:
+                # This collector is anonymous by contract.  A persistent
+                # directory contaminated with an authenticated c_user cookie
+                # must fail before *any* page navigation; otherwise results
+                # could include friend-only inventory and be mislabeled public.
+                cookies = await context.cookies("https://www.facebook.com")
+                if any(
+                    cookie.get("name") == "c_user" and cookie.get("value")
+                    for cookie in cookies
+                ):
+                    raise FacebookBrowserLoginRequired(
+                        "匿名公開相片瀏覽器含 Facebook 登入 cookie，已停止以避免混用權限"
+                    )
+                if self.require_login:
+                    raise FacebookBrowserError("公開相片回溯必須使用獨立匿名瀏覽器")
+                page = context.pages[0] if context.pages else await context.new_page()
+                try:
+                    result = await self._collect_public_profile_photo_inventory(
+                        page,
+                        photos_url,
+                        profile_identity,
+                        progress,
+                        diagnostic_key=diagnostic_key,
+                    )
+                except FacebookBrowserError:
+                    raise
+                except Exception as exc:
+                    await self._save_failure(page, diagnostic_key)
+                    raise FacebookBrowserError(
+                        f"Facebook 公開相片解析失敗：{exc.__class__.__name__}"
+                    ) from exc
+            finally:
+                await context.close()
+        return result
+
+    async def _collect_public_profile_photo_inventory(
+        self,
+        page: Page,
+        photos_url: str,
+        profile_identity: str,
+        progress: dict[str, Any] | None = None,
+        *,
+        diagnostic_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Discover the whole target grid, then fetch a bounded media batch."""
+        original_state = progress if isinstance(progress, dict) else {}
+        state = dict(original_state)
+        previous_schema = int(state.get("schema_version") or 0)
+        profile_root_url = photos_url.removesuffix("/photos_by")
+
+        profile_owner_aliases: list[str] = []
+        allowed_owner_keys: set[str] = set()
+
+        def remember_owner_alias(raw_alias: object) -> None:
+            value = str(raw_alias or "").strip()
+            if not value:
+                return
+            alias = _facebook_profile_identity(value) if _is_facebook_host(value) else value
+            alias = alias.strip().strip("/")
+            if not alias or not re.fullmatch(r"[A-Za-z0-9._-]+", alias):
+                return
+            key = alias.casefold()
+            if key not in allowed_owner_keys:
+                allowed_owner_keys.add(key)
+                profile_owner_aliases.append(alias)
+
+        remember_owner_alias(profile_identity)
+        for raw_alias in state.get("profile_owner_aliases") or []:
+            remember_owner_alias(raw_alias)
+
+        collected_items: list[dict[str, str]] = []
+        collected_by_id: dict[str, int] = {}
+        for raw_item in state.get("collected_items") or []:
+            if not isinstance(raw_item, dict):
+                continue
+            item_id = str(raw_item.get("id") or "").strip()
+            viewer_url = normalize_url(str(raw_item.get("url") or ""))
+            image_url = str(raw_item.get("image") or "").strip()
+            if not item_id or not viewer_url or not image_url or item_id in collected_by_id:
+                continue
+            collected_by_id[item_id] = len(collected_items)
+            collected_items.append({"id": item_id, "url": viewer_url, "image": image_url})
+
+        discovered_urls: list[str] = []
+        discovered_keys: set[str] = set()
+
+        def photo_key(url: object) -> str:
+            normalized = normalize_url(str(url or ""))
+            media_id = _facebook_photo_media_identity(normalized)
+            return f"media:{media_id}" if media_id else normalized
+
+        def remember_discovered(raw_url: object) -> None:
+            normalized = normalize_url(str(raw_url or ""))
+            if not normalized or not is_facebook_permalink(normalized):
+                return
+            if not _facebook_photo_media_identity(normalized):
+                return
+            owner = _facebook_permalink_owner(normalized)
+            if owner and owner.casefold() not in allowed_owner_keys:
+                return
+            key = photo_key(normalized)
+            if key and key not in discovered_keys:
+                discovered_keys.add(key)
+                discovered_urls.append(normalized)
+
+        for raw_url in state.get("discovered_urls") or []:
+            remember_discovered(raw_url)
+        # Migrate checkpoints created by the previous viewer-walk
+        # implementation.  Previously collected items are valid processed
+        # photos, but its completed flag is not account-wide evidence.
+        for item in collected_items:
+            remember_discovered(item["url"])
+
+        processed_urls: list[str] = []
+        processed_keys: set[str] = set()
+
+        def remember_processed(raw_url: object) -> None:
+            normalized = normalize_url(str(raw_url or ""))
+            key = photo_key(normalized)
+            if normalized and key and key not in processed_keys:
+                processed_keys.add(key)
+                processed_urls.append(normalized)
+
+        for raw_url in state.get("processed_urls") or []:
+            remember_processed(raw_url)
+        if previous_schema < 3:
+            for item in collected_items:
+                remember_processed(item["url"])
+
+        # A media download can fail after the account-wide inventory has
+        # already been completed (for example because an fbcdn URL expired).
+        # Callers may request a bounded permalink refresh without invalidating
+        # the grid checkpoint or scrolling the Photos surface again.  Keep the
+        # requested IDs across resumable calls; once the grid is known complete
+        # only IDs that still belong to ``discovered_urls`` are actionable.
+        requested_refresh_media_ids: list[str] = []
+        requested_refresh_media_keys: set[str] = set()
+        for raw_media_id in state.get("refresh_media_external_ids") or []:
+            raw_value = str(raw_media_id or "").strip()
+            media_id = _facebook_photo_media_identity(raw_value) or raw_value
+            if (
+                not media_id
+                or len(media_id) > 512
+                or not re.fullmatch(r"[A-Za-z0-9._:-]+", media_id)
+                or media_id in requested_refresh_media_keys
+            ):
+                continue
+            requested_refresh_media_keys.add(media_id)
+            requested_refresh_media_ids.append(media_id)
+
+        permalink_failures: dict[str, dict[str, Any]] = {}
+        for raw_key, raw_failure in (state.get("permalink_failures") or {}).items():
+            if not isinstance(raw_failure, dict):
+                continue
+            failure_url = normalize_url(str(raw_failure.get("url") or ""))
+            key = photo_key(failure_url) or str(raw_key or "").strip()
+            attempts = max(0, int(raw_failure.get("attempts") or 0))
+            reason = str(raw_failure.get("last_reason") or "").strip()
+            if key and failure_url and attempts and reason:
+                permalink_failures[key] = {
+                    "url": failure_url,
+                    "attempts": attempts,
+                    "last_reason": reason,
+                    "updated_at": float(raw_failure.get("updated_at") or 0),
+                }
+
+        grid_complete = (
+            previous_schema >= 3
+            and bool(state.get("grid_complete"))
+            and bool(discovered_urls or state.get("grid_empty_confirmed"))
+        )
+        grid_empty_confirmed = bool(state.get("grid_empty_confirmed"))
+        batch_items: list[dict[str, str]] = []
+        batch_grid_replay_scrolls = 0
+        batch_grid_new_scrolls = 0
+        batch_operations = 0
+        stalled_reason = ""
+        terminal_reason = ""
+
+        if not grid_complete:
+            invocation_start_discovered = len(discovered_urls)
+            response = await page.goto(
+                photos_url, wait_until="domcontentloaded", timeout=self.timeout_ms
+            )
+            if response and response.status == 429:
+                raise FacebookBrowserChallengeRequired(
+                    "Facebook 公開相片頁回應 HTTP 429"
+                )
+            if response and response.status >= 400:
+                raise FacebookBrowserError(f"Facebook 公開相片頁 HTTP {response.status}")
+            await page.wait_for_timeout(round(random.uniform(2200, 3800)))
+            await self._raise_for_access_wall(page, diagnostic_key)
+
+            previous_depth = max(0, int(state.get("grid_scroll_depth") or 0))
+            stable_rounds = 0
+            last_signature: tuple[int, int] | None = None
+
+            async def inspect_grid() -> dict[str, int]:
+                try:
+                    links = await self._public_photo_grid_links(page, profile_identity)
+                    metrics = await self._public_photo_grid_metrics(page)
+                except (AttributeError, PlaywrightError, PlaywrightTimeoutError) as exc:
+                    raise FacebookBrowserError(
+                        f"public_photo_grid_dom_unavailable:{exc.__class__.__name__}"
+                    ) from exc
+                for link in links:
+                    remember_discovered(link)
+                return {
+                    "scroll_height": max(0, int(metrics.get("scroll_height") or 0)),
+                    "viewport_height": max(0, int(metrics.get("viewport_height") or 0)),
+                    "scroll_y": max(0, int(metrics.get("scroll_y") or 0)),
+                }
+
+            try:
+                latest_metrics = await inspect_grid()
+            except FacebookBrowserError as exc:
+                stalled_reason = str(exc)
+                latest_metrics = {}
+
+            # A new browser page starts at the top on every continuation. Replay
+            # only the previously checkpointed depth with a short wait, then
+            # grant a fresh budget of at most twenty slow discovery scrolls.
+            # Replay never increases grid_scroll_depth.
+            replay_started_at = time.monotonic()
+            while not stalled_reason and batch_grid_replay_scrolls < previous_depth:
+                if (
+                    time.monotonic() - replay_started_at
+                    >= self.profile_photo_grid_replay_max_seconds
+                ):
+                    stalled_reason = "public_photo_grid_replay_incomplete"
+                    break
+                try:
+                    await self._scroll_public_photo_grid(page)
+                    batch_grid_replay_scrolls += 1
+                    await page.wait_for_timeout(self.profile_photo_grid_replay_wait_ms)
+                    await self._raise_for_access_wall(page, diagnostic_key)
+                    latest_metrics = await inspect_grid()
+                except (AttributeError, PlaywrightError, PlaywrightTimeoutError) as exc:
+                    stalled_reason = (
+                        f"public_photo_grid_replay_unavailable:{exc.__class__.__name__}"
+                    )
+                except FacebookBrowserError as exc:
+                    stalled_reason = str(exc)
+
+            if (
+                not stalled_reason
+                and batch_grid_replay_scrolls != previous_depth
+            ):
+                stalled_reason = "public_photo_grid_replay_incomplete"
+
+            baseline_signature = (
+                len(discovered_urls),
+                int(latest_metrics.get("scroll_height") or 0),
+                int(latest_metrics.get("scroll_y") or 0),
+            )
+            discovery_started_at = time.monotonic()
+            while not stalled_reason:
+                height = max(0, int(latest_metrics.get("scroll_height") or 0))
+                viewport = max(0, int(latest_metrics.get("viewport_height") or 0))
+                position = max(0, int(latest_metrics.get("scroll_y") or 0))
+                at_bottom = bool(height and viewport and position + viewport >= height - 8)
+                signature = (len(discovered_urls), height)
+                if at_bottom and signature == last_signature:
+                    stable_rounds += 1
+                else:
+                    stable_rounds = 0
+                last_signature = signature
+                if at_bottom and stable_rounds >= self.profile_photo_grid_stable_rounds:
+                    if discovered_urls:
+                        grid_complete = True
+                    elif await self._public_photo_grid_empty_state(page):
+                        grid_complete = True
+                        grid_empty_confirmed = True
+                    else:
+                        stalled_reason = "public_photo_grid_empty_or_unavailable"
+                    break
+                if (
+                    batch_grid_new_scrolls >= self.profile_photo_grid_batch_max_scrolls
+                    or time.monotonic() - discovery_started_at >= self.album_batch_max_seconds
+                ):
+                    break
+                try:
+                    await self._scroll_public_photo_grid(page)
+                    batch_grid_new_scrolls += 1
+                    await page.wait_for_timeout(round(random.uniform(1600, 3000)))
+                    await self._raise_for_access_wall(page, diagnostic_key)
+                    latest_metrics = await inspect_grid()
+                except (AttributeError, PlaywrightError, PlaywrightTimeoutError) as exc:
+                    stalled_reason = (
+                        f"public_photo_grid_dom_unavailable:{exc.__class__.__name__}"
+                    )
+                except FacebookBrowserError as exc:
+                    stalled_reason = str(exc)
+
+            if not grid_complete and not stalled_reason:
+                final_signature = (
+                    len(discovered_urls),
+                    int(latest_metrics.get("scroll_height") or 0),
+                    int(latest_metrics.get("scroll_y") or 0),
+                )
+                made_progress = (
+                    len(discovered_urls) > invocation_start_discovered
+                    or final_signature != baseline_signature
+                )
+                if not made_progress:
+                    stalled_reason = "public_photo_grid_no_progress"
+
+            if not grid_complete and not stalled_reason:
+                # Hitting the bounded grid budget is explicitly resumable. A
+                # later run replays the saved depth and continues farther.
+                state.update({
+                    "schema_version": 4,
+                    "surface": "public_photo_pages",
+                    "profile_url": normalize_url(profile_root_url),
+                    "photos_url": photos_url,
+                    "profile_owner_aliases": profile_owner_aliases,
+                    "phase": "discover_grid",
+                    "discovered_urls": discovered_urls,
+                    "processed_urls": processed_urls,
+                    "collected_items": collected_items,
+                    "refresh_media_external_ids": requested_refresh_media_ids,
+                    "permalink_failures": permalink_failures,
+                    "permalink_max_attempts": self.profile_photo_permalink_max_attempts,
+                    "grid_complete": False,
+                    "grid_empty_confirmed": False,
+                    "grid_scroll_depth": previous_depth + batch_grid_new_scrolls,
+                    "grid_stable_rounds": stable_rounds,
+                    "resume_url": photos_url,
+                    "completed": False,
+                    "terminal_reason": "",
+                    "stalled_reason": "",
+                    "declared_total": None,
+                    "batch_new_photos": 0,
+                    "batch_operations": 0,
+                    "batch_grid_scrolls": batch_grid_new_scrolls,
+                    "batch_grid_replay_scrolls": batch_grid_replay_scrolls,
+                    "batch_grid_new_scrolls": batch_grid_new_scrolls,
+                    "total_grid_replay_scrolls": int(
+                        state.get("total_grid_replay_scrolls") or 0
+                    ) + batch_grid_replay_scrolls,
+                    "total_grid_new_scrolls": int(
+                        state.get("total_grid_new_scrolls") or 0
+                    ) + batch_grid_new_scrolls,
+                    "updated_at": time.time(),
+                })
+                return self._public_photo_result(state, batch_items)
+
+        if stalled_reason:
+            state.update({
+                "schema_version": 4,
+                "surface": "public_photo_pages",
+                "profile_url": normalize_url(profile_root_url),
+                "photos_url": photos_url,
+                "profile_owner_aliases": profile_owner_aliases,
+                "phase": "source_limited",
+                "discovered_urls": discovered_urls,
+                "processed_urls": processed_urls,
+                "collected_items": collected_items,
+                "refresh_media_external_ids": requested_refresh_media_ids,
+                "permalink_failures": permalink_failures,
+                "permalink_max_attempts": self.profile_photo_permalink_max_attempts,
+                "grid_complete": grid_complete,
+                "grid_empty_confirmed": grid_empty_confirmed,
+                "grid_scroll_depth": max(0, int(state.get("grid_scroll_depth") or 0))
+                + batch_grid_new_scrolls,
+                "resume_url": "",
+                "completed": False,
+                "terminal_reason": "",
+                "stalled_reason": stalled_reason,
+                "declared_total": len(discovered_urls) or None,
+                "batch_new_photos": 0,
+                "batch_operations": 0,
+                "batch_grid_scrolls": batch_grid_new_scrolls,
+                "batch_grid_replay_scrolls": batch_grid_replay_scrolls,
+                "batch_grid_new_scrolls": batch_grid_new_scrolls,
+                "total_grid_replay_scrolls": int(
+                    state.get("total_grid_replay_scrolls") or 0
+                ) + batch_grid_replay_scrolls,
+                "total_grid_new_scrolls": int(
+                    state.get("total_grid_new_scrolls") or 0
+                ) + batch_grid_new_scrolls,
+                "updated_at": time.time(),
+            })
+            return self._public_photo_result(state, batch_items)
+
+        discovered_media_ids = {
+            media_id
+            for url in discovered_urls
+            if (media_id := _facebook_photo_media_identity(url))
+        }
+        refresh_media_external_ids = [
+            media_id
+            for media_id in requested_refresh_media_ids
+            if media_id in discovered_media_ids
+        ]
+        refresh_media_keys = set(refresh_media_external_ids)
+        if refresh_media_keys:
+            # Mark requested media pending again, while retaining the last
+            # successfully collected item until a verified replacement is
+            # available.  A success below overwrites that item and emits it in
+            # this invocation's ``batch_items`` for the downloader.
+            processed_urls = [
+                url
+                for url in processed_urls
+                if _facebook_photo_media_identity(url) not in refresh_media_keys
+            ]
+            processed_keys = {photo_key(url) for url in processed_urls if photo_key(url)}
+
+        def failure_attempts(viewer_url: str) -> int:
+            return int(
+                (permalink_failures.get(photo_key(viewer_url)) or {}).get("attempts")
+                or 0
+            )
+
+        def remember_failure(viewer_url: str, reason: str) -> None:
+            key = photo_key(viewer_url)
+            if not key:
+                return
+            permalink_failures[key] = {
+                "url": normalize_url(viewer_url),
+                "attempts": failure_attempts(viewer_url) + 1,
+                "last_reason": reason,
+                "updated_at": time.time(),
+            }
+
+        pending_urls = [
+            url for url in discovered_urls if photo_key(url) not in processed_keys
+        ]
+        # A consistently bad first permalink must not starve the rest of the
+        # inventory. Fresh URLs are attempted before retries; every navigation,
+        # successful or not, consumes the same bounded operation budget.
+        refresh_pending_urls = [
+            url
+            for url in pending_urls
+            if _facebook_photo_media_identity(url) in refresh_media_keys
+        ]
+        ordinary_pending_urls = [
+            url
+            for url in pending_urls
+            if _facebook_photo_media_identity(url) not in refresh_media_keys
+        ]
+        unattempted_urls = [
+            url
+            for url in refresh_pending_urls + ordinary_pending_urls
+            if failure_attempts(url) == 0
+        ]
+        retry_urls = [
+            url
+            for url in refresh_pending_urls + ordinary_pending_urls
+            if 0 < failure_attempts(url) < self.profile_photo_permalink_max_attempts
+        ]
+        operation_limit = max(
+            1,
+            min(self.album_batch_max_operations, self.album_batch_max_new_photos),
+        )
+        for viewer_url in (unattempted_urls + retry_urls)[:operation_limit]:
+            batch_operations += 1
+            expected_media_id = _facebook_photo_media_identity(viewer_url)
+            if not expected_media_id:
+                remember_failure(viewer_url, "public_photo_expected_identity_missing")
+                continue
+            try:
+                response = await page.goto(
+                    viewer_url, wait_until="domcontentloaded", timeout=self.timeout_ms
+                )
+            except (AttributeError, PlaywrightError, PlaywrightTimeoutError) as exc:
+                remember_failure(
+                    viewer_url,
+                    f"public_photo_permalink_navigation:{exc.__class__.__name__}",
+                )
+                continue
+            if response and response.status >= 400:
+                if response.status == 429:
+                    raise FacebookBrowserChallengeRequired(
+                        "Facebook 公開相片連結回應 HTTP 429"
+                    )
+                remember_failure(
+                    viewer_url, f"public_photo_permalink_http_{response.status}"
+                )
+                continue
+            await page.wait_for_timeout(round(random.uniform(1800, 3200)))
+            await self._raise_for_access_wall(page, diagnostic_key)
+            try:
+                current_media_id = await self._current_viewer_media_id(page)
+            except (AttributeError, PlaywrightError, PlaywrightTimeoutError) as exc:
+                remember_failure(
+                    viewer_url,
+                    f"public_photo_viewer_dom_unavailable:{exc.__class__.__name__}",
+                )
+                continue
+            if not current_media_id:
+                remember_failure(viewer_url, "public_photo_current_identity_missing")
+                continue
+            if str(current_media_id) != str(expected_media_id):
+                remember_failure(
+                    viewer_url,
+                    "public_photo_media_identity_mismatch:"
+                    f"expected={expected_media_id},current={current_media_id}",
+                )
+                continue
+            try:
+                image_url = await self._public_photo_original_image(page)
+            except (AttributeError, PlaywrightError, PlaywrightTimeoutError) as exc:
+                remember_failure(
+                    viewer_url,
+                    f"public_photo_original_dom_unavailable:{exc.__class__.__name__}",
+                )
+                continue
+            if not image_url:
+                remember_failure(viewer_url, "public_photo_original_missing")
+                continue
+
+            current_url = normalize_url(str(getattr(page, "url", "") or ""))
+            if not is_facebook_permalink(current_url):
+                current_url = viewer_url
+            item = {
+                "id": str(expected_media_id),
+                "url": current_url,
+                "image": image_url,
+            }
+            if expected_media_id in collected_by_id:
+                collected_items[collected_by_id[expected_media_id]] = item
+            else:
+                collected_by_id[expected_media_id] = len(collected_items)
+                collected_items.append(item)
+            batch_items.append(item)
+            remember_processed(viewer_url)
+            permalink_failures.pop(photo_key(viewer_url), None)
+            if expected_media_id in refresh_media_keys:
+                refresh_media_keys.remove(expected_media_id)
+                refresh_media_external_ids = [
+                    media_id
+                    for media_id in refresh_media_external_ids
+                    if media_id != expected_media_id
+                ]
+
+        remaining = [
+            url for url in discovered_urls if photo_key(url) not in processed_keys
+        ]
+        retryable_remaining = [
+            url
+            for url in remaining
+            if failure_attempts(url) < self.profile_photo_permalink_max_attempts
+        ]
+        exhausted_remaining = [
+            url
+            for url in remaining
+            if failure_attempts(url) >= self.profile_photo_permalink_max_attempts
+        ]
+        if remaining and not retryable_remaining and exhausted_remaining:
+            stalled_reason = "public_photo_permalink_failures_exhausted"
+
+        completed = grid_complete and not remaining
+        if completed:
+            terminal_reason = (
+                "explicit_empty_grid" if grid_empty_confirmed else "grid_inventory_processed"
+            )
+        state.update({
+            "schema_version": 4,
+            "surface": "public_photo_pages",
+            "profile_url": normalize_url(profile_root_url),
+            "photos_url": photos_url,
+            "profile_owner_aliases": profile_owner_aliases,
+            "phase": "complete" if completed else ("source_limited" if stalled_reason else "fetch_media"),
+            "discovered_urls": discovered_urls,
+            "processed_urls": processed_urls,
+            "collected_items": collected_items,
+            "refresh_media_external_ids": refresh_media_external_ids,
+            "permalink_failures": permalink_failures,
+            "permalink_max_attempts": self.profile_photo_permalink_max_attempts,
+            "grid_complete": grid_complete,
+            "grid_empty_confirmed": grid_empty_confirmed,
+            "grid_scroll_depth": int(state.get("grid_scroll_depth") or 0)
+            + batch_grid_new_scrolls,
+            "resume_url": "" if completed or stalled_reason else (
+                retryable_remaining[0] if retryable_remaining else photos_url
+            ),
+            "completed": completed,
+            "terminal_reason": terminal_reason,
+            "stalled_reason": stalled_reason,
+            "declared_total": len(discovered_urls),
+            "batch_new_photos": len(batch_items),
+            "batch_operations": batch_operations,
+            "batch_grid_scrolls": batch_grid_new_scrolls,
+            "batch_grid_replay_scrolls": batch_grid_replay_scrolls,
+            "batch_grid_new_scrolls": batch_grid_new_scrolls,
+            "total_grid_replay_scrolls": int(
+                state.get("total_grid_replay_scrolls") or 0
+            ) + batch_grid_replay_scrolls,
+            "total_grid_new_scrolls": int(
+                state.get("total_grid_new_scrolls") or 0
+            ) + batch_grid_new_scrolls,
+            "total_operations": int(state.get("total_operations") or 0) + batch_operations,
+            "updated_at": time.time(),
+        })
+        return self._public_photo_result(state, batch_items)
+
+    @staticmethod
+    def _public_photo_result(
+        checkpoint: dict[str, Any], batch_items: list[dict[str, str]]
+    ) -> dict[str, Any]:
+        discovered_count = len(checkpoint.get("discovered_urls") or [])
+        processed_count = len(checkpoint.get("processed_urls") or [])
+        pending_count = max(0, discovered_count - processed_count)
+        failures = checkpoint.get("permalink_failures") or {}
+        max_attempts = max(1, int(checkpoint.get("permalink_max_attempts") or 3))
+        failure_count = len(failures) if isinstance(failures, dict) else 0
+        exhausted_failure_count = sum(
+            1
+            for failure in failures.values()
+            if isinstance(failure, dict)
+            and int(failure.get("attempts") or 0) >= max_attempts
+        ) if isinstance(failures, dict) else 0
+        checkpoint.update({
+            "discovered_count": discovered_count,
+            "processed_count": processed_count,
+            "pending_count": pending_count,
+            "permalink_failure_count": failure_count,
+            "permalink_exhausted_count": exhausted_failure_count,
+        })
+        resumable = bool(
+            not checkpoint.get("completed")
+            and not checkpoint.get("stalled_reason")
+            and checkpoint.get("resume_url")
+        )
+        return {
+            "items": [
+                dict(item)
+                for item in checkpoint.get("collected_items") or []
+                if isinstance(item, dict)
+            ],
+            "batch_items": [dict(item) for item in batch_items],
+            "progress": checkpoint,
+            "discovered_count": discovered_count,
+            "processed_count": processed_count,
+            "pending_count": pending_count,
+            "permalink_failure_count": failure_count,
+            "permalink_exhausted_count": exhausted_failure_count,
+            "grid_complete": bool(checkpoint.get("grid_complete")),
+            "resumable": resumable,
+            "completed": bool(checkpoint.get("completed")),
+            "terminal_reason": str(checkpoint.get("terminal_reason") or ""),
+            "stalled_reason": str(checkpoint.get("stalled_reason") or ""),
+        }
+
+    @staticmethod
+    async def _public_photo_grid_links(page: Page, profile_identity: str) -> list[str]:
+        raw_links = await page.locator(
+            "[role='main'] a[href*='/photo.php'][href*='fbid='], "
+            "[role='main'] a[href*='/photos/'], "
+            "main a[href*='/photo.php'][href*='fbid='], "
+            "main a[href*='/photos/']"
+        ).evaluate_all(
+            "nodes => nodes.filter(node => Boolean(node.querySelector('img, svg image')))"
+            ".map(node => node.href || '').filter(Boolean)"
+        )
+        links: list[str] = []
+        seen: set[str] = set()
+        for raw_url in raw_links if isinstance(raw_links, list) else []:
+            url = normalize_url(str(raw_url or ""))
+            if not url or not is_facebook_permalink(url):
+                continue
+            key = _facebook_photo_media_identity(url)
+            if not key:
+                continue
+            if key not in seen:
+                links.append(url)
+                seen.add(key)
+        return links
+
+    @staticmethod
+    async def _public_photo_grid_metrics(page: Page) -> dict[str, int]:
+        value = await page.evaluate(
+            "() => ({scroll_height: Math.max(document.body?.scrollHeight || 0, "
+            "document.documentElement?.scrollHeight || 0), viewport_height: window.innerHeight || 0, "
+            "scroll_y: window.scrollY || document.documentElement?.scrollTop || 0})"
+        )
+        return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    async def _public_photo_grid_empty_state(page: Page) -> bool:
+        value = await page.evaluate(
+            r"""() => [...document.querySelectorAll(
+                '[role="main"] [role="heading"], [role="main"] [role="status"], '
+                + 'main h1, main h2, main [role="status"]'
+            )]
+                .map(node => (node.innerText || node.textContent || '').trim().toLocaleLowerCase())
+                .some(text => /^(?:no photos(?: to show)?|no public photos|\u5c1a\u7121相片|\u6c92有相片|\u6c92有公開相片)$/.test(text))"""
+        )
+        return value is True
+
+    @staticmethod
+    async def _scroll_public_photo_grid(page: Page) -> None:
+        await page.evaluate(
+            "window.scrollTo(0, Math.max(document.body?.scrollHeight || 0, "
+            "document.documentElement?.scrollHeight || 0))"
+        )
 
     @staticmethod
     async def _current_viewer_media_id(page: Page) -> str:
@@ -955,10 +1763,11 @@ class FacebookBrowserGateway:
         try:
             candidates.extend(
                 await page.locator(
-                    "link[rel='canonical'], [role='dialog'] a[href*='fbid='], "
+                    "link[rel='canonical'], meta[property='og:url'], "
+                    "[role='dialog'] a[href*='fbid='], "
                     "[role='dialog'] a[href*='/photos/']"
                 ).evaluate_all(
-                    "nodes => nodes.map(node => node.href || '').filter(Boolean)"
+                    "nodes => nodes.map(node => node.href || node.content || '').filter(Boolean)"
                 )
             )
         except AttributeError:
@@ -972,7 +1781,10 @@ class FacebookBrowserGateway:
             # viewer frame look identical.
             if not (query.get("fbid") or "/photos/" in path or path in {"/photo", "/photo.php"}):
                 continue
-            if identity := facebook_post_identity(str(url)):
+            if identity := (
+                _facebook_photo_media_identity(str(url))
+                or facebook_post_identity(str(url))
+            ):
                 return identity
         return ""
 
@@ -1013,6 +1825,39 @@ class FacebookBrowserGateway:
         candidates = await self._large_facebook_images(
             page,
             "[role='dialog'] img, [role='main'] img, main img",
+        )
+        return candidates[0] if candidates else ""
+
+    async def _public_photo_original_image(self, page: Page) -> str:
+        """Return only media attributable to the currently verified viewer.
+
+        ``main img`` is intentionally not a fallback: profile chrome, suggested
+        posts and advertisements can be larger than the photo being opened.
+        The page-level Open Graph image is preferred, followed by media nodes
+        scoped to the viewer dialog or Facebook's media-viewer marker.
+        """
+        try:
+            metadata = await page.locator(
+                "meta[property='og:image'], meta[name='twitter:image']"
+            ).evaluate_all(
+                "nodes => nodes.map(node => node.content || '').filter(Boolean)"
+            )
+        except AttributeError:
+            metadata = []
+        for raw_url in metadata if isinstance(metadata, list) else []:
+            value = str(raw_url or "").strip()
+            if (
+                value.startswith(("http://", "https://"))
+                and "fbcdn.net" in (urlsplit(value).hostname or "").casefold()
+            ):
+                return value
+        candidates = await self._large_facebook_images(
+            page,
+            "[role='dialog'] img, "
+            "[role='main'] img[data-visualcompletion='media-vc-image'], "
+            "main img[data-visualcompletion='media-vc-image'], "
+            "[role='main'] [data-pagelet*='MediaViewer'] img, "
+            "main [data-pagelet*='MediaViewer'] img",
         )
         return candidates[0] if candidates else ""
 

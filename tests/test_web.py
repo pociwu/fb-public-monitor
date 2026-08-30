@@ -475,6 +475,199 @@ def test_dashboard_can_queue_immediate_browser_visit(tmp_path: Path, monkeypatch
     assert job and job["priority"] == -110 and '"manual":true' in job["payload_json"]
 
 
+def test_dashboard_queues_one_public_photo_capture_and_rejects_cross_site(
+    tmp_path: Path, monkeypatch
+):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("FACEBOOK_BROWSER_ENABLED", "1")
+    app = create_app(load_settings(config))
+    calls: list[int] = []
+
+    def queue_public_photo_capture(profile_id: int):
+        calls.append(profile_id)
+        return len(calls) == 1, {"status": "pending"}
+
+    monkeypatch.setattr(
+        app.state.service,
+        "queue_public_photo_capture",
+        queue_public_photo_capture,
+        raising=False,
+    )
+
+    with TestClient(app) as client:
+        dashboard = client.get("/")
+        rejected = client.post(
+            "/profiles/1/capture-photos",
+            headers={"Origin": "https://attacker.example"},
+            follow_redirects=False,
+        )
+        missing = client.post("/profiles/999/capture-photos", follow_redirects=False)
+        queued = client.post("/profiles/1/capture-photos", follow_redirects=False)
+        repeated = client.post("/profiles/1/capture-photos", follow_redirects=False)
+
+    assert dashboard.status_code == 200
+    assert 'action="/profiles/1/capture-photos"' in dashboard.text
+    assert "擷取全部照片" in dashboard.text
+    assert rejected.status_code == 403
+    assert missing.status_code == 404
+    assert queued.status_code == 303 and "notice=" in queued.headers["location"]
+    assert repeated.status_code == 303 and "error=" in repeated.headers["location"]
+    assert calls == [1, 1]
+
+
+def test_public_photo_capture_requires_browser_and_photo_tab_previews_downloads(
+    tmp_path: Path, monkeypatch
+):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("FACEBOOK_BROWSER_ENABLED", "0")
+    app = create_app(load_settings(config))
+    db = app.state.db
+    image_path = app.state.settings.data_dir / "media" / "public-photo.jpg"
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (900, 600), (30, 100, 180)).save(image_path)
+    now = "2026-08-30T04:30:00+00:00"
+    entity_id = db.execute(
+        """INSERT INTO entities(profile_id,kind,external_id,source_url,published_at,current_hash,present,first_seen_at,last_seen_at)
+        VALUES(1,'photo','photo-1','https://facebook.com/photo/?fbid=1',?,'photo-hash',1,?,?)""",
+        (now, now, now),
+    )
+    version_id = db.execute(
+        """INSERT INTO versions(entity_id,content_hash,normalized_json,raw_path,seen_at,change_type)
+        VALUES(?,'photo-hash',?,'photo.json',?,'created')""",
+        (entity_id, '{"id":"photo-1","title":"公開相片一","created_at":"2026-08-30T04:30:00+00:00"}', now),
+    )
+    db.execute("UPDATE entities SET current_version_id=? WHERE id=?", (version_id, entity_id))
+    media_id = db.execute(
+        """INSERT INTO media(sha256,source_url,mime_type,size_bytes,path,status,first_seen_at)
+        VALUES('public-photo-sha','https://cdn.example/public-photo.jpg','image/jpeg',100,?,'ready',?)""",
+        (str(image_path), now),
+    )
+    db.execute(
+        "INSERT INTO entity_media(entity_id,version_id,media_id,role,discovery_path,position) VALUES(?,?,?,?,?,0)",
+        (entity_id, version_id, media_id, "image", "$.image"),
+    )
+
+    with TestClient(app) as client:
+        dashboard = client.get("/")
+        disabled = client.post("/profiles/1/capture-photos", follow_redirects=False)
+        photos = client.get("/profiles/1?kind=photo")
+
+    assert dashboard.status_code == 200
+    assert "1 張公開照片" in dashboard.text
+    assert "照片擷取未啟用" in dashboard.text
+    assert f'data-lightbox-src="/media/{media_id}"' in dashboard.text
+    assert disabled.status_code == 303 and "error=" in disabled.headers["location"]
+    assert photos.status_code == 200
+    assert "公開相片一" in photos.text
+    assert f'data-lightbox-src="/media/{media_id}"' in photos.text
+    assert f'data-download="/media/{media_id}?download=true"' in photos.text
+
+
+def test_photo_count_and_list_keep_one_canonical_ready_file_but_all_pending_ids(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    app = create_app(load_settings(config))
+    db = app.state.db
+    now = "2026-08-30T04:30:00+00:00"
+    image_path = app.state.settings.data_dir / "media" / "canonical.jpg"
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (640, 480), (20, 80, 140)).save(image_path)
+    ready_media_id = db.execute(
+        """INSERT INTO media(
+        sha256,source_url,mime_type,size_bytes,path,status,first_seen_at
+        ) VALUES('one-exact-sha','https://cdn.example/canonical.jpg','image/jpeg',100,?,'ready',?)""",
+        (str(image_path), now),
+    )
+
+    def add_photo(external_id: str, title: str, media_id: int) -> int:
+        digest = f"hash-{external_id}"
+        entity_id = db.execute(
+            """INSERT INTO entities(
+            profile_id,kind,external_id,source_url,published_at,current_hash,
+            present,first_seen_at,last_seen_at
+            ) VALUES(1,'photo',?,?,?, ?,1,?,?)""",
+            (
+                external_id,
+                f"https://facebook.com/photo/?fbid={external_id}",
+                now,
+                digest,
+                now,
+                now,
+            ),
+        )
+        version_id = db.execute(
+            """INSERT INTO versions(
+            entity_id,content_hash,normalized_json,raw_path,seen_at,change_type
+            ) VALUES(?,?,?,?,?,'created')""",
+            (
+                entity_id,
+                digest,
+                json.dumps({"title": title, "publishTime": now}, ensure_ascii=False),
+                f"{external_id}.json",
+                now,
+            ),
+        )
+        db.execute(
+            "UPDATE entities SET current_version_id=? WHERE id=?",
+            (version_id, entity_id),
+        )
+        db.execute(
+            """INSERT INTO entity_media(
+            entity_id,version_id,media_id,role,discovery_path,position
+            ) VALUES(?,?,?,'image','$.image',0)""",
+            (entity_id, version_id, media_id),
+        )
+        return entity_id
+
+    canonical_id = add_photo("111111", "最早正本", ready_media_id)
+    duplicate_id = add_photo("222222", "重複別名", ready_media_id)
+    pending_ids = []
+    for index, (external_id, title) in enumerate(
+        (("333333", "等待補抓甲"), ("444444", "等待補抓乙")),
+        start=1,
+    ):
+        pending_media_id = db.execute(
+            """INSERT INTO media(sha256,source_url,status,first_seen_at)
+            VALUES(?,?, 'pending',?)""",
+            (f"pending-{index}", f"https://cdn.example/pending-{index}.jpg", now),
+        )
+        pending_ids.append(add_photo(external_id, title, pending_media_id))
+
+    with TestClient(app) as client:
+        dashboard = client.get("/")
+        photos = client.get("/profiles/1?kind=photo")
+
+    assert canonical_id < duplicate_id < pending_ids[0] < pending_ids[1]
+    assert dashboard.status_code == 200
+    assert "3 張公開照片" in dashboard.text
+    assert dashboard.text.count(
+        f'data-lightbox-src="/media/{ready_media_id}"'
+    ) == 1
+    assert photos.status_code == 200
+    assert "已保存 3 張" in photos.text
+    assert "最早正本" in photos.text
+    assert "重複別名" not in photos.text
+    assert "等待補抓甲" in photos.text
+    assert "等待補抓乙" in photos.text
+
+
 def test_dashboard_can_freeze_and_unfreeze_apify_per_profile(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text(

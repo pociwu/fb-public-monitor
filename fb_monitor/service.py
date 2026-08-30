@@ -470,7 +470,8 @@ class MonitorService:
         now = utcnow()
         jobs = self.db.rows(
             """SELECT * FROM jobs WHERE status='running' AND job_type IN (
-            'detect_public_v2','verify_public_v2','capture_posts_v2','contract_test_posts_v2'
+            'detect_public_v2','verify_public_v2','capture_posts_v2','capture_profile_photos',
+            'contract_test_posts_v2'
             ) ORDER BY id"""
         )
         for job in jobs:
@@ -4346,6 +4347,7 @@ class MonitorService:
         if job is None:
             # Another scheduler won the status compare-and-swap.
             return
+        job_terminal_status = "done"
         try:
             if job["job_type"] == "visit":
                 await self.visit_profile(int(job["profile_id"]))
@@ -4357,6 +4359,12 @@ class MonitorService:
                 await self.verify_public_v2(int(job["profile_id"]))
             elif job["job_type"] == "capture_posts_v2":
                 await self.capture_posts_v2(int(job["profile_id"]), job_payload)
+            elif job["job_type"] == "capture_profile_photos":
+                photo_outcome = await self.capture_profile_photos(
+                    int(job["profile_id"]), job_payload
+                )
+                if photo_outcome in {"source_limited", "failed"}:
+                    job_terminal_status = photo_outcome
             elif job["job_type"] == "capture_comments_v2":
                 await self.capture_comments_v2(int(job["profile_id"]), job_payload)
             elif job["job_type"] == "contract_test_posts_v2":
@@ -4406,9 +4414,9 @@ class MonitorService:
                     self.db.finish_maintenance_run(run_id, {}, str(exc))
                     raise
             self.db.execute(
-                """UPDATE jobs SET status='done',finished_at=?,error=NULL
+                """UPDATE jobs SET status=?,finished_at=?,error=NULL
                 WHERE id=? AND status='running' AND lease_owner=?""",
-                (utcnow(), job["id"], self.worker_id),
+                (job_terminal_status, utcnow(), job["id"], self.worker_id),
             )
         except BrowserGuardDeferred as exc:
             resume = exc.decision.retry_at or (datetime.now(UTC) + timedelta(minutes=5))
@@ -4454,6 +4462,683 @@ class MonitorService:
                     "system_error",
                     {"title": "系統修復工作失敗，已停止", "text": f"工作：{job['job_type']}\n錯誤：{str(exc)[:3000]}"},
                 )
+
+    def queue_public_photo_capture(
+        self, profile_id: int
+    ) -> tuple[bool, dict[str, Any]]:
+        """Queue one anonymous, profile-scoped Photos-page inventory.
+
+        Photo-page inventory has its own generation ledger.  It must not claim
+        the single active Capture V2 epoch slot or pass a browser-only intent
+        through the paid Actor state machine.  A logged-in browser is never
+        used to create public inventory.
+        """
+        profile = self.db.row(
+            "SELECT * FROM profiles WHERE id=? AND enabled=1", (profile_id,)
+        )
+        if not profile:
+            raise ValueError("找不到啟用中的監控帳號")
+        if not self.settings.facebook_browser_enabled:
+            raise FacebookBrowserError("Facebook 公開照片瀏覽器尚未啟用")
+
+        now = utcnow()
+        already_active = False
+        with self.db.connect() as conn:
+            # Serialize generation selection so two dashboard clicks cannot
+            # create parallel inventories for the same profile.
+            conn.execute("BEGIN IMMEDIATE")
+            latest_row = conn.execute(
+                """SELECT * FROM profile_photo_captures
+                WHERE profile_id=? ORDER BY generation DESC,id DESC LIMIT 1""",
+                (profile_id,),
+            ).fetchone()
+            latest = dict(latest_row) if latest_row else None
+            active_capture_ids: set[int] = set()
+            for job in conn.execute(
+                """SELECT payload_json FROM jobs
+                WHERE profile_id=? AND job_type='capture_profile_photos'
+                  AND status IN ('pending','running')""",
+                (profile_id,),
+            ).fetchall():
+                try:
+                    current_payload = json.loads(job["payload_json"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    current_payload = {}
+                capture_id = int(current_payload.get("photo_capture_id") or 0)
+                if capture_id:
+                    active_capture_ids.add(capture_id)
+
+            # A generation is immutable only after it has proved a complete
+            # inventory.  Manual retries of a source-limited/failed pass must
+            # retain its checkpoint (and generation number) instead of
+            # silently abandoning partial grid/permalink progress.
+            resumable = bool(
+                latest and str(latest.get("status") or "") != "complete"
+            )
+            if resumable:
+                capture_id = int(latest["id"])
+                generation = int(latest["generation"])
+                already_active = capture_id in active_capture_ids
+            else:
+                generation = int((latest or {}).get("generation") or 0) + 1
+                cursor = conn.execute(
+                    """INSERT INTO profile_photo_captures(
+                      profile_id,generation,status,checkpoint_json,
+                      terminal_evidence_json,next_job_at,created_at,updated_at
+                    ) VALUES(?,?,'pending','{}','{}',?,?,?)""",
+                    (profile_id, generation, now, now, now),
+                )
+                capture_id = int(cursor.lastrowid)
+
+            if not already_active:
+                conn.execute(
+                    """UPDATE profile_photo_captures
+                    SET status='pending',limited_reason=NULL,next_job_at=?,
+                        completed_at=NULL,updated_at=? WHERE id=?""",
+                    (now, now, capture_id),
+                )
+
+        capture = self.db.row(
+            "SELECT * FROM profile_photo_captures WHERE id=?", (capture_id,)
+        ) or {"id": capture_id, "profile_id": profile_id, "generation": generation, "status": "pending"}
+        if already_active:
+            return False, capture
+
+        _, created = self.db.queue_unique_job(
+            profile_id=profile_id,
+            job_type="capture_profile_photos",
+            priority=-120,
+            dedupe_key=f"capture-public-photos:{capture_id}:0",
+            payload={
+                "photo_capture_id": capture_id,
+                "iteration": 0,
+                "manual": True,
+            },
+        )
+        refreshed = self.db.row(
+            "SELECT * FROM profile_photo_captures WHERE id=?", (capture_id,)
+        ) or capture
+        return created, refreshed
+
+    async def capture_profile_photos(
+        self, profile_id: int, payload: dict[str, Any]
+    ) -> str | None:
+        """Resume one bounded anonymous pass over a profile's public Photos page."""
+        profile = self.db.row(
+            "SELECT * FROM profiles WHERE id=? AND enabled=1", (profile_id,)
+        )
+        if not profile:
+            return
+        if not self.settings.facebook_browser_enabled:
+            raise FacebookBrowserError("Facebook 公開照片瀏覽器尚未啟用")
+        capture_id = int(payload.get("photo_capture_id") or 0)
+        iteration = max(0, int(payload.get("iteration") or 0))
+        capture = self.db.row(
+            """SELECT * FROM profile_photo_captures
+            WHERE id=? AND profile_id=?""",
+            (capture_id, profile_id),
+        )
+        if not capture:
+            raise ValueError("公開照片回溯工作與帳號不相符")
+        if str(capture.get("status") or "") == "complete":
+            return
+        try:
+            progress = json.loads(capture.get("checkpoint_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            progress = {}
+        if not isinstance(progress, dict):
+            progress = {}
+        owner_aliases = {
+            str(value).strip()
+            for value in progress.get("profile_owner_aliases") or []
+            if str(value).strip()
+        }
+        if profile.get("fb_id"):
+            owner_aliases.add(str(profile["fb_id"]).strip())
+        if owner_aliases:
+            progress["profile_owner_aliases"] = sorted(owner_aliases)
+        pending_refresh_ids = sorted(
+            {
+                str(value).strip()
+                for value in progress.get("pending_media_external_ids") or []
+                if str(value).strip()
+            }
+        )
+        # A CDN URL can expire between grid discovery and download.  Starting
+        # with the first continuation (the second media attempt), ask the
+        # anonymous collector to reopen only those durable permalinks and
+        # refresh their image URLs.  The collector recognizes this checkpoint
+        # field and deliberately skips the Photos-grid scan.
+        refresh_pending_media = bool(
+            pending_refresh_ids
+            and int(progress.get("media_retry_attempt") or 0) >= 1
+        )
+        if refresh_pending_media:
+            progress["refresh_media_external_ids"] = pending_refresh_ids
+        self.db.execute(
+            """UPDATE profile_photo_captures
+            SET status='in_progress',next_job_at=NULL,updated_at=? WHERE id=?""",
+            (utcnow(), capture_id),
+        )
+
+        checkpoint_inventory_complete = bool(
+            progress.get("completed")
+            and progress.get("grid_complete")
+            and not refresh_pending_media
+            and (
+                progress.get("discovered_count")
+                or progress.get("discovered_urls")
+                or progress.get("grid_empty_confirmed")
+            )
+        )
+        browser_used = not checkpoint_inventory_complete
+        diagnostic_key = f"public-photos-{profile_id}"
+        if checkpoint_inventory_complete:
+            result = {
+                "items": progress.get("collected_items") or [],
+                "batch_items": [],
+                "progress": progress,
+                "completed": True,
+                "terminal_reason": progress.get("terminal_reason") or "grid_inventory_processed",
+                "stalled_reason": "",
+            }
+        else:
+            self._acquire_browser(
+                profile,
+                anonymous=True,
+                operation="capture_profile_photos",
+                defer_job=True,
+            )
+            try:
+                result = await self.facebook_anonymous_browser.public_profile_photos(
+                    str(profile["url"]), progress, diagnostic_key
+                )
+            except FacebookBrowserChallengeRequired as exc:
+                self._record_browser_challenge(
+                    profile,
+                    anonymous=True,
+                    diagnostic_key=diagnostic_key,
+                    error=exc,
+                )
+                now = utcnow()
+                self.db.execute(
+                    """UPDATE profile_photo_captures SET status='source_limited',
+                    checkpoint_json=?,limited_reason=?,next_job_at=NULL,
+                    completed_at=?,updated_at=? WHERE id=?""",
+                    (json.dumps(progress, ensure_ascii=False, sort_keys=True), str(exc), now, now, capture_id),
+                )
+                return "source_limited"
+            except FacebookBrowserLoginRequired as exc:
+                # An anonymous login wall is an honest source limitation, not
+                # permission to switch to the operator's authenticated inventory.
+                now = utcnow()
+                self.db.execute(
+                    """UPDATE profile_photo_captures SET status='source_limited',
+                    checkpoint_json=?,limited_reason=?,next_job_at=NULL,
+                    completed_at=?,updated_at=? WHERE id=?""",
+                    (json.dumps(progress, ensure_ascii=False, sort_keys=True), str(exc), now, now, capture_id),
+                )
+                return "source_limited"
+            except FacebookBrowserError as exc:
+                # This is an independent manual browser feature. Keep its
+                # failure in the dedicated ledger instead of contaminating the
+                # profile's normal monitoring health/failure counters.
+                now = utcnow()
+                self.db.execute(
+                    """UPDATE profile_photo_captures SET status='failed',
+                    checkpoint_json=?,limited_reason=?,next_job_at=NULL,
+                    completed_at=?,updated_at=? WHERE id=?""",
+                    (json.dumps(progress, ensure_ascii=False, sort_keys=True), str(exc), now, now, capture_id),
+                )
+                return "failed"
+
+        if browser_used:
+            self.anonymous_browser_guard.record_success(profile_id)
+        checkpoint = result.get("progress") if isinstance(result, dict) else None
+        checkpoint = checkpoint if isinstance(checkpoint, dict) else progress
+        items = result.get("items") if isinstance(result, dict) else []
+        items = [item for item in items if isinstance(item, dict)]
+        if not items:
+            checkpoint_items = checkpoint.get("collected_items")
+            if isinstance(checkpoint_items, list):
+                items = [item for item in checkpoint_items if isinstance(item, dict)]
+        batch_items_value = result.get("batch_items") if isinstance(result, dict) else None
+        batch_items = (
+            [item for item in batch_items_value if isinstance(item, dict)]
+            if isinstance(batch_items_value, list)
+            else items
+        )
+
+        def photo_payload(raw: dict[str, Any]) -> dict[str, Any] | None:
+            image_value = raw.get("image") or raw.get("image_url")
+            image_url = (
+                str(image_value.get("url") or "")
+                if isinstance(image_value, dict)
+                else str(image_value or "")
+            )
+            source_url = str(raw.get("url") or raw.get("source_url") or "")
+            photo_id = str(raw.get("id") or raw.get("photo_id") or "").strip()
+            if not image_url:
+                return None
+            return {
+                "photoId": photo_id
+                or content_hash(source_url or normalize_url(image_url))[:24],
+                "url": source_url or str(profile["url"]),
+                "image": {"url": image_url},
+            }
+
+        expected_external_ids = {
+            external_id(photo_item, "photo")
+            for raw in items
+            if (photo_item := photo_payload(raw)) is not None
+        }
+
+        def ready_photo_external_ids() -> set[str]:
+            """Return photos whose current media is both ready and on disk."""
+            ready: set[str] = set()
+            invalid_media_ids: set[int] = set()
+            for row in self.db.rows(
+                """SELECT e.external_id,m.id media_id,m.path
+                FROM entities e JOIN entity_media em ON em.entity_id=e.id
+                JOIN media m ON m.id=em.media_id
+                WHERE e.profile_id=? AND e.kind='photo'
+                  AND em.version_id=e.current_version_id
+                  AND m.status='ready'""",
+                (profile_id,),
+            ):
+                path = Path(str(row.get("path") or ""))
+                if path.is_file():
+                    ready.add(str(row["external_id"]))
+                else:
+                    invalid_media_ids.add(int(row["media_id"]))
+            # A stale `ready` row must not make a capture complete.  Mark it
+            # retryable so the next silent ingest actually invokes MediaStore
+            # instead of accepting a missing file as an exact-ready alias.
+            for media_id in invalid_media_ids:
+                self.db.execute(
+                    """UPDATE media SET status='pending',
+                    error='ready media path is missing' WHERE id=?""",
+                    (media_id,),
+                )
+            return ready
+
+        def current_ready_media(entity_id: int) -> list[dict[str, Any]]:
+            rows = self.db.rows(
+                """SELECT m.*,e.current_version_id FROM entities e
+                JOIN entity_media em ON em.entity_id=e.id
+                  AND em.version_id=e.current_version_id
+                JOIN media m ON m.id=em.media_id
+                WHERE e.id=? AND e.kind='photo' AND m.status='ready'
+                  AND m.sha256 IS NOT NULL AND m.sha256<>''
+                  AND m.path IS NOT NULL AND m.path<>''
+                ORDER BY m.id""",
+                (entity_id,),
+            )
+            return [
+                row
+                for row in rows
+                if Path(str(row.get("path") or "")).is_file()
+            ]
+
+        def photo_sha_seen_elsewhere(
+            entity_id: int, version_id: int, sha256: str
+        ) -> bool:
+            return bool(
+                self.db.row(
+                    """SELECT 1 FROM media m
+                    JOIN entity_media em ON em.media_id=m.id
+                    JOIN entities e ON e.id=em.entity_id
+                    WHERE e.kind='photo' AND m.status='ready' AND m.sha256=?
+                      AND NOT (em.entity_id=? AND em.version_id=?)
+                    LIMIT 1""",
+                    (sha256, entity_id, version_id),
+                )
+            )
+
+        # When the browser inventory is already terminal, continue from its
+        # durable item list and retry only media that did not become ready.
+        # This avoids rescrolling the entire Facebook grid for a transient CDN
+        # or low-disk failure.
+        if bool(result.get("completed")):
+            ready_before = ready_photo_external_ids()
+            queued_ids = {
+                external_id(photo_item, "photo")
+                for raw in batch_items
+                if (photo_item := photo_payload(raw)) is not None
+            }
+            for raw in items:
+                photo_item = photo_payload(raw)
+                if photo_item is None:
+                    continue
+                item_id = external_id(photo_item, "photo")
+                if item_id in ready_before or item_id in queued_ids:
+                    continue
+                batch_items.append(raw)
+                queued_ids.add(item_id)
+                if len(batch_items) >= 20:
+                    break
+
+        had_prior_complete = bool(
+            self.db.row(
+                """SELECT 1 FROM profile_photo_captures
+                WHERE profile_id=? AND id<>? AND status='complete'
+                LIMIT 1""",
+                (profile_id, capture_id),
+            )
+        )
+        raw_classifications = checkpoint.get("photo_classifications") or {}
+        classifications: dict[str, str] = (
+            {
+                str(key): str(value)
+                for key, value in raw_classifications.items()
+                if str(value) in {"new", "updated", "duplicate"}
+            }
+            if isinstance(raw_classifications, dict)
+            else {}
+        )
+        raw_candidates = checkpoint.get("photo_notification_candidates") or {}
+        notification_candidates: dict[str, str] = (
+            {
+                str(key): str(value)
+                for key, value in raw_candidates.items()
+                if str(value) in {"new", "updated"}
+            }
+            if isinstance(raw_candidates, dict)
+            else {}
+        )
+        notified_external_ids = {
+            str(value)
+            for value in checkpoint.get("notified_photo_external_ids") or []
+        }
+        for raw in batch_items:
+            photo_item = photo_payload(raw)
+            if photo_item is None:
+                continue
+            ext_id = external_id(photo_item, "photo")
+            existing = self.db.row(
+                "SELECT id,current_hash FROM entities WHERE profile_id=? AND kind='photo' AND external_id=?",
+                (profile_id, ext_id),
+            )
+            entity_id, persisted_id, changed = await self.ingester.ingest(
+                profile_id, "photo", photo_item, notify=False
+            )
+            expected_external_ids.add(persisted_id)
+            change_class = (
+                "new" if not existing else "updated" if changed else None
+            )
+            if change_class:
+                notification_candidates[ext_id] = change_class
+            elif ext_id not in notification_candidates:
+                classifications.setdefault(ext_id, "duplicate")
+
+            candidate_class = notification_candidates.get(ext_id)
+            media_rows = current_ready_media(entity_id)
+            if not candidate_class or not media_rows:
+                continue
+            version_id = int(media_rows[0]["current_version_id"])
+            unique_bytes = any(
+                not photo_sha_seen_elsewhere(
+                    entity_id, version_id, str(media_row["sha256"])
+                )
+                for media_row in media_rows
+            )
+            if not unique_bytes:
+                classifications[ext_id] = "duplicate"
+                notification_candidates.pop(ext_id, None)
+                continue
+
+            classifications[ext_id] = candidate_class
+            notification_candidates.pop(ext_id, None)
+            if had_prior_complete and ext_id not in notified_external_ids:
+                # Every browser item is persisted silently.  Promotion to a
+                # Telegram event happens only for later generations, after a
+                # real file is ready and exact-byte de-duplication has passed.
+                self.ingester.notify_persisted(entity_id)
+                notified_external_ids.add(ext_id)
+
+        # Media retry workers can make a candidate ready between two capture
+        # jobs. Such an item is intentionally omitted from `batch_items`, but
+        # it still needs the same byte-level classification/promotion gate.
+        for ext_id, candidate_class in list(notification_candidates.items()):
+            entity = self.db.row(
+                """SELECT id FROM entities
+                WHERE profile_id=? AND kind='photo' AND external_id=?""",
+                (profile_id, ext_id),
+            )
+            if not entity:
+                continue
+            entity_id = int(entity["id"])
+            media_rows = current_ready_media(entity_id)
+            if not media_rows:
+                continue
+            version_id = int(media_rows[0]["current_version_id"])
+            unique_bytes = any(
+                not photo_sha_seen_elsewhere(
+                    entity_id, version_id, str(media_row["sha256"])
+                )
+                for media_row in media_rows
+            )
+            classifications[ext_id] = (
+                candidate_class if unique_bytes else "duplicate"
+            )
+            notification_candidates.pop(ext_id, None)
+            if (
+                unique_bytes
+                and had_prior_complete
+                and ext_id not in notified_external_ids
+            ):
+                self.ingester.notify_persisted(entity_id)
+                notified_external_ids.add(ext_id)
+
+        checkpoint["photo_classifications"] = classifications
+        if notification_candidates:
+            checkpoint["photo_notification_candidates"] = notification_candidates
+        else:
+            checkpoint.pop("photo_notification_candidates", None)
+        if notified_external_ids:
+            checkpoint["notified_photo_external_ids"] = sorted(
+                notified_external_ids
+            )
+        new_count = sum(value == "new" for value in classifications.values())
+        updated_count = sum(
+            value == "updated" for value in classifications.values()
+        )
+        duplicate_count = sum(
+            value == "duplicate" for value in classifications.values()
+        )
+
+        discovered_values = checkpoint.get("discovered_urls") or checkpoint.get("photo_urls") or []
+        processed_values = checkpoint.get("processed_urls") or []
+        declared_total = int(checkpoint.get("declared_total") or 0)
+        discovered_count = max(
+            int(checkpoint.get("discovered_count") or 0),
+            len(discovered_values) if isinstance(discovered_values, list) else 0,
+        )
+        processed_count = max(
+            int(checkpoint.get("processed_count") or 0),
+            len(processed_values) if isinstance(processed_values, list) else 0,
+        )
+        seen_count = max(len(expected_external_ids), declared_total, discovered_count)
+        ready_external_ids = ready_photo_external_ids()
+        # Completion is scoped to the identities listed by this Photos-page
+        # checkpoint. Other old ready photo entities must not mask a failed
+        # download in the current inventory.
+        ready_count = len(expected_external_ids & ready_external_ids)
+        previous_seen = int(capture.get("seen_count") or 0)
+        total_seen = max(previous_seen, seen_count)
+        # Classification is checkpoint-derived and replay safe; continuation
+        # jobs must not add the same photo to the counters again.
+        total_new = new_count
+        total_updated = updated_count
+        total_duplicates = duplicate_count
+        checkpoint_json = json.dumps(checkpoint, ensure_ascii=False, sort_keys=True)
+        collector_completed = bool(result.get("completed"))
+        grid_terminal = bool(checkpoint.get("grid_complete")) and (
+            discovered_count > 0 or bool(checkpoint.get("grid_empty_confirmed"))
+        )
+        inventory_terminal = grid_terminal and processed_count >= discovered_count
+        completed = collector_completed and inventory_terminal
+        terminal_reason = str(result.get("terminal_reason") or checkpoint.get("terminal_reason") or "")
+        stalled_reason = str(result.get("stalled_reason") or checkpoint.get("stalled_reason") or "")
+        if completed and ready_count >= total_seen:
+            checkpoint.pop("pending_media_external_ids", None)
+            checkpoint.pop("refresh_media_external_ids", None)
+            checkpoint.pop("media_retry_attempt", None)
+            checkpoint.pop("media_retry_until", None)
+            checkpoint_json = json.dumps(checkpoint, ensure_ascii=False, sort_keys=True)
+            terminal_evidence = {
+                "collector": "anonymous_facebook_photo_viewer",
+                "auth_scope": AuthScope.ANONYMOUS.value,
+                "terminal_reason": terminal_reason,
+                "declared_total": checkpoint.get("declared_total"),
+                "seen_count": total_seen,
+                "ready_count": ready_count,
+                "completed_at": utcnow(),
+            }
+            now = utcnow()
+            self.db.execute(
+                """UPDATE profile_photo_captures SET status='complete',checkpoint_json=?,
+                seen_count=?,new_count=?,updated_count=?,duplicate_count=?,
+                terminal_evidence_json=?,limited_reason=NULL,next_job_at=NULL,
+                completed_at=?,updated_at=? WHERE id=?""",
+                (
+                    checkpoint_json, total_seen, total_new, total_updated,
+                    total_duplicates,
+                    json.dumps(terminal_evidence, ensure_ascii=False, sort_keys=True),
+                    now, now, capture_id,
+                ),
+            )
+            # Persist the generation terminal marker before advancing absence
+            # counters. If the process is interrupted during reconciliation,
+            # this same successful inventory cannot be replayed as a second
+            # missing observation and falsely remove an old photo.
+            self.ingester.reconcile(
+                profile_id,
+                "photo",
+                expected_external_ids,
+                None,
+                notify=had_prior_complete,
+            )
+            display = profile.get("display_name") or profile.get("name") or "Facebook"
+            self.db.add_event(
+                f"public-photo-capture:{capture_id}:complete",
+                "public_photo_capture_complete",
+                {
+                    "title": f"{display} 公開照片回溯完成",
+                    "text": f"已辨識 {total_seen} 張公開照片；新增 {total_new} 張。",
+                    "source_url": profile["url"],
+                },
+                profile_id,
+                notify=True,
+            )
+            return
+
+        media_retry_pending = False
+        retry_delay = timedelta(minutes=1)
+        if collector_completed and not inventory_terminal:
+            stalled_reason = "照片網格缺少完整終點證據"
+        elif completed and ready_count < total_seen:
+            pending_media_ids = sorted(expected_external_ids - ready_external_ids)
+            if total_seen > len(expected_external_ids) and not pending_media_ids:
+                # The grid declared/discovered more identities than the
+                # collector could resolve into photo items. Retrying media for
+                # 30 days cannot repair a missing permalink, so stop honestly
+                # instead of producing an empty continuation loop.
+                stalled_reason = "照片網格含有尚未解析的永久連結"
+            else:
+                retry_attempt = int(checkpoint.get("media_retry_attempt") or 0) + 1
+                retry_until_text = str(checkpoint.get("media_retry_until") or "")
+                try:
+                    retry_until = datetime.fromisoformat(retry_until_text)
+                    if retry_until.tzinfo is None:
+                        retry_until = retry_until.replace(tzinfo=UTC)
+                except ValueError:
+                    retry_until = datetime.now(UTC) + timedelta(
+                        days=max(1, self.settings.media_retry_days)
+                    )
+                checkpoint.update(
+                    {
+                        "media_retry_attempt": retry_attempt,
+                        "media_retry_until": retry_until.isoformat(),
+                        "pending_media_external_ids": pending_media_ids,
+                    }
+                )
+                if datetime.now(UTC) < retry_until:
+                    media_retry_pending = True
+                    retry_delay = timedelta(
+                        minutes=min(360, 15 * (2 ** min(5, retry_attempt - 1)))
+                    )
+                else:
+                    stalled_reason = "媒體超過補抓期限仍未全部下載完成"
+        has_unprocessed = bool(
+            isinstance(discovered_values, list)
+            and isinstance(processed_values, list)
+            and len(discovered_values) > len(processed_values)
+        ) or int(checkpoint.get("pending_count") or 0) > 0
+        resumable = media_retry_pending or (
+            not stalled_reason
+            and not completed
+            and bool(
+                result.get("resumable")
+                or checkpoint.get("resume_url")
+                or has_unprocessed
+                or checkpoint.get("grid_complete") is False
+            )
+        )
+        if resumable:
+            next_iteration = iteration + 1
+            available = datetime.now(UTC) + retry_delay
+            checkpoint["capture_iteration"] = next_iteration
+            self.db.execute(
+                """UPDATE profile_photo_captures SET status='in_progress',checkpoint_json=?,
+                seen_count=?,new_count=?,updated_count=?,duplicate_count=?,
+                limited_reason=NULL,next_job_at=?,completed_at=NULL,updated_at=? WHERE id=?""",
+                (
+                    json.dumps(checkpoint, ensure_ascii=False, sort_keys=True),
+                    total_seen, total_new, total_updated, total_duplicates,
+                    available.isoformat(), utcnow(), capture_id,
+                ),
+            )
+            self.db.queue_unique_job(
+                profile_id=profile_id,
+                job_type="capture_profile_photos",
+                priority=-120,
+                dedupe_key=(
+                    f"capture-public-photos:{capture_id}:{next_iteration}"
+                ),
+                payload={
+                    "photo_capture_id": capture_id,
+                    "iteration": next_iteration,
+                    "manual": True,
+                },
+                available_at=available.isoformat(),
+            )
+            return
+
+        reason = stalled_reason or "公開相片頁未提供可驗證的終點或續抓游標"
+        now = utcnow()
+        checkpoint_json = json.dumps(checkpoint, ensure_ascii=False, sort_keys=True)
+        terminal_evidence = {
+            "collector": "anonymous_facebook_photo_viewer",
+            "auth_scope": AuthScope.ANONYMOUS.value,
+            "terminal_reason": terminal_reason,
+            "stalled_reason": reason,
+            "seen_count": total_seen,
+            "ready_count": ready_count,
+        }
+        self.db.execute(
+            """UPDATE profile_photo_captures SET status='source_limited',checkpoint_json=?,
+            seen_count=?,new_count=?,updated_count=?,duplicate_count=?,
+            terminal_evidence_json=?,limited_reason=?,next_job_at=NULL,
+            completed_at=?,updated_at=? WHERE id=?""",
+            (
+                checkpoint_json, total_seen, total_new, total_updated,
+                total_duplicates,
+                json.dumps(terminal_evidence, ensure_ascii=False, sort_keys=True),
+                reason, now, now, capture_id,
+            ),
+        )
+        return "source_limited"
 
     async def browser_visit_profile(self, profile_id: int) -> None:
         profile = self.db.row("SELECT * FROM profiles WHERE id=? AND enabled=1", (profile_id,))
@@ -6027,7 +6712,8 @@ class MonitorService:
     def _dedupe_database(self) -> dict[str, int]:
         counts = {"entities_merged": 0, "posts_merged": 0, "comments_merged": 0}
         groups = self.db.rows("""SELECT profile_id,kind,current_hash,GROUP_CONCAT(id) ids
-            FROM entities WHERE current_hash IS NOT NULL GROUP BY profile_id,kind,current_hash HAVING COUNT(*) > 1""")
+            FROM entities WHERE current_hash IS NOT NULL AND kind<>'photo'
+            GROUP BY profile_id,kind,current_hash HAVING COUNT(*) > 1""")
         alias_groups: dict[tuple[int, str], list[int]] = {}
         for row in self.db.rows("SELECT id,profile_id,source_url FROM entities WHERE kind='post' AND source_url IS NOT NULL"):
             identity = facebook_post_identity(str(row.get("source_url") or ""))

@@ -5,6 +5,7 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit
 
 from .db import Database, utcnow
 from .media import MediaRef, MediaStore, extract_media, media_representation_key
@@ -16,11 +17,13 @@ ID_KEYS = {
     "profile": ("profileId", "profile_id", "id", "pageId", "facebookId"),
     "post": ("source_post_id", "postId", "post_id", "id", "facebookId"),
     "comment": ("commentId", "comment_id", "id"),
+    "photo": ("photoId", "photo_id", "mediaId", "media_id", "external_id", "id"),
 }
 URL_KEYS = {
     "profile": ("url", "profileUrl", "profile_url", "facebookUrl", "pageUrl"),
     "post": ("source_url", "postUrl", "post_url", "url", "facebookUrl"),
     "comment": ("commentUrl", "comment_url", "url"),
+    "photo": ("source_url", "photoUrl", "photo_url", "permalink", "url", "facebookUrl"),
 }
 
 
@@ -33,9 +36,41 @@ def external_id(item: dict[str, Any], kind: str) -> str:
     if value:
         return str(value)
     url = str(first(item, URL_KEYS[kind]) or "")
+    if kind == "photo":
+        identity = _facebook_photo_identity(url)
+        if identity:
+            return identity
+        refs = extract_media(item, kind)
+        if refs:
+            # Facebook rotates CDN hosts and signatures.  ``normalize_url``
+            # keeps the immutable object path, so a refreshed download URL
+            # remains the same photo entity.
+            return content_hash(normalize_url(refs[0].url))[:24]
     if url:
         return content_hash(url)[:24]
     return content_hash(item)[:24]
+
+
+def _facebook_photo_identity(url: str) -> str:
+    """Extract a stable public-photo identity from Facebook permalink forms."""
+    if not url:
+        return ""
+    parts = urlsplit(url)
+    query = {
+        key.casefold(): value
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+    }
+    if query.get("fbid"):
+        return query["fbid"]
+    # Photo paths vary between ``/photos/<id>`` and album-shaped paths such
+    # as ``/photos/a.<set-id>/<photo-id>``.  The last numeric component is the
+    # actual photo id; textual/profile components must not become identity.
+    if "/photo" in parts.path.casefold():
+        numeric = re.findall(r"(?:^|/)(\d{5,})(?=/|$)", parts.path)
+        if numeric:
+            return numeric[-1]
+    canonical = normalize_url(url)
+    return content_hash(canonical)[:24] if canonical else ""
 
 
 def comment_dedupe_key(item: dict[str, Any], parent_external_id: str | None) -> str:
@@ -73,6 +108,17 @@ def safe_part(value: str) -> str:
 
 
 def markdown_for(item: dict[str, Any], kind: str) -> str:
+    if kind == "photo":
+        text = first(item, ("caption", "raw_text", "text", "message", "description")) or ""
+        url = first(item, URL_KEYS[kind]) or ""
+        date = display_time(first(item, ("created_at", "date", "timestamp", "publishTime", "time")))
+        return (
+            "# 公開照片\n\n"
+            "- 類型：照片\n"
+            f"- 時間：{date}\n"
+            f"- 來源：{url}\n\n"
+            f"{normalize_text(text)}\n"
+        )
     title = profile_display_name(item) if kind == "profile" else first(item, ("name", "profileName", "source_profile_name", "postTitle", "authorName"))
     title = title or kind.title()
     text = first(item, ("raw_text", "text", "message", "postText", "description", "profile_intro_text")) or ""
@@ -120,7 +166,7 @@ def _event_payload(db: Database, profile_id: int, kind: str, change_type: str, i
     display = display or profile.get("display_name") or profile.get("name") or f"Facebook {profile.get('fb_id') or profile_id}"
     labels = {"created": "新增", "updated": "更新", "restored": "恢復"}
     label = labels.get(change_type, change_type)
-    text = normalize_text(str(first(item, ("raw_text", "text", "message", "postText", "description", "bio", "about", "profile_intro_text")) or ""))
+    text = normalize_text(str(first(item, ("raw_text", "text", "message", "postText", "description", "caption", "bio", "about", "profile_intro_text")) or ""))
     published = telegram_time(first(item, ("created_at", "date", "timestamp", "publishTime", "time")))
     roles = {ref.role for ref in media}
     if kind == "profile":
@@ -138,6 +184,17 @@ def _event_payload(db: Database, profile_id: int, kind: str, change_type: str, i
     elif kind == "post":
         body = "\n".join(part for part in (f"時間：{published}" if published else "", f"內容：{text}" if text else "（無文字內容）", f"附件：{len(media)} 個" if media else "") if part)
         title = f"【{label}貼文】{display}"
+    elif kind == "photo":
+        body = "\n".join(
+            part
+            for part in (
+                f"時間：{published}" if published else "",
+                f"說明：{text}" if text else "（無文字說明）",
+                f"照片：{len(media)} 張" if media else "",
+            )
+            if part
+        )
+        title = f"【{label}照片】{display}"
     else:
         author = first(item, ("authorName", "author_name", "name", "profileName")) or "未知作者"
         body = "\n".join(part for part in (f"作者：{normalize_text(str(author))}", f"時間：{published}" if published else "", f"留言：{text}" if text else "（無文字內容）", f"附件：{len(media)} 個" if media else "") if part)
@@ -217,6 +274,133 @@ class Ingester:
                 int(existing["current_version_id"]) if existing and existing.get("current_version_id") else None,
             )
         return entity_id, ext_id, True
+
+    def notify_persisted(self, entity_id: int) -> bool:
+        """Queue one notification for a silently persisted public photo.
+
+        Public-photo backfills are intentionally ingested with ``notify=False``.
+        A later capture generation can call this method once the current media
+        is ready.  The entity/current-digest event key makes retries replay
+        safe, while ``queue_group_media`` applies the existing global file-SHA
+        suppression used by all Telegram media notifications.
+        """
+        entity = self.db.row(
+            """SELECT e.*,v.normalized_json,v.change_type
+            FROM entities e JOIN versions v ON v.id=e.current_version_id
+            WHERE e.id=? AND e.kind='photo'""",
+            (entity_id,),
+        )
+        if not entity or not entity.get("current_hash"):
+            return False
+
+        media_rows = self.db.rows(
+            """SELECT DISTINCT m.*,em.role,em.discovery_path,
+            COALESCE(em.position,999999) position
+            FROM entity_media em JOIN media m ON m.id=em.media_id
+            WHERE em.entity_id=? AND em.version_id=?
+              AND m.status='ready' AND m.path IS NOT NULL AND m.path<>''
+              AND m.sha256 IS NOT NULL AND m.sha256<>''
+            ORDER BY position,m.id""",
+            (entity_id, entity["current_version_id"]),
+        )
+        if not media_rows:
+            return False
+
+        digest = str(entity["current_hash"])
+        profile_id = int(entity["profile_id"])
+        original_event_key = (
+            f"photo:{profile_id}:{entity['external_id']}:{digest}"
+        )
+        # ``ingest(..., notify=True)`` already owns this digest when its
+        # original event has an outbox row.  Do not create a second event just
+        # because a caller cannot tell how the version was first imported.
+        if self.db.row(
+            """SELECT 1 FROM events ev JOIN outbox o ON o.event_id=ev.id
+            WHERE ev.event_key=? LIMIT 1""",
+            (original_event_key,),
+        ):
+            return False
+
+        try:
+            normalized = json.loads(str(entity.get("normalized_json") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            normalized = {}
+        if not isinstance(normalized, dict):
+            normalized = {}
+        item = dict(normalized)
+        item.update(
+            {
+                "photoId": str(entity["external_id"]),
+                "photoUrl": str(entity.get("source_url") or ""),
+                "caption": str(normalized.get("text") or ""),
+                "publishTime": str(
+                    normalized.get("publishTime")
+                    or entity.get("published_at")
+                    or ""
+                ),
+            }
+        )
+        media_refs = [
+            MediaRef(
+                url=str(row["source_url"]),
+                role=str(row.get("role") or "image"),
+                json_path=str(row.get("discovery_path") or "$.image"),
+            )
+            for row in media_rows
+        ]
+        change_type = str(entity.get("change_type") or "created")
+        persisted_event_key = f"persisted-photo:{entity_id}:{digest}"
+        event_id = self.db.add_event(
+            persisted_event_key,
+            f"photo_{change_type}",
+            _event_payload(
+                self.db,
+                profile_id,
+                "photo",
+                change_type,
+                item,
+                str(entity.get("source_url") or ""),
+                str(entity["external_id"]),
+                media_refs,
+            ),
+            profile_id,
+            entity_id,
+            notify=True,
+            coalesce=True,
+            coalesce_minutes=15,
+        )
+        created = event_id is not None
+        if event_id is None:
+            # Heal the narrow crash window between the atomic text/group
+            # creation above and individual media queue calls below.  Replays
+            # do not create another text notification, but may fill in a
+            # missing SHA-scoped media row.
+            existing_event = self.db.row(
+                "SELECT id FROM events WHERE event_key=?",
+                (persisted_event_key,),
+            )
+            if not existing_event:
+                return False
+            event_id = int(existing_event["id"])
+
+        captions = {
+            "video": "影片",
+            "image": "照片",
+            "photo": "照片",
+            "attachment": "照片",
+        }
+        for row in media_rows:
+            role = str(row.get("role") or "image")
+            self.db.queue_group_media(
+                event_id,
+                str(row["sha256"]),
+                {
+                    "path": str(row["path"]),
+                    "mime_type": row.get("mime_type"),
+                    "caption": captions.get(role, "照片"),
+                },
+            )
+        return created
 
     async def _refresh_unchanged_media(
         self,

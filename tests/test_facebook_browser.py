@@ -687,6 +687,23 @@ async def test_album_walker_keeps_advancing_until_photo_repeats(tmp_path: Path, 
 
 
 @pytest.mark.asyncio
+async def test_viewer_media_id_uses_photo_not_album_set_id(tmp_path: Path):
+    class EmptyLinks:
+        async def evaluate_all(self, expression: str):
+            return []
+
+    class FakePage:
+        url = "https://www.facebook.com/example/photos/a.111111/987654321/"
+
+        def locator(self, selector: str):
+            return EmptyLinks()
+
+    gateway = FacebookBrowserGateway(True, tmp_path)
+
+    assert await gateway._current_viewer_media_id(FakePage()) == "987654321"
+
+
+@pytest.mark.asyncio
 async def test_browser_waits_randomly_between_canary_posts(tmp_path: Path, monkeypatch):
     class FakePage:
         def __init__(self):
@@ -838,6 +855,807 @@ async def test_album_walker_resumes_65_photos_in_20_20_20_5_batches(tmp_path: Pa
     assert state["resume_url"] == ""
     assert len(state["seen_media_ids"]) == 65
     assert len(state["collected_photos"]) == 65
+    assert len(state["collected_items"]) == 65
+    assert state["collected_items"][0] == {
+        "id": "1",
+        "url": "https://www.facebook.com/photo.php?fbid=1",
+        "image": "https://scontent.example.fbcdn.net/v/photo-1.jpg?token=rotating",
+    }
+    assert state["collected_items"][-1]["id"] == "65"
+
+
+@pytest.mark.asyncio
+async def test_public_profile_photos_uses_dedicated_surface_and_returns_checkpoint(
+    tmp_path: Path, monkeypatch
+):
+    browser = EmptyCookieBrowser()
+    context = browser.Context()
+    monkeypatch.setattr(
+        "fb_monitor.facebook_browser.async_playwright", lambda: browser.Manager(context)
+    )
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=False)
+    observed = {}
+
+    async def collect(page, source_url, profile_identity, progress, **kwargs):
+        observed.update({
+            "source_url": source_url,
+            "profile_identity": profile_identity,
+            "progress": progress,
+            **kwargs,
+        })
+        checkpoint = {
+            "collected_items": [],
+            "discovered_urls": [],
+            "processed_urls": [],
+            "grid_complete": False,
+            "completed": False,
+            "terminal_reason": "",
+            "stalled_reason": "",
+            "resume_url": source_url,
+        }
+        return gateway._public_photo_result(checkpoint, [])
+
+    monkeypatch.setattr(gateway, "_collect_public_profile_photo_inventory", collect)
+    initial_progress = {"resume_url": "https://www.facebook.com/photo.php?fbid=122"}
+
+    result = await gateway.public_profile_photos(
+        "https://www.facebook.com/profile.php?id=100123",
+        initial_progress,
+        "profile-7-photos",
+    )
+
+    assert observed["source_url"] == "https://www.facebook.com/100123/photos_by"
+    assert observed["profile_identity"] == "100123"
+    assert observed["progress"] is initial_progress
+    assert observed["diagnostic_key"] == "profile-7-photos"
+    assert result == {
+        "items": [],
+        "batch_items": [],
+        "progress": {
+            "collected_items": [],
+            "discovered_urls": [],
+            "processed_urls": [],
+            "grid_complete": False,
+            "completed": False,
+            "terminal_reason": "",
+            "stalled_reason": "",
+            "resume_url": "https://www.facebook.com/100123/photos_by",
+            "discovered_count": 0,
+            "processed_count": 0,
+            "pending_count": 0,
+            "permalink_failure_count": 0,
+            "permalink_exhausted_count": 0,
+        },
+        "discovered_count": 0,
+        "processed_count": 0,
+        "pending_count": 0,
+        "permalink_failure_count": 0,
+        "permalink_exhausted_count": 0,
+        "grid_complete": False,
+        "resumable": True,
+        "completed": False,
+        "terminal_reason": "",
+        "stalled_reason": "",
+    }
+    assert context.cookie_reads == 1
+    assert context.closed is True
+
+
+@pytest.mark.asyncio
+async def test_public_photo_grid_lazy_loads_multiple_albums_then_fetches_20_20_5(
+    tmp_path: Path, monkeypatch
+):
+    class Response:
+        status = 200
+
+    class FakePage:
+        def __init__(self):
+            self.url = ""
+            self.grid_scrolls = 0
+            self.visited: list[str] = []
+
+        async def goto(self, url: str, **kwargs):
+            self.url = url
+            self.visited.append(url)
+            return Response()
+
+        async def wait_for_timeout(self, milliseconds: int):
+            return None
+
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=False)
+    gateway.profile_photo_grid_stable_rounds = 2
+    page = FakePage()
+    all_links = [
+        (
+            f"https://www.facebook.com/100/photos/a.{1 if index <= 23 else 2}/{index}/"
+            if index % 2
+            else f"https://www.facebook.com/photo.php?fbid={index}&set=a.album"
+        )
+        for index in range(1, 46)
+    ]
+
+    async def grid_links(current_page, profile_identity):
+        assert profile_identity == "100"
+        counts = [8, 20, 35, 45]
+        count = counts[min(current_page.grid_scrolls, len(counts) - 1)]
+        # The target grid can contain an unrelated navigation thumbnail; an
+        # encoded foreign owner must never enter the inventory.
+        return all_links[:count] + [
+            "https://www.facebook.com/999/photos/a.foreign/999001/"
+        ]
+
+    async def grid_metrics(current_page):
+        if current_page.grid_scrolls < 3:
+            height = 2000 + current_page.grid_scrolls * 1000
+            return {"scroll_height": height, "viewport_height": 500, "scroll_y": height - 700}
+        return {"scroll_height": 5000, "viewport_height": 500, "scroll_y": 4500}
+
+    async def scroll_grid(current_page):
+        current_page.grid_scrolls += 1
+
+    async def no_access_wall(current_page, diagnostic_key=None):
+        return None
+
+    async def viewer_image(current_page):
+        media_id = (
+            parse_qs(urlsplit(current_page.url).query).get("fbid") or
+            [current_page.url.rstrip("/").split("/")[-1]]
+        )[0]
+        return f"https://scontent.example.fbcdn.net/v/photo-{media_id}.jpg?token=rotating"
+
+    async def viewer_media_id(current_page):
+        return (
+            parse_qs(urlsplit(current_page.url).query).get("fbid") or
+            [current_page.url.rstrip("/").split("/")[-1]]
+        )[0]
+
+    monkeypatch.setattr(gateway, "_public_photo_grid_links", grid_links)
+    monkeypatch.setattr(gateway, "_public_photo_grid_metrics", grid_metrics)
+    monkeypatch.setattr(gateway, "_scroll_public_photo_grid", scroll_grid)
+    monkeypatch.setattr(gateway, "_raise_for_access_wall", no_access_wall)
+    monkeypatch.setattr(gateway, "_public_photo_original_image", viewer_image)
+    monkeypatch.setattr(gateway, "_current_viewer_media_id", viewer_media_id)
+
+    state = None
+    results = []
+    for _ in range(3):
+        result = await gateway._collect_public_profile_photo_inventory(
+            page,
+            "https://www.facebook.com/100/photos_by",
+            "100",
+            state,
+        )
+        results.append(result)
+        state = json.loads(json.dumps(result["progress"]))
+
+    assert [len(result["batch_items"]) for result in results] == [20, 20, 5]
+    assert [len(result["items"]) for result in results] == [20, 40, 45]
+    assert [result["processed_count"] for result in results] == [20, 40, 45]
+    assert [result["pending_count"] for result in results] == [25, 5, 0]
+    assert results[0]["grid_complete"] is True
+    assert results[0]["completed"] is False
+    assert results[0]["stalled_reason"] == ""
+    assert results[-1]["completed"] is True
+    assert results[-1]["terminal_reason"] == "grid_inventory_processed"
+    assert results[-1]["progress"]["declared_total"] == 45
+    assert results[-1]["progress"]["discovered_count"] == 45
+    assert results[-1]["progress"]["processed_count"] == 45
+    assert results[-1]["progress"]["pending_count"] == 0
+    assert page.visited.count("https://www.facebook.com/100/photos_by") == 1
+    assert "https://www.facebook.com/999/photos/a.foreign/999001" not in state["discovered_urls"]
+
+
+@pytest.mark.asyncio
+async def test_public_photo_refresh_reopens_completed_media_in_bounded_batches_without_grid_scan(
+    tmp_path: Path, monkeypatch
+):
+    class Response:
+        status = 200
+
+    class FakePage:
+        def __init__(self):
+            self.url = ""
+            self.visited: list[str] = []
+
+        async def goto(self, url: str, **kwargs):
+            self.url = url
+            self.visited.append(url)
+            return Response()
+
+        async def wait_for_timeout(self, milliseconds: int):
+            return None
+
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=False)
+    urls = [
+        f"https://www.facebook.com/100/photos/a.album/{index}/"
+        for index in range(1, 22)
+    ]
+
+    async def no_access_wall(current_page, diagnostic_key=None):
+        return None
+
+    async def current_media_id(current_page):
+        return current_page.url.rstrip("/").split("/")[-1]
+
+    async def refreshed_image(current_page):
+        media_id = current_page.url.rstrip("/").split("/")[-1]
+        return f"https://scontent.example.fbcdn.net/v/photo-{media_id}.jpg?fresh=1"
+
+    monkeypatch.setattr(gateway, "_raise_for_access_wall", no_access_wall)
+    monkeypatch.setattr(gateway, "_current_viewer_media_id", current_media_id)
+    monkeypatch.setattr(gateway, "_public_photo_original_image", refreshed_image)
+
+    state = {
+        "schema_version": 4,
+        "grid_complete": True,
+        "completed": True,
+        "discovered_urls": urls,
+        "processed_urls": urls,
+        "collected_items": [
+            {
+                "id": str(index),
+                "url": urls[index - 1],
+                "image": f"https://scontent.example.fbcdn.net/v/photo-{index}.jpg?expired=1",
+            }
+            for index in range(1, 22)
+        ],
+        "refresh_media_external_ids": [str(index) for index in range(1, 22)],
+    }
+    first_page = FakePage()
+    first = await gateway._collect_public_profile_photo_inventory(
+        first_page,
+        "https://www.facebook.com/100/photos_by",
+        "100",
+        state,
+    )
+
+    assert len(first_page.visited) == 20
+    assert all("/photos_by" not in url for url in first_page.visited)
+    assert [item["id"] for item in first["batch_items"]] == [
+        str(index) for index in range(1, 21)
+    ]
+    assert first["items"][0]["image"].endswith("?fresh=1")
+    assert first["items"][-1]["image"].endswith("?expired=1")
+    assert first["progress"]["refresh_media_external_ids"] == ["21"]
+    assert first["processed_count"] == 20
+    assert first["pending_count"] == 1
+    assert first["completed"] is False
+
+    second_page = FakePage()
+    second = await gateway._collect_public_profile_photo_inventory(
+        second_page,
+        "https://www.facebook.com/100/photos_by",
+        "100",
+        json.loads(json.dumps(first["progress"])),
+    )
+
+    assert second_page.visited == [urls[-1].rstrip("/")]
+    assert second["batch_items"][0]["id"] == "21"
+    assert second["items"][-1]["image"].endswith("?fresh=1")
+    assert second["progress"]["refresh_media_external_ids"] == []
+    assert second["completed"] is True
+    assert second["terminal_reason"] == "grid_inventory_processed"
+
+
+@pytest.mark.asyncio
+async def test_public_photo_refresh_keeps_old_item_and_failure_budget_until_verified(
+    tmp_path: Path, monkeypatch
+):
+    class Response:
+        status = 200
+
+    class FakePage:
+        url = ""
+
+        async def goto(self, url: str, **kwargs):
+            self.url = url
+            return Response()
+
+        async def wait_for_timeout(self, milliseconds: int):
+            return None
+
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=False)
+    url = "https://www.facebook.com/photo.php?fbid=77"
+
+    async def no_access_wall(current_page, diagnostic_key=None):
+        return None
+
+    async def current_media_id(current_page):
+        return "77"
+
+    async def missing_original(current_page):
+        return ""
+
+    monkeypatch.setattr(gateway, "_raise_for_access_wall", no_access_wall)
+    monkeypatch.setattr(gateway, "_current_viewer_media_id", current_media_id)
+    monkeypatch.setattr(gateway, "_public_photo_original_image", missing_original)
+
+    result = await gateway._collect_public_profile_photo_inventory(
+        FakePage(),
+        "https://www.facebook.com/100/photos_by",
+        "100",
+        {
+            "schema_version": 4,
+            "grid_complete": True,
+            "completed": True,
+            "discovered_urls": [url],
+            "processed_urls": [url],
+            "collected_items": [
+                {"id": "77", "url": url, "image": "https://old.fbcdn.net/77.jpg"}
+            ],
+            "refresh_media_external_ids": ["77"],
+        },
+    )
+
+    assert result["batch_items"] == []
+    assert result["items"][0]["image"] == "https://old.fbcdn.net/77.jpg"
+    assert result["progress"]["refresh_media_external_ids"] == ["77"]
+    assert result["processed_count"] == 0
+    assert result["completed"] is False
+    failure = result["progress"]["permalink_failures"]["media:77"]
+    assert failure["attempts"] == 1
+    assert failure["last_reason"] == "public_photo_original_missing"
+
+
+@pytest.mark.asyncio
+async def test_public_photo_grid_limit_is_resumable_without_stalled_reason(
+    tmp_path: Path, monkeypatch
+):
+    class Response:
+        status = 200
+
+    class FakePage:
+        url = ""
+        grid_scrolls = 0
+        viewer_visits = 0
+
+        async def goto(self, url: str, **kwargs):
+            self.url = url
+            if "/photos_by" not in url:
+                self.viewer_visits += 1
+            return Response()
+
+        async def wait_for_timeout(self, milliseconds: int):
+            return None
+
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=False)
+    gateway.profile_photo_grid_batch_max_scrolls = 2
+    page = FakePage()
+
+    async def grid_links(current_page, profile_identity):
+        return [
+            f"https://www.facebook.com/{profile_identity}/photos/a.1/{index}/"
+            for index in range(1, current_page.grid_scrolls + 2)
+        ]
+
+    async def not_at_bottom(current_page):
+        return {"scroll_height": 9000, "viewport_height": 500, "scroll_y": current_page.grid_scrolls * 500}
+
+    async def scroll_grid(current_page):
+        current_page.grid_scrolls += 1
+
+    async def no_access_wall(current_page, diagnostic_key=None):
+        return None
+
+    monkeypatch.setattr(gateway, "_public_photo_grid_links", grid_links)
+    monkeypatch.setattr(gateway, "_public_photo_grid_metrics", not_at_bottom)
+    monkeypatch.setattr(gateway, "_scroll_public_photo_grid", scroll_grid)
+    monkeypatch.setattr(gateway, "_raise_for_access_wall", no_access_wall)
+
+    result = await gateway._collect_public_profile_photo_inventory(
+        page,
+        "https://www.facebook.com/100/photos_by",
+        "100",
+    )
+
+    assert result["completed"] is False
+    assert result["grid_complete"] is False
+    assert result["stalled_reason"] == ""
+    assert result["progress"]["phase"] == "discover_grid"
+    assert result["progress"]["resume_url"] == "https://www.facebook.com/100/photos_by"
+    assert result["progress"]["grid_scroll_depth"] == 2
+    assert result["progress"]["batch_grid_scrolls"] == 2
+    assert result["discovered_count"] == 3
+    assert result["processed_count"] == 0
+    assert page.viewer_visits == 0
+
+
+@pytest.mark.asyncio
+async def test_public_photo_grid_replays_checkpoint_then_adds_only_bounded_new_scrolls(
+    tmp_path: Path, monkeypatch
+):
+    class Response:
+        status = 200
+
+    class FakePage:
+        def __init__(self):
+            self.url = ""
+            self.grid_scrolls = 0
+            self.scroll_calls = 0
+
+        async def goto(self, url: str, **kwargs):
+            self.url = url
+            return Response()
+
+        async def wait_for_timeout(self, milliseconds: int):
+            return None
+
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=False)
+    gateway.profile_photo_grid_batch_max_scrolls = 2
+
+    async def grid_links(current_page, profile_identity):
+        return [
+            f"https://www.facebook.com/{profile_identity}/photos/a.1/{index}/"
+            for index in range(1, current_page.grid_scrolls + 2)
+        ]
+
+    async def grid_metrics(current_page):
+        return {
+            "scroll_height": 10_000,
+            "viewport_height": 500,
+            "scroll_y": current_page.grid_scrolls * 500,
+        }
+
+    async def scroll_grid(current_page):
+        current_page.grid_scrolls += 1
+        current_page.scroll_calls += 1
+
+    async def no_access_wall(current_page, diagnostic_key=None):
+        return None
+
+    monkeypatch.setattr(gateway, "_public_photo_grid_links", grid_links)
+    monkeypatch.setattr(gateway, "_public_photo_grid_metrics", grid_metrics)
+    monkeypatch.setattr(gateway, "_scroll_public_photo_grid", scroll_grid)
+    monkeypatch.setattr(gateway, "_raise_for_access_wall", no_access_wall)
+
+    first_page = FakePage()
+    first = await gateway._collect_public_profile_photo_inventory(
+        first_page, "https://www.facebook.com/100/photos_by", "100"
+    )
+    second_page = FakePage()  # a continuation always opens a fresh browser page
+    second = await gateway._collect_public_profile_photo_inventory(
+        second_page,
+        "https://www.facebook.com/100/photos_by",
+        "100",
+        json.loads(json.dumps(first["progress"])),
+    )
+
+    assert first["progress"]["grid_scroll_depth"] == 2
+    assert first["progress"]["batch_grid_replay_scrolls"] == 0
+    assert first["progress"]["batch_grid_new_scrolls"] == 2
+    assert second["progress"]["grid_scroll_depth"] == 4
+    assert second["progress"]["batch_grid_replay_scrolls"] == 2
+    assert second["progress"]["batch_grid_new_scrolls"] == 2
+    assert second["progress"]["total_grid_new_scrolls"] == 4
+    assert second["progress"]["total_grid_replay_scrolls"] == 2
+    assert second_page.scroll_calls == 4
+    assert second["discovered_count"] == 5
+    assert second["stalled_reason"] == ""
+
+
+@pytest.mark.asyncio
+async def test_public_photo_grid_accepts_checkpointed_numeric_owner_alias(
+    tmp_path: Path, monkeypatch
+):
+    class Response:
+        status = 200
+
+    class FakePage:
+        url = ""
+
+        async def goto(self, url: str, **kwargs):
+            self.url = url
+            return Response()
+
+        async def wait_for_timeout(self, milliseconds: int):
+            return None
+
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=False)
+    gateway.profile_photo_grid_batch_max_scrolls = 0
+
+    async def numeric_owner_link(current_page, profile_identity):
+        assert profile_identity == "vanity.name"
+        return ["https://www.facebook.com/100123/photos/a.album/777/"]
+
+    async def not_at_bottom(current_page):
+        return {"scroll_height": 5000, "viewport_height": 500, "scroll_y": 0}
+
+    async def no_access_wall(current_page, diagnostic_key=None):
+        return None
+
+    monkeypatch.setattr(gateway, "_public_photo_grid_links", numeric_owner_link)
+    monkeypatch.setattr(gateway, "_public_photo_grid_metrics", not_at_bottom)
+    monkeypatch.setattr(gateway, "_raise_for_access_wall", no_access_wall)
+
+    result = await gateway._collect_public_profile_photo_inventory(
+        FakePage(),
+        "https://www.facebook.com/vanity.name/photos_by",
+        "vanity.name",
+        {"profile_owner_aliases": ["100123"]},
+    )
+
+    assert result["progress"]["profile_owner_aliases"] == ["vanity.name", "100123"]
+    assert result["progress"]["discovered_urls"] == [
+        "https://www.facebook.com/100123/photos/a.album/777"
+    ]
+    assert result["stalled_reason"] == ""
+
+
+@pytest.mark.asyncio
+async def test_public_photo_grid_links_excludes_album_only_urls_and_defers_owner_filter(
+    tmp_path: Path,
+):
+    class Locator:
+        async def evaluate_all(self, expression: str):
+            return [
+                "https://www.facebook.com/100123/photos/a.555/",
+                "https://www.facebook.com/100123/photos/a.555/777/",
+            ]
+
+    class FakePage:
+        def locator(self, selector: str):
+            return Locator()
+
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=False)
+    links = await gateway._public_photo_grid_links(FakePage(), "vanity.name")
+
+    assert links == ["https://www.facebook.com/100123/photos/a.555/777"]
+
+
+@pytest.mark.asyncio
+async def test_public_photo_grid_http_429_raises_typed_challenge(tmp_path: Path):
+    class Response:
+        status = 429
+
+    class FakePage:
+        url = ""
+
+        async def goto(self, url: str, **kwargs):
+            self.url = url
+            return Response()
+
+        async def wait_for_timeout(self, milliseconds: int):
+            return None
+
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=False)
+
+    with pytest.raises(FacebookBrowserChallengeRequired, match="429"):
+        await gateway._collect_public_profile_photo_inventory(
+            FakePage(), "https://www.facebook.com/100/photos_by", "100"
+        )
+
+
+@pytest.mark.asyncio
+async def test_public_photo_permalink_failures_do_not_block_fresh_urls_and_exhaust_at_three(
+    tmp_path: Path, monkeypatch
+):
+    class Response:
+        status = 200
+
+    class FakePage:
+        def __init__(self):
+            self.url = ""
+            self.visited: list[str] = []
+
+        async def goto(self, url: str, **kwargs):
+            self.url = url
+            self.visited.append(url)
+            return Response()
+
+        async def wait_for_timeout(self, milliseconds: int):
+            return None
+
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=False)
+    gateway.album_batch_max_operations = 2
+    gateway.album_batch_max_new_photos = 2
+    page = FakePage()
+    urls = [f"https://www.facebook.com/photo.php?fbid={index}" for index in range(1, 4)]
+
+    async def no_access_wall(current_page, diagnostic_key=None):
+        return None
+
+    async def current_media_id(current_page):
+        expected = (parse_qs(urlsplit(current_page.url).query).get("fbid") or [""])[0]
+        return "999" if expected == "1" else expected
+
+    async def original_image(current_page):
+        media_id = (parse_qs(urlsplit(current_page.url).query).get("fbid") or [""])[0]
+        return f"https://scontent.example.fbcdn.net/v/photo-{media_id}.jpg"
+
+    monkeypatch.setattr(gateway, "_raise_for_access_wall", no_access_wall)
+    monkeypatch.setattr(gateway, "_current_viewer_media_id", current_media_id)
+    monkeypatch.setattr(gateway, "_public_photo_original_image", original_image)
+
+    state = {
+        "schema_version": 4,
+        "grid_complete": True,
+        "discovered_urls": urls,
+        "processed_urls": [],
+        "collected_items": [],
+    }
+    results = []
+    for _ in range(3):
+        result = await gateway._collect_public_profile_photo_inventory(
+            page,
+            "https://www.facebook.com/100/photos_by",
+            "100",
+            state,
+        )
+        results.append(result)
+        state = json.loads(json.dumps(result["progress"]))
+
+    assert [result["progress"]["batch_operations"] for result in results] == [2, 2, 1]
+    assert [result["processed_count"] for result in results] == [1, 2, 2]
+    assert [item["id"] for item in results[-1]["items"]] == ["2", "3"]
+    assert page.visited == [urls[0], urls[1], urls[2], urls[0], urls[0]]
+    assert results[0]["stalled_reason"] == ""
+    assert results[1]["stalled_reason"] == ""
+    assert results[-1]["stalled_reason"] == "public_photo_permalink_failures_exhausted"
+    assert results[-1]["resumable"] is False
+    failure = results[-1]["progress"]["permalink_failures"]["media:1"]
+    assert failure["attempts"] == 3
+    assert "expected=1,current=999" in failure["last_reason"]
+
+
+@pytest.mark.asyncio
+async def test_public_photo_permalink_http_429_raises_challenge_without_retrying(
+    tmp_path: Path, monkeypatch
+):
+    class Response:
+        status = 429
+
+    class FakePage:
+        url = ""
+
+        async def goto(self, url: str, **kwargs):
+            self.url = url
+            return Response()
+
+        async def wait_for_timeout(self, milliseconds: int):
+            return None
+
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=False)
+    state = {
+        "schema_version": 4,
+        "grid_complete": True,
+        "discovered_urls": ["https://www.facebook.com/photo.php?fbid=1"],
+        "processed_urls": [],
+        "collected_items": [],
+    }
+
+    with pytest.raises(FacebookBrowserChallengeRequired, match="429"):
+        await gateway._collect_public_profile_photo_inventory(
+            FakePage(), "https://www.facebook.com/100/photos_by", "100", state
+        )
+
+
+@pytest.mark.asyncio
+async def test_public_photo_original_prefers_open_graph_media(tmp_path: Path):
+    class Locator:
+        async def evaluate_all(self, expression: str):
+            return ["https://scontent.example.fbcdn.net/v/current-photo.jpg?token=1"]
+
+    class FakePage:
+        def locator(self, selector: str):
+            assert "og:image" in selector
+            return Locator()
+
+        async def evaluate(self, expression: str, selector: str):
+            raise AssertionError("Open Graph media should win before DOM image fallback")
+
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=False)
+    image = await gateway._public_photo_original_image(FakePage())
+
+    assert image == "https://scontent.example.fbcdn.net/v/current-photo.jpg?token=1"
+
+
+@pytest.mark.asyncio
+async def test_public_photo_original_rejects_unrelated_generic_main_image(tmp_path: Path):
+    class Locator:
+        async def evaluate_all(self, expression: str):
+            return []
+
+    class FakePage:
+        def __init__(self):
+            self.selectors: list[str] = []
+
+        def locator(self, selector: str):
+            return Locator()
+
+        async def evaluate(self, expression: str, selector: str):
+            self.selectors.append(selector)
+            if selector == "[role='main'] img, main img":
+                return ["https://scontent.example.fbcdn.net/v/unrelated-large-ad.jpg"]
+            return []
+
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=False)
+    page = FakePage()
+    image = await gateway._public_photo_original_image(page)
+
+    assert image == ""
+    assert len(page.selectors) == 1
+    assert "data-visualcompletion='media-vc-image'" in page.selectors[0]
+    assert page.selectors[0] != "[role='main'] img, main img"
+
+
+@pytest.mark.asyncio
+async def test_public_photo_grid_requires_explicit_empty_evidence(
+    tmp_path: Path, monkeypatch
+):
+    class Response:
+        status = 200
+
+    class FakePage:
+        url = ""
+
+        async def goto(self, url: str, **kwargs):
+            self.url = url
+            return Response()
+
+        async def wait_for_timeout(self, milliseconds: int):
+            return None
+
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=False)
+    gateway.profile_photo_grid_stable_rounds = 1
+
+    async def no_links(current_page, profile_identity):
+        return []
+
+    async def bottom(current_page):
+        return {"scroll_height": 1000, "viewport_height": 500, "scroll_y": 500}
+
+    async def scroll_grid(current_page):
+        return None
+
+    async def no_access_wall(current_page, diagnostic_key=None):
+        return None
+
+    async def not_explicitly_empty(current_page):
+        return False
+
+    monkeypatch.setattr(gateway, "_public_photo_grid_links", no_links)
+    monkeypatch.setattr(gateway, "_public_photo_grid_metrics", bottom)
+    monkeypatch.setattr(gateway, "_scroll_public_photo_grid", scroll_grid)
+    monkeypatch.setattr(gateway, "_raise_for_access_wall", no_access_wall)
+    monkeypatch.setattr(gateway, "_public_photo_grid_empty_state", not_explicitly_empty)
+
+    result = await gateway._collect_public_profile_photo_inventory(
+        FakePage(), "https://www.facebook.com/100/photos_by", "100"
+    )
+
+    assert result["completed"] is False
+    assert result["stalled_reason"] == "public_photo_grid_empty_or_unavailable"
+    assert result["progress"]["phase"] == "source_limited"
+
+
+@pytest.mark.asyncio
+async def test_public_profile_photos_rejects_authenticated_cookie_before_navigation(
+    tmp_path: Path, monkeypatch
+):
+    browser = EmptyCookieBrowser()
+
+    class PollutedContext(browser.Context):
+        async def cookies(self, url: str):
+            self.cookie_reads += 1
+            return [{"name": "c_user", "value": "123"}]
+
+    context = PollutedContext()
+    monkeypatch.setattr(
+        "fb_monitor.facebook_browser.async_playwright", lambda: browser.Manager(context)
+    )
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=False)
+
+    async def unexpected(*args, **kwargs):
+        raise AssertionError("cookie pollution must stop before collector navigation")
+
+    monkeypatch.setattr(gateway, "_collect_public_profile_photo_inventory", unexpected)
+
+    with pytest.raises(FacebookBrowserLoginRequired, match="cookie"):
+        await gateway.public_profile_photos("https://www.facebook.com/100")
+
+    assert context.cookie_reads == 1
+    assert context.page.visited == []
+    assert context.closed is True
 
 
 @pytest.mark.asyncio

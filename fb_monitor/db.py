@@ -287,6 +287,24 @@ CREATE TABLE IF NOT EXISTS coverage_streams (
   updated_at TEXT NOT NULL,
   UNIQUE(epoch_id,stream,surface,scope_type,scope_id)
 );
+CREATE TABLE IF NOT EXISTS profile_photo_captures (
+  id INTEGER PRIMARY KEY,
+  profile_id INTEGER NOT NULL REFERENCES profiles(id),
+  generation INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'pending',
+  checkpoint_json TEXT NOT NULL DEFAULT '{}',
+  seen_count INTEGER NOT NULL DEFAULT 0,
+  new_count INTEGER NOT NULL DEFAULT 0,
+  updated_count INTEGER NOT NULL DEFAULT 0,
+  duplicate_count INTEGER NOT NULL DEFAULT 0,
+  terminal_evidence_json TEXT NOT NULL DEFAULT '{}',
+  limited_reason TEXT,
+  next_job_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT,
+  UNIQUE(profile_id,generation)
+);
 CREATE TABLE IF NOT EXISTS paid_source_batches (
   id INTEGER PRIMARY KEY,
   request_hash TEXT NOT NULL UNIQUE,
@@ -510,6 +528,8 @@ CREATE INDEX IF NOT EXISTS idx_access_observations_profile ON access_observation
 CREATE INDEX IF NOT EXISTS idx_contracts_lookup ON actor_contracts(provider,actor_id,purpose,status,expires_at);
 CREATE INDEX IF NOT EXISTS idx_contract_allocations_grant ON contract_test_allocations(grant_id,id);
 CREATE INDEX IF NOT EXISTS idx_coverage_epoch_status ON coverage_streams(epoch_id,status,stream,surface);
+CREATE INDEX IF NOT EXISTS idx_profile_photo_captures_latest
+  ON profile_photo_captures(profile_id,generation DESC,id DESC);
 CREATE INDEX IF NOT EXISTS idx_paid_batches_status ON paid_source_batches(status,updated_at);
 CREATE INDEX IF NOT EXISTS idx_paid_batches_epoch ON paid_source_batches(epoch_id,coverage_stream_id,id);
 CREATE INDEX IF NOT EXISTS idx_paid_access_probe_profile
@@ -900,7 +920,7 @@ class Database:
         if table not in {
             "profiles", "entities", "versions", "media", "entity_media", "events", "outbox", "jobs",
             "usage", "audit_seen", "actor_runs", "schema_migrations", "access_observations",
-            "actor_contracts", "contract_runs", "capture_epochs", "coverage_streams",
+            "actor_contracts", "contract_runs", "capture_epochs", "coverage_streams", "profile_photo_captures",
             "contract_test_grants", "contract_test_allocations",
             "paid_source_batches", "paid_access_probe_batches", "post_aliases", "media_aliases", "post_media_coverage",
             "browser_limits", "browser_evidence", "profile_name_candidates", "profile_source_controls",

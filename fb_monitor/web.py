@@ -123,6 +123,8 @@ def _entity_content(item: dict[str, Any], kind: str) -> dict[str, str]:
         text = str(_first_value(nested, ("bio", "intro", "description")) or text)
     elif kind == "comment":
         title = author_name or "留言"
+    elif kind == "photo":
+        title = str(_first_value(item, ("title", "name")) or "公開照片")
     else:
         title = author_name or "貼文"
     return {"title": title, "text": text, "timestamp": timestamp}
@@ -149,6 +151,99 @@ def _attach_browser_capture(profile: dict[str, Any], cfg: Settings) -> None:
     path = cfg.facebook_browser_data_dir / "screenshots" / f"profile-{int(profile['id'])}.png"
     profile["browser_capture_available"] = path.is_file()
     profile["browser_capture_display"] = display_time(path.stat().st_mtime, cfg.timezone) if path.is_file() else ""
+
+
+def _canonical_photo_entity_ids(db: Database, profile_id: int) -> list[int]:
+    """Keep the earliest photo entity for each verified current file.
+
+    Actor/viewer URL identities can occasionally describe the same downloaded
+    photo with different Facebook ids.  Only exact ready media (same media id
+    or SHA) is strong enough to collapse those rows.  Entities whose current
+    media is still pending/unavailable remain visible independently until
+    their bytes can actually be compared.
+    """
+    rows = db.rows(
+        """SELECT e.id,e.external_id,m.id media_id,m.sha256,m.status
+        FROM entities e
+        LEFT JOIN entity_media em
+          ON em.entity_id=e.id AND em.version_id=e.current_version_id
+        LEFT JOIN media m ON m.id=em.media_id
+        WHERE e.profile_id=? AND e.kind='photo'
+        ORDER BY e.id,m.id""",
+        (profile_id,),
+    )
+    entity_keys: dict[int, set[tuple[str, str]]] = {}
+    for row in rows:
+        entity_id = int(row["id"])
+        keys = entity_keys.setdefault(entity_id, set())
+        if row.get("status") != "ready" or row.get("media_id") is None:
+            continue
+        keys.add(("media", str(row["media_id"])))
+        if row.get("sha256"):
+            keys.add(("sha256", str(row["sha256"])))
+
+    canonical: list[int] = []
+    seen_ready_content: set[tuple[str, str]] = set()
+    for entity_id, keys in entity_keys.items():
+        if keys and keys & seen_ready_content:
+            continue
+        canonical.append(entity_id)
+        seen_ready_content.update(keys)
+    return canonical
+
+
+def _profile_photo_capture_state(
+    db: Database, profile_id: int, cfg: Settings
+) -> dict[str, Any]:
+    """Return the latest dedicated public-photo capture generation."""
+    row = db.row(
+        """SELECT * FROM profile_photo_captures
+        WHERE profile_id=? ORDER BY generation DESC,id DESC LIMIT 1""",
+        (profile_id,),
+    ) or {}
+    active_job = None
+    for job in db.rows(
+        """SELECT status,payload_json FROM jobs WHERE profile_id=?
+        AND job_type='capture_profile_photos' AND status IN ('pending','running')
+        ORDER BY id DESC""",
+        (profile_id,),
+    ):
+        try:
+            payload = json.loads(job.get("payload_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        row_id = int(row.get("id") or 0)
+        if row_id and int(payload.get("photo_capture_id") or 0) == row_id:
+            active_job = job
+            break
+    status = str(row.get("status") or "not_started")
+    if active_job:
+        status = "running" if active_job.get("status") == "running" else "pending"
+    labels = {
+        "not_started": "尚未擷取",
+        "pending": "已排入佇列",
+        "running": "擷取中",
+        "in_progress": "等待續抓",
+        "complete": "已完成",
+        "source_limited": "公開來源受限",
+        "budget_paused": "額度暫停",
+        "manual_paused": "人工暫停",
+        "failed": "擷取失敗",
+    }
+    state = dict(row)
+    state.update(
+        {
+            "status": status,
+            "status_label": labels.get(status, status),
+            # A stale in_progress checkpoint must remain manually resumable.
+            # Only a durable pending/running job disables the button.
+            "active": bool(active_job),
+            "discovered_count": int(row.get("seen_count") or 0),
+            "imported_count": int(row.get("new_count") or 0),
+            "updated_display": display_time(row.get("updated_at"), cfg.timezone),
+        }
+    )
+    return state
 
 
 def _attach_current_media(db: Database, entities: list[dict[str, Any]]) -> None:
@@ -328,6 +423,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         profiles = db.rows("""SELECT p.*,
             (SELECT COUNT(*) FROM entities e WHERE e.profile_id=p.id AND e.kind='post') post_count,
             (SELECT COUNT(*) FROM entities e WHERE e.profile_id=p.id AND e.kind='comment') comment_count,
+            (SELECT COUNT(*) FROM entities e WHERE e.profile_id=p.id AND e.kind='photo') photo_count,
             (SELECT m.id FROM media m JOIN entity_media em ON em.media_id=m.id JOIN entities e ON e.id=em.entity_id
              WHERE e.profile_id=p.id AND e.kind='profile' AND m.status='ready' AND em.role='profile_picture'
              ORDER BY em.version_id DESC,
@@ -340,6 +436,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             FROM profiles p WHERE p.enabled=1 ORDER BY COALESCE(p.sort_order,p.id),p.id""")
         for profile in profiles:
             _attach_browser_capture(profile, cfg)
+            profile["photo_capture"] = _profile_photo_capture_state(db, int(profile["id"]), cfg)
+            profile["photo_count"] = len(
+                _canonical_photo_entity_ids(db, int(profile["id"]))
+            )
             _attach_profile_name_history(db, profile)
             profile["last_success_display"] = display_time(profile.get("last_success_at"), cfg.timezone)
             profile["next_visit_display"] = display_time(profile.get("next_visit_at"), cfg.timezone)
@@ -388,9 +488,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     excluded_assets.add(normalize_url(str(media_row["source_url"])))
             public_photo_rows = db.rows(
                 """SELECT DISTINCT m.id,m.source_url,m.perceptual_hash,m.size_bytes FROM media m JOIN entity_media em ON em.media_id=m.id
-                JOIN entities e ON e.id=em.entity_id WHERE e.profile_id=? AND e.kind='profile'
+                JOIN entities e ON e.id=em.entity_id WHERE e.profile_id=? AND e.kind IN ('profile','photo')
                 AND em.version_id=e.current_version_id
-                AND m.status='ready' AND em.role='image'
+                AND m.status='ready' AND (e.kind='photo' OR em.role='image')
                 ORDER BY COALESCE(m.size_bytes,0) DESC,m.id DESC LIMIT 64""",
                 (profile["id"],),
             )
@@ -917,6 +1017,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         label = profile.get("display_name") or profile.get("name") or "Facebook"
         return RedirectResponse(url=f"/?notice={quote(f'已排入 {label} 立即瀏覽器拜訪')}", status_code=303)
 
+    @app.post("/profiles/{profile_id}/capture-photos")
+    def capture_profile_photos(request: Request, profile_id: int):
+        _require_paid_action_same_origin(request)
+        db: Database = request.app.state.db
+        profile = db.row(
+            "SELECT id,display_name,name FROM profiles WHERE id=? AND enabled=1",
+            (profile_id,),
+        )
+        if not profile:
+            raise HTTPException(404)
+        if not cfg.facebook_browser_enabled:
+            return RedirectResponse(
+                url=f"/?error={quote('公開照片擷取需要先啟用 Facebook 直接瀏覽器')}",
+                status_code=303,
+            )
+        created, coverage = request.app.state.service.queue_public_photo_capture(profile_id)
+        label = profile.get("display_name") or profile.get("name") or "Facebook"
+        if not created:
+            status = str((coverage or {}).get("status") or "pending")
+            message = (
+                f"{label} 的公開照片回溯已完成，不會重複排程"
+                if status == "complete"
+                else f"{label} 的公開照片回溯已在佇列中（{status}），不會重複排程"
+            )
+            return RedirectResponse(url=f"/?error={quote(message)}", status_code=303)
+        return RedirectResponse(
+            url=f"/?notice={quote(f'已排入 {label} 公開照片完整回溯；可中斷續接且不重複下載')}",
+            status_code=303,
+        )
+
     @app.post("/profiles/{profile_id}/apify-freeze")
     def toggle_profile_apify(request: Request, profile_id: int):
         _require_paid_action_same_origin(request)
@@ -1001,7 +1131,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def profile_page(
         request: Request,
         profile_id: int,
-        kind: str = Query("post", pattern="^(post|comment|profile)$"),
+        kind: str = Query("post", pattern="^(post|comment|photo|profile)$"),
         q: str = "",
         media_filter: str = Query("all", pattern="^(all|image|video|none|gone)$"),
         page: int = Query(1, ge=1),
@@ -1011,11 +1141,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not profile:
             raise HTTPException(404)
         profile["apify_frozen"] = db.profile_source_frozen(profile_id, "apify")
+        canonical_photo_ids = _canonical_photo_entity_ids(db, profile_id)
+        profile["photo_count"] = len(canonical_photo_ids)
+        profile["photo_capture"] = _profile_photo_capture_state(db, profile_id, cfg)
         _attach_browser_capture(profile, cfg)
         _attach_profile_name_history(db, profile)
         size, offset = 20, (page - 1) * 20
         params: tuple[Any, ...] = (profile_id, kind)
         where = "e.profile_id=? AND e.kind=?"
+        if kind == "photo":
+            if canonical_photo_ids:
+                where += " AND e.id IN (" + ",".join(
+                    "?" for _ in canonical_photo_ids
+                ) + ")"
+                params += tuple(canonical_photo_ids)
+            else:
+                where += " AND 0"
         if q:
             where += " AND (e.external_id LIKE ? OR e.source_url LIKE ? OR v.normalized_json LIKE ?)"
             like = f"%{q}%"
@@ -1065,7 +1206,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if actor.strip()
             )
         )
-        return templates.TemplateResponse(request, "profile.html", {"profile": profile, "entities": entities, "kind": kind, "q": q, "media_filter": media_filter, "page": page, "pages": max(1, ((count or {"count": 0})["count"] + size - 1) // size), "capture_v2_enabled": cfg.capture_v2_enabled, "capture_epoch": capture_epoch, "capture_coverage": capture_coverage, "capture_contract_ready": capture_contract_ready, "capture_contract_budget": cfg.actor_contract_test_budget_usd})
+        return templates.TemplateResponse(request, "profile.html", {"profile": profile, "entities": entities, "kind": kind, "q": q, "media_filter": media_filter, "page": page, "pages": max(1, ((count or {"count": 0})["count"] + size - 1) // size), "capture_v2_enabled": cfg.capture_v2_enabled, "browser_enabled": cfg.facebook_browser_enabled, "capture_epoch": capture_epoch, "capture_coverage": capture_coverage, "capture_contract_ready": capture_contract_ready, "capture_contract_budget": cfg.actor_contract_test_budget_usd})
 
     @app.get("/profiles/{profile_id}/browser-screenshot")
     def browser_screenshot(request: Request, profile_id: int):
@@ -1183,8 +1324,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "migrate_profile_pics": "大頭照欄位更新", "dedupe_database": "資料庫去重",
             "contract_test_posts_v2": "Capture V2 Actor 契約測試",
             "capture_posts_v2": "Capture V2 貼文續抓",
+            "capture_profile_photos": "公開照片完整回溯",
         }
-        status_labels = {"pending": "等待中", "running": "執行中", "done": "完成", "failed": "失敗", "cancelled": "已取消", "deferred_budget": "額度延後"}
+        status_labels = {"pending": "等待中", "running": "執行中", "done": "完成", "failed": "失敗", "source_limited": "公開來源受限", "cancelled": "已取消", "deferred_budget": "額度延後"}
         for row in rows:
             row["type_label"] = type_labels.get(str(row["job_type"]), str(row["job_type"]))
             row["status_label"] = status_labels.get(str(row["status"]), str(row["status"]))
