@@ -153,7 +153,7 @@ def test_dashboard_card_shows_serpapi_profile_details(tmp_path: Path, monkeypatc
         assert "Facebook 網址：" in dashboard.text
         assert "pfbid0example" not in dashboard.text
         assert "2026-08-01 08:10" in dashboard.text
-        assert '<div class="profile-card">' in dashboard.text
+        assert '<div class="profile-card"' in dashboard.text
         assert "data-copy-profile" in dashboard.text
 
 
@@ -327,6 +327,8 @@ def test_dashboard_hides_cover_preview_from_public_photos(tmp_path: Path, monkey
     assert dashboard.status_code == 200
     assert f'/media/{media[1]}/thumbnail' not in dashboard.text
     assert f'/media/{media[2]}/thumbnail' in dashboard.text
+    assert f'data-lightbox-src="/media/{media[2]}"' in dashboard.text
+    assert f'data-download="/media/{media[2]}?download=true"' in dashboard.text
 
 
 def test_dashboard_deduplicates_profile_photos_with_same_perceptual_hash(tmp_path: Path, monkeypatch):

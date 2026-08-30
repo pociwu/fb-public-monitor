@@ -22,15 +22,15 @@
 </form>
 <div class="cards" data-profile-cards>{% for p in profiles %}<div class="profile-card-wrap" data-profile-id="{{ p.id }}">
   <span class="drag-handle" draggable="true" aria-label="拖曳調整順序" title="拖曳調整順序">⠿</span>
-  <div class="profile-card">
-  {% if p.cover_media_id %}<div class="card-cover"><img src="/media/{{ p.cover_media_id }}/thumbnail" alt="{{ p.display_name or p.name }} 封面照"></div>{% endif %}
-  <div class="profile-head">{% if p.avatar_media_id %}<img class="avatar" src="/media/{{ p.avatar_media_id }}" alt="">{% else %}<span class="avatar placeholder">FB</span>{% endif %}<div><span class="dot {{ p.public_state }}"></span><strong>{{ p.display_name or p.name }}</strong>{% if p.display_name and p.name != p.display_name %}<small class="alias">別名：{{ p.name }}</small>{% endif %}{% if p.previous_names %}<small class="alias">曾用名稱：{{ p.previous_names|join('、') }}</small>{% endif %}</div></div>
+  <div class="profile-card" data-gallery="dashboard-profile-{{ p.id }}">
+  {% if p.cover_media_id %}<div class="card-cover"><button class="card-media-button" type="button" data-lightbox-src="/media/{{ p.cover_media_id }}" data-download="/media/{{ p.cover_media_id }}?download=true" aria-label="查看 {{ p.display_name or p.name }} 封面照"><img src="/media/{{ p.cover_media_id }}/thumbnail" alt="{{ p.display_name or p.name }} 封面照"></button></div>{% endif %}
+  <div class="profile-head">{% if p.avatar_media_id %}<button class="card-avatar-button" type="button" data-lightbox-src="/media/{{ p.avatar_media_id }}" data-download="/media/{{ p.avatar_media_id }}?download=true" aria-label="查看 {{ p.display_name or p.name }} 大頭照"><img class="avatar" src="/media/{{ p.avatar_media_id }}" alt="{{ p.display_name or p.name }} 大頭照"></button>{% else %}<span class="avatar placeholder">FB</span>{% endif %}<div><span class="dot {{ p.public_state }}"></span><strong>{{ p.display_name or p.name }}</strong>{% if p.display_name and p.name != p.display_name %}<small class="alias">別名：{{ p.name }}</small>{% endif %}{% if p.previous_names %}<small class="alias">曾用名稱：{{ p.previous_names|join('、') }}</small>{% endif %}</div></div>
   <small>{{ p.public_state }} · Facebook ID：{{ p.display_fb_id or '尚未解析' }}</small>
   {% if p.details %}<div class="profile-details">
     {% if p.details.profile_intro_text %}<p>{{ p.details.profile_intro_text }}</p>{% endif %}
     <small>{% if p.details.profile_data_source %}個人資料來源：{{ p.details.profile_data_source }}{% endif %}{% if p.details.followers %}<br>追蹤者：{{ p.details.followers }}{% endif %}{% if p.details.current_city %}<br>居住地：{{ p.details.current_city }}{% endif %}{% if p.details.hometown %}<br>家鄉：{{ p.details.hometown }}{% endif %}{% if p.work_labels %}<br>工作：{{ p.work_labels[0] }}{% endif %}{% if p.education_labels %}<br>學歷：{{ p.education_labels[0] }}{% endif %}<br>監控網址：<span class="break-all">{{ p.url }}</span>{% if p.details.url and p.details.url != p.url %}<br>Facebook 網址：<span class="break-all">{{ p.details.url }}</span>{% endif %}</small>
   </div>{% endif %}
-  {% if p.public_photo_ids %}<div class="card-photo-strip">{% for media_id in p.public_photo_ids %}<img src="/media/{{ media_id }}/thumbnail" alt="公開照片">{% endfor %}</div>{% endif %}
+  {% if p.public_photo_ids %}<div class="card-photo-strip">{% for media_id in p.public_photo_ids %}<button class="card-media-button" type="button" data-lightbox-src="/media/{{ media_id }}" data-download="/media/{{ media_id }}?download=true" aria-label="查看第 {{ loop.index }} 張公開照片"><img src="/media/{{ media_id }}/thumbnail" alt="第 {{ loop.index }} 張公開照片" loading="lazy"></button>{% endfor %}</div>{% endif %}
   <p>{{ p.post_count }} 篇貼文 · {{ p.comment_count }} 則留言</p>
   <small>最近成功：{{ p.last_success_display if p.last_success_at else '—' }}<br>下次拜訪：{{ p.next_visit_display if p.next_visit_at else '佇列中' }}</small>
   </div>
