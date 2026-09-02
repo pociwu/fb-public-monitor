@@ -42,7 +42,7 @@ def cleanup_capture_raw(
     *,
     now: datetime | None = None,
 ) -> RawCleanupResult:
-    """Remove only resolved Capture V2 raw artifacts whose epoch is complete.
+    """Remove only resolved paid-capture raw artifacts whose capture is complete.
 
     Ambiguous, failed, running, or incomplete batches are deliberately absent
     from the deletion query.  Each file is first renamed inside the evidence
@@ -54,33 +54,45 @@ def cleanup_capture_raw(
     now = now or datetime.now(UTC)
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
-    root = Path(data_dir) / "capture-v2" / "raw"
-    root.mkdir(parents=True, exist_ok=True)
-    try:
-        root.chmod(0o700)
-    except OSError:
-        pass
+    roots = {
+        "capture-v2": Path(data_dir) / "capture-v2" / "raw",
+        "photo-capture": Path(data_dir) / "photo-capture" / "raw",
+    }
+    for root in roots.values():
+        root.mkdir(parents=True, exist_ok=True)
+        try:
+            root.chmod(0o700)
+        except OSError:
+            pass
 
     checked = deleted = deleted_bytes = temporary_deleted = errors = 0
     rows = db.rows(
         """SELECT b.id,b.raw_path,b.raw_saved_at,b.created_at,e.completed_at,
-        'paid_source_batches' AS source_table
+        'paid_source_batches' AS source_table,'capture-v2' AS source_root
         FROM paid_source_batches b
         JOIN capture_epochs e ON e.id=b.epoch_id
         WHERE b.status='committed' AND b.raw_path IS NOT NULL
           AND e.status='complete' AND e.completed_at IS NOT NULL
         UNION ALL
         SELECT p.id,p.raw_path,p.raw_saved_at,p.created_at,p.committed_at AS completed_at,
-        'paid_access_probe_batches' AS source_table
+        'paid_access_probe_batches' AS source_table,'capture-v2' AS source_root
         FROM paid_access_probe_batches p
         WHERE p.status='committed' AND p.raw_path IS NOT NULL
           AND p.committed_at IS NOT NULL
+        UNION ALL
+        SELECT p.id,p.raw_path,p.raw_saved_at,p.created_at,c.completed_at,
+        'paid_photo_batches' AS source_table,'photo-capture' AS source_root
+        FROM paid_photo_batches p
+        JOIN profile_photo_captures c ON c.id=p.photo_capture_id
+        WHERE p.status='committed' AND p.raw_path IS NOT NULL
+          AND c.status='complete' AND c.completed_at IS NOT NULL
         ORDER BY source_table,id"""
     )
     for row in rows:
         checked += 1
         try:
             path = Path(str(row["raw_path"]))
+            root = roots[str(row["source_root"])]
             created_at = _aware(row.get("raw_saved_at") or row["created_at"])
             completed_at = _aware(row["completed_at"])
             decision = artifact_retention_decision(
@@ -106,7 +118,11 @@ def cleanup_capture_raw(
             path.replace(staged)
             try:
                 table = str(row.get("source_table") or "")
-                if table not in {"paid_source_batches", "paid_access_probe_batches"}:
+                if table not in {
+                    "paid_source_batches",
+                    "paid_access_probe_batches",
+                    "paid_photo_batches",
+                }:
                     raise RuntimeError("unknown Capture V2 raw metadata table")
                 with db.connect() as conn:
                     cursor = conn.execute(
@@ -125,17 +141,18 @@ def cleanup_capture_raw(
             errors += 1
 
     cutoff = now.astimezone(UTC) - timedelta(hours=24)
-    for temporary in root.rglob("*.tmp"):
-        try:
-            if not _inside(root, temporary):
+    for root in roots.values():
+        for temporary in root.rglob("*.tmp"):
+            try:
+                if not _inside(root, temporary):
+                    errors += 1
+                    continue
+                modified = datetime.fromtimestamp(temporary.stat().st_mtime, UTC)
+                if modified <= cutoff:
+                    temporary.unlink()
+                    temporary_deleted += 1
+            except OSError:
                 errors += 1
-                continue
-            modified = datetime.fromtimestamp(temporary.stat().st_mtime, UTC)
-            if modified <= cutoff:
-                temporary.unlink()
-                temporary_deleted += 1
-        except OSError:
-            errors += 1
 
     return RawCleanupResult(
         checked=checked,

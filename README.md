@@ -10,13 +10,13 @@
 - 完整歷史結案後，6–8 小時巡檢會直接以最近 20 個已知貼文 ID 作停止邊界，上限 20 篇，不再先付費購買重複的最新 1 篇；每個 UTC 月另核對最近 5 篇，同一月份不重複建立工作。
 - 契約 fixture 必須以「最新」匿名、身分一致的強證據確認公開；若後續強證據已確認私人，不會因歷史曾公開而繼續付費契約測試。所有 Web 變更與可能產生付費工作的 POST 在瀏覽器提供 `Origin`/`Referer` 時必須同源；無這兩個 header 的本機 CLI/curl 保留相容。
 - 每個付費批次先建立唯一 request hash，保存 Actor run ID 與 gzip raw 結果後才匯入並前進游標；若啟動結果不明確，會停在 `needs_reconcile`，不會自動重新購買。
-- 個人檔案每 48 小時最多更新一次姓名、ID、網址、公開狀態、簡介、地點、學歷、工作、追蹤者、大頭照、封面與最多 6 張公開照片；查詢順序為 SerpApi → Bright Data → 已登入 Chromium。
+- 個人檔案每 48 小時最多更新一次姓名、ID、網址、公開狀態、簡介、地點、學歷、工作、追蹤者、大頭照、封面與最多 6 張來源可取得照片；查詢順序為 SerpApi → Bright Data → 已登入 Chromium。
 - 已登入 Chromium 的「可讀取」只代表 `authenticated_visible`，不能據此判定匿名公開。一般 SerpApi／Apify 訊號先標為疑似公開，再由無登入瀏覽器或通過公開判定契約的匿名來源確認。
 - Chromium 每次直接擷取會先等待 3 秒，再依姓名區塊與圖片載入狀態最多等待 5 秒；並依帳號覆寫保存最新畫面，首頁個人卡片與個人詳細頁的「瀏覽器擷取畫面」可直接開啟查看。
 - 所有可能啟動 Chromium 的手動拜訪、匿名公開驗證、金絲雀與個人資料備援都經過同一個 OCI/IP 共用的 `BrowserGuard`，共同實施全域／單帳號隨機冷卻、每日批次上限與 challenge 熔斷。匿名或登入瀏覽器任一方遇到真正的 checkpoint、challenge 或 429，都會暫停全部 Chromium 工作；單純匿名登入牆只記為未知，不會誤開熔斷器。被延後的手動／驗證工作保留同一筆 job 稍後再跑，自動備援則安全略過並寫入非通知事件。
 - Facebook 出現 checkpoint／challenge／HTTP 429 時會啟動 24 小時全域熔斷，72 小時內重複發生則延長為 72 小時；已登入瀏覽器單純登入失效只要求重新登入，不會誤開平台風控熔斷。現場畫面以 lossless WebP 保存 180 天，並以 500 MiB 總上限每日自動清理。
 - Chromium 每次最多處理 2 篇有固定連結的貼文；單一相簿批次最多 20 次操作或 3 分鐘，每次切換隨機等待 3–7 秒。照片集合採累積式 checkpoint；暫時找不到相片連結、圖片沒有切換或游標失效只會標示 stalled／source-limited，不會誤判完成。
-- 每張帳號卡片可獨立排入「擷取全部照片」。此工作只使用無登入 Chromium 讀取該帳號的公開 `photos_by` 頁，每批最多 20 張並保存續抓 checkpoint；照片以 Facebook media ID 建立 `photo` entity，再沿用 SHA-256／感知雜湊去重。照片回溯使用獨立的分代狀態簿，不會佔用或污染 Capture V2 的付費 Actor epoch。只有公開照片網格已到可驗證的終點、所有發現的照片都已處理，且列出的媒體實檔均已下載，才會將該分代標成完成。暫時下載失敗會在補抓期內只刷新失敗照片的 permalink，不重掃整個網格；登入牆、DOM 停滯或無法解析的永久連結則如實標成 `source_limited`，不會改用登入帳號擴張公開清冊。首次完整回溯只發一則摘要，後續完整核對才逐項通知真正新增／變更且未重複的照片。
+- 每張帳號卡片可獨立排入「擷取全部照片」。此工作優先使用已登入 Chromium，同時讀取操作帳號可見的本人上傳 `/photos_by` 與被標註 `/photos_of` 兩個照片頁，不再限定為匿名公開內容；直接瀏覽受限時改用設定且受預算控制的 Apify 照片 Actor 後備。每批最多 20 張並為兩個頁面各自保存續抓 checkpoint；照片以 Facebook media ID 建立 `photo` entity，再沿用 SHA-256／感知雜湊去重。照片回溯使用獨立的分代狀態簿，不會佔用或污染 Capture V2 的付費 Actor epoch。只有兩個照片頁都到達可驗證的終點、所有發現的照片都已處理，且列出的媒體實檔均已下載，才會將該分代標成完成。暫時下載失敗會在補抓期內只刷新失敗照片的 permalink，不重掃整個網格；登入失效、DOM 停滯、Actor 受限或無法解析的永久連結則如實標成 `source_limited`。首次完整回溯只發一則摘要，後續完整核對才逐項通知真正新增／變更且未重複的照片。
 - 內容消失需連續兩次成功核對才確認；Actor 失敗不會改變 Facebook 狀態。
 - SQLite 保存實體、版本、事件、排程、通知 outbox、SerpApi 額度、本地費用估算與 Apify 官方用量快照。JSON、Markdown 和媒體保存在 `/data`。
 - 每日在健康摘要時段統計本專案的圖片、影片／附件、SQLite、JSON／Markdown、縮圖快取與 Chromium 用量；首頁可進入最近 30 天詳細頁，Telegram 每日傳送相較前一日的增加量。專案總用量不包含其他 Docker、Docker Images、Build Cache 或 Ubuntu 系統檔案。
@@ -26,7 +26,7 @@
 - Telegram 先傳文字、後補媒體；同一通知的照片使用媒體群組傳送，每組最多 10 張，超過時自動分組，避免逐張訊息干擾。單張圖片、影片與其他檔案維持個別傳送；過大檔案降級為本機路徑提示。通知失敗持久化補發。
 - Telegram 使用固定中文摘要並直接上傳真正變更的照片／影片，不傳 CDN 網址或原始 JSON diff。
 - 每天 08:00（Asia/Taipei）發健康摘要，帳號優先顯示 SerpApi 解析的真實姓名，不使用 `FB-數字ID`。
-- FastAPI/Jinja2/HTMX Web UI 顯示監控人數、自動名稱、設定別名、Facebook ID 與大頭照；首頁可驗證並新增 Facebook 個人網址、停止監控並保留歷史資料、拖曳保存卡片順序，以及立即排程單一／全部帳號拜訪或單一帳號公開照片完整回溯；帳號詳細頁新增「照片」分頁，可燈箱預覽及下載原檔，另提供永久 Actor 診斷頁。預設只由 Docker 發布至主機 `127.0.0.1:8080`，也可用 `WEB_BIND_IP` 綁定 Tailscale IP。
+- FastAPI/Jinja2/HTMX Web UI 顯示監控人數、自動名稱、設定別名、Facebook ID 與大頭照；首頁可驗證並新增 Facebook 個人網址、停止監控並保留歷史資料、拖曳保存卡片順序，以及立即排程單一／全部帳號拜訪或單一帳號可見照片完整回溯；帳號詳細頁新增「照片」分頁，可燈箱預覽及下載原檔，並顯示每輪擷取的存取範圍與來源，另提供永久 Actor 診斷頁。登入 Chromium 會合併「本人上傳」與「被標註」兩個照片表面，並以登入帳號範圍雜湊隔離不同登入身分；Apify Actor 不使用本機登入 cookie，只補抓其自身可取得範圍，不能單獨證明登入帳號可見清冊完整。預設只由 Docker 發布至主機 `127.0.0.1:8080`，也可用 `WEB_BIND_IP` 綁定 Tailscale IP。
 - 貼文與留言列表使用實際媒體卡片：圖片縮圖、影片原地播放、最多四格附件、文字摘要、媒體篩選及已消失遮罩；個人檔案分頁使用封面＋大頭照概覽卡。
 - 圖片列表採延遲生成的 640px 縮圖，快取位於 `/data/cache/thumbnails/`；原始媒體不變，lightbox 與詳細頁仍可下載原檔。
 - SerpApi 與 Bright Data 只負責個人資料／公開狀態訊號，不宣稱歷史貼文完整；登入 Chromium 只作低頻缺口補抓。批量貼文必須使用通過契約的 Apify Actor。
@@ -35,7 +35,7 @@
 ### 尚未自動啟用
 
 - 每篇貼文的留言 checkpoint／job 已在貼文清冊明確到底後自動建立，但 comments Actor 尚未通過獨立游標、終點與費用契約，因此目前不會啟動付費留言抓取，而會安全結案為 `source_limited`。
-- Actor 同批附件已保存並核對；逐篇貼文相簿的獨立 API 缺圖補抓尚未啟用。`reels`、`videos`、`avatar_history`、`cover_history` 仍無各自通過契約的 collector，不能宣稱這些 surface 已完整回溯。Capture V2 的 `public_photo_pages` 仍會誠實保持 `source_limited`；帳號卡片啟動的匿名照片回溯會在獨立狀態簿中記錄各次分代的終點證據。它不包含朋友限定、被標註但來源非公開、大頭照歷史或封面歷史。
+- Actor 同批附件已保存並核對；逐篇貼文相簿的獨立 API 缺圖補抓尚未啟用。`reels`、`videos`、`avatar_history`、`cover_history` 仍無各自通過契約的 collector，不能宣稱這些 surface 已完整回溯。Capture V2 的 `public_photo_pages` 仍會誠實保持 `source_limited`；帳號卡片啟動的照片回溯改以已登入帳號的可見範圍為清冊，並在獨立狀態簿中記錄各次分代的來源、範圍與終點證據。這不代表 Capture V2 的公開性判定或公開貼文契約已改變。
 
 ## Ubuntu 部署
 
@@ -56,8 +56,10 @@ docker compose logs -f monitor
 - `SERPAPI_KEY`：SerpApi 帳號 API key；程式先查免費 Account API，剩餘次數為 0 時不會執行個人檔案查詢。
 - `BRIGHTDATA_API_TOKEN`：Bright Data API token。設定後，SerpApi 額度用完、連線失敗或查無結果時，才呼叫 Facebook Profiles Scraper API 作備援。
 - `BRIGHTDATA_DATASET_ID`：Bright Data Facebook Profiles dataset ID，預設 `gd_mf0urb782734ik94dz`，通常不需修改。
-- `FACEBOOK_BROWSER_ENABLED=1`：啟用已登入 Chromium 個人檔案第三備援，以及使用獨立空白資料目錄的匿名公開驗證／照片回溯。
+- `FACEBOOK_BROWSER_ENABLED=1`：啟用已登入 Chromium 個人檔案備援與帳號可見照片回溯；匿名公開驗證仍使用獨立空白資料目錄。
 - `FACEBOOK_BROWSER_DATA_DIR=/browser-data`：容器內持久化瀏覽器登入狀態的路徑。
+- `PHOTO_ACTOR_FALLBACK_ENABLED=1`：登入照片擷取失敗時啟用 Apify 照片 Actor 後備。
+- `PHOTO_ACTOR_MAX_CHARGE_USD=0.50`：單次照片 Actor 硬上限；仍受 `budget.monthly_usd` 全域上限約束。
 - `BROWSER_LOGIN_BIND_IP`：互動式登入 noVNC 網頁的主機綁定 IP；OCI 應設為 Tailscale IP。
 - `TELEGRAM_BOT_TOKEN`：由 BotFather 建立的 bot token。
 - `TELEGRAM_CHAT_ID`：單一 Telegram 群組 ID；把 bot 加入群組並授權傳送訊息。
@@ -147,6 +149,12 @@ docker compose exec monitor fb-monitor scan 1
 docker compose exec monitor fb-monitor scan example-account
 docker compose exec monitor fb-monitor diagnose
 docker compose exec monitor fb-monitor diagnose example-account
+# Actor 啟動結果不明時，連回已存在的照片 run（不會重新購買）
+docker compose exec monitor fb-monitor reconcile-photo-batch 12 --run-id EXISTING_RUN_ID --dataset-id EXISTING_DATASET_ID
+# 已在 Apify Console 確認根本未啟動時，關閉舊 request 並排入安全重試
+docker compose exec monitor fb-monitor reconcile-photo-batch 12 --confirm-not-launched
+# 已人工切換照片 Actor／schema，放棄無法匯入的舊 raw 並安全重試（raw 仍保留）
+docker compose exec monitor fb-monitor reconcile-photo-batch 12 --abandon-import-failed
 ```
 
 ### OCI 維運選單
@@ -158,7 +166,7 @@ install -m 750 ~/fb-public-monitor/fb.sh ~/fb.sh
 ~/fb.sh
 ```
 
-`scan` 只將工作排到最前端，仍遵守全域間隔與預算。Web UI 提供首頁卡片排序、SerpApi 個人檔案與剩餘額度、新增／移除監控帳號、全部／單人立即拜訪、單人「擷取全部照片」、Apify 官方用量快照與通知佇列管理。照片回溯沿用共用 BrowserGuard；按下按鈕只會排程，不會繞過全域／單帳號冷卻或 challenge 熔斷。
+`scan` 只將工作排到最前端，仍遵守全域間隔與預算。Web UI 提供首頁卡片排序、SerpApi 個人檔案與剩餘額度、新增／移除監控帳號、全部／單人立即拜訪、單人「擷取全部照片」、Apify 官方用量快照與通知佇列管理。照片回溯優先使用已登入 Chromium，並沿用共用 BrowserGuard；直接瀏覽受限時才使用 Apify 照片 Actor 後備。按下按鈕只會排程，不會繞過全域／單帳號冷卻、challenge 熔斷或 Apify 預算上限。
 
 ### 從 GitHub 更新 OCI
 
@@ -178,9 +186,10 @@ bash scripts/deploy.sh
 個人檔案使用 SerpApi `facebook_profile`；預設 Apify Actor：
 
 - 貼文與貼文附件：`spbotdel/facebook-profile-posts-all-photos-scraper`
+- 照片補抓：`vulnv/facebook-profile-scraper`
 - 留言與回覆：`apify/facebook-comments-scraper`
 
-Actor ID 與額外輸入可在 `config.yaml` 的 `actors` 區塊覆寫。每次 Actor 呼叫、輸入格式、結果數、SUMMARY、錯誤與 schema 失敗樣本（最多 20 筆）都會保存；token、cookie、password、secret 欄位會遮蔽。Facebook 或 Actor schema 改變且所有已確認 fallback 皆失敗時，服務會停止該輪並通知，不會自行切換到未核准的付費 Actor。完整擷取是指 Actor 在未登入狀態實際可取得的公開內容；影片直接網址與留言附件不保證存在。
+Actor ID 與額外輸入可在 `config.yaml` 的 `actors` 區塊覆寫。每次 Actor 呼叫、輸入格式、結果數、SUMMARY、錯誤與 schema 失敗樣本（最多 20 筆）都會保存；一般 Actor 診斷會遮蔽 token、cookie、password、secret 欄位。照片 Actor 的 input 另會直接拒絕 cookie、`c_user`、session、password、登入 token 等認證資料，既不傳送也不新增付費批次。Facebook 或 Actor schema 改變且所有已確認 fallback 皆失敗時，服務會停止該輪並通知，不會自行切換到未核准的付費 Actor。照片 Actor 結果標記為 `actor_visible`，只代表 Actor 自身可取得範圍，不等同匿名公開內容，也不等同登入帳號可見清冊；影片直接網址與留言附件不保證存在。
 
 5 美元預算很低，大型帳號的首次貼文／留言回溯可能需要多個月。優先級依序為公開狀態、個人檔案、近期貼文、近期留言、歷史回溯、完整核對。
 

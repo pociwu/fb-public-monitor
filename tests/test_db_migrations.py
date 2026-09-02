@@ -115,3 +115,38 @@ def test_legacy_jobs_get_capture_links_and_active_dedupe_index(tmp_path: Path):
         "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_jobs_active_dedupe'"
     )
     assert db.row("SELECT COUNT(*) AS total FROM jobs")["total"] == 1
+
+
+def test_existing_database_adds_photo_provenance_and_paid_batch_ledger(tmp_path: Path):
+    path = tmp_path / "legacy-photo-capture.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """CREATE TABLE entities (
+          id INTEGER PRIMARY KEY, profile_id INTEGER NOT NULL, kind TEXT NOT NULL,
+          external_id TEXT NOT NULL, parent_external_id TEXT, dedupe_key TEXT,
+          source_url TEXT, published_at TEXT, current_hash TEXT,
+          current_version_id INTEGER, present INTEGER NOT NULL DEFAULT 1,
+          missing_successes INTEGER NOT NULL DEFAULT 0, notification_hash TEXT,
+          first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+          UNIQUE(profile_id,kind,external_id)
+        )"""
+    )
+    connection.commit()
+    connection.close()
+
+    db = Database(path)
+
+    columns = {row["name"] for row in db.rows("PRAGMA table_info(entities)")}
+    assert {
+        "source_scope",
+        "source_collector",
+        "source_run_id",
+        "source_viewer_scope_hash",
+    } <= columns
+    assert db.row(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='paid_photo_batches'"
+    )
+    assert db.row(
+        "SELECT name FROM sqlite_master WHERE type='index' "
+        "AND name='idx_paid_photo_batches_capture'"
+    )

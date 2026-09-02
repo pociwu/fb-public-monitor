@@ -22,6 +22,143 @@ def add_profile(db: Database, profile_id: int = 1, *, frozen: int = 0) -> None:
     )
 
 
+def add_photo_capture(db: Database, profile_id: int = 1, generation: int = 1) -> int:
+    return db.execute(
+        """INSERT INTO profile_photo_captures(
+          profile_id,generation,status,created_at,updated_at
+        ) VALUES(?,?,'pending','now','now')""",
+        (profile_id, generation),
+    )
+
+
+def test_paid_photo_batch_is_idempotent_and_reserves_global_budget(tmp_path: Path):
+    db = Database(tmp_path / "paid-photo.sqlite3")
+    add_profile(db)
+    capture_id = add_photo_capture(db)
+
+    first, created = db.prepare_paid_photo_batch(
+        profile_id=1,
+        photo_capture_id=capture_id,
+        actor_id="example/profile-photos",
+        normalized_input={"urls": ["https://facebook.com/1"]},
+        max_charge_usd=0.25,
+    )
+    replay, created_again = db.prepare_paid_photo_batch(
+        profile_id=1,
+        photo_capture_id=capture_id,
+        actor_id="example/profile-photos",
+        normalized_input={"urls": ["https://facebook.com/1"]},
+        max_charge_usd=0.25,
+    )
+
+    assert created is True
+    assert created_again is False
+    assert replay["id"] == first["id"]
+    claimed, won = db.claim_paid_photo_batch_launch(
+        first["id"],
+        global_capacity_usd=0.20,
+        minimum_charge_usd=0.0029,
+    )
+    assert won is True
+    assert claimed["status"] == "launching"
+    assert claimed["max_charge_usd"] == pytest.approx(0.20)
+    reservations = db.paid_budget_reservations(posts_result_price_usd=0.005)
+    assert reservations["photo_unsettled_usd"] == pytest.approx(0.20)
+    assert reservations["total_unsettled_usd"] >= 0.20
+
+
+def test_paid_photo_batch_claim_rejects_insufficient_atomic_budget(tmp_path: Path):
+    db = Database(tmp_path / "paid-photo-budget.sqlite3")
+    add_profile(db)
+    capture_id = add_photo_capture(db)
+    batch, _ = db.prepare_paid_photo_batch(
+        profile_id=1,
+        photo_capture_id=capture_id,
+        actor_id="example/profile-photos",
+        normalized_input={"urls": ["https://facebook.com/1"]},
+        max_charge_usd=0.25,
+    )
+
+    denied, claimed = db.claim_paid_photo_batch_launch(
+        batch["id"],
+        global_capacity_usd=0.001,
+        minimum_charge_usd=0.0029,
+    )
+
+    assert claimed is False
+    assert denied["status"] == "prepared"
+    assert denied["max_charge_usd"] == pytest.approx(0.001)
+
+
+def test_paid_photo_batch_reconcile_attaches_run_or_closes_unlaunched(tmp_path: Path):
+    db = Database(tmp_path / "paid-photo-reconcile.sqlite3")
+    add_profile(db)
+    first_capture = add_photo_capture(db)
+    first, _ = db.prepare_paid_photo_batch(
+        profile_id=1,
+        photo_capture_id=first_capture,
+        actor_id="example/photos",
+        normalized_input={"urls": ["https://facebook.com/1"]},
+        max_charge_usd=0.1,
+    )
+    db.transition_paid_photo_batch(first["id"], "launching")
+    db.transition_paid_photo_batch(first["id"], "needs_reconcile")
+
+    attached = db.reconcile_paid_photo_batch(
+        first["id"], run_id="existing-run", dataset_id="existing-dataset"
+    )
+
+    assert attached["status"] == "run_started"
+    assert attached["run_id"] == "existing-run"
+    assert attached["dataset_id"] == "existing-dataset"
+
+    second_capture = add_photo_capture(db, generation=2)
+    second, _ = db.prepare_paid_photo_batch(
+        profile_id=1,
+        photo_capture_id=second_capture,
+        actor_id="example/photos",
+        normalized_input={"urls": ["https://facebook.com/1"], "page": 2},
+        max_charge_usd=0.1,
+    )
+    db.transition_paid_photo_batch(second["id"], "launching")
+    db.transition_paid_photo_batch(second["id"], "needs_reconcile")
+
+    closed = db.reconcile_paid_photo_batch(
+        second["id"], confirm_not_launched=True
+    )
+
+    assert closed["status"] == "failed"
+    assert "not launched" in closed["error"]
+
+    third_capture = add_photo_capture(db, generation=3)
+    third, _ = db.prepare_paid_photo_batch(
+        profile_id=1,
+        photo_capture_id=third_capture,
+        actor_id="example/photos-v2",
+        normalized_input={"urls": ["https://facebook.com/1"], "schema": 2},
+        max_charge_usd=0.1,
+    )
+    db.transition_paid_photo_batch(third["id"], "launching")
+    db.transition_paid_photo_batch(
+        third["id"], "run_started", run_id="bad-schema-run"
+    )
+    db.transition_paid_photo_batch(
+        third["id"],
+        "raw_saved",
+        raw_path="/data/photo-capture/raw/bad.json.gz",
+    )
+    db.transition_paid_photo_batch(
+        third["id"], "import_failed", error="schema mismatch"
+    )
+
+    abandoned = db.reconcile_paid_photo_batch(
+        third["id"], abandon_import_failed=True
+    )
+
+    assert abandoned["status"] == "failed"
+    assert "abandoned import_failed" in abandoned["error"]
+
+
 def _race_two(call_left, call_right):
     barrier = threading.Barrier(2)
 

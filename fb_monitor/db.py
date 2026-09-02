@@ -74,7 +74,10 @@ CREATE TABLE IF NOT EXISTS entities (
   id INTEGER PRIMARY KEY, profile_id INTEGER NOT NULL REFERENCES profiles(id), kind TEXT NOT NULL,
   external_id TEXT NOT NULL, parent_external_id TEXT, dedupe_key TEXT, source_url TEXT, published_at TEXT,
   current_hash TEXT, current_version_id INTEGER, present INTEGER NOT NULL DEFAULT 1,
-  missing_successes INTEGER NOT NULL DEFAULT 0, notification_hash TEXT, first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+  missing_successes INTEGER NOT NULL DEFAULT 0, notification_hash TEXT,
+  source_scope TEXT, source_collector TEXT, source_run_id TEXT,
+  source_viewer_scope_hash TEXT,
+  first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
   UNIQUE(profile_id, kind, external_id)
 );
 CREATE TABLE IF NOT EXISTS versions (
@@ -305,6 +308,34 @@ CREATE TABLE IF NOT EXISTS profile_photo_captures (
   completed_at TEXT,
   UNIQUE(profile_id,generation)
 );
+CREATE TABLE IF NOT EXISTS paid_photo_batches (
+  id INTEGER PRIMARY KEY,
+  request_hash TEXT NOT NULL UNIQUE,
+  profile_id INTEGER NOT NULL REFERENCES profiles(id),
+  photo_capture_id INTEGER NOT NULL REFERENCES profile_photo_captures(id),
+  actor_run_id INTEGER REFERENCES actor_runs(id),
+  actor_id TEXT NOT NULL,
+  normalized_input_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'prepared',
+  max_charge_usd REAL NOT NULL DEFAULT 0,
+  run_id TEXT,
+  dataset_id TEXT,
+  key_value_store_id TEXT,
+  raw_path TEXT,
+  raw_sha256 TEXT,
+  charged_usd REAL NOT NULL DEFAULT 0,
+  raw_result_count INTEGER NOT NULL DEFAULT 0,
+  parsed_result_count INTEGER NOT NULL DEFAULT 0,
+  input_cursor TEXT,
+  output_cursor TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  launched_at TEXT,
+  raw_saved_at TEXT,
+  imported_at TEXT,
+  committed_at TEXT,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS paid_source_batches (
   id INTEGER PRIMARY KEY,
   request_hash TEXT NOT NULL UNIQUE,
@@ -530,6 +561,8 @@ CREATE INDEX IF NOT EXISTS idx_contract_allocations_grant ON contract_test_alloc
 CREATE INDEX IF NOT EXISTS idx_coverage_epoch_status ON coverage_streams(epoch_id,status,stream,surface);
 CREATE INDEX IF NOT EXISTS idx_profile_photo_captures_latest
   ON profile_photo_captures(profile_id,generation DESC,id DESC);
+CREATE INDEX IF NOT EXISTS idx_paid_photo_batches_capture
+  ON paid_photo_batches(photo_capture_id,status,updated_at,id);
 CREATE INDEX IF NOT EXISTS idx_paid_batches_status ON paid_source_batches(status,updated_at);
 CREATE INDEX IF NOT EXISTS idx_paid_batches_epoch ON paid_source_batches(epoch_id,coverage_stream_id,id);
 CREATE INDEX IF NOT EXISTS idx_paid_access_probe_profile
@@ -618,6 +651,14 @@ class Database:
                 conn.execute("ALTER TABLE entities ADD COLUMN dedupe_key TEXT")
             if "notification_hash" not in entity_columns:
                 conn.execute("ALTER TABLE entities ADD COLUMN notification_hash TEXT")
+            for name in (
+                "source_scope",
+                "source_collector",
+                "source_run_id",
+                "source_viewer_scope_hash",
+            ):
+                if name not in entity_columns:
+                    conn.execute(f"ALTER TABLE entities ADD COLUMN {name} TEXT")
             media_columns = {row[1] for row in conn.execute("PRAGMA table_info(entity_media)")}
             if "discovery_path" not in media_columns:
                 conn.execute("ALTER TABLE entity_media ADD COLUMN discovery_path TEXT")
@@ -921,7 +962,7 @@ class Database:
             "profiles", "entities", "versions", "media", "entity_media", "events", "outbox", "jobs",
             "usage", "audit_seen", "actor_runs", "schema_migrations", "access_observations",
             "actor_contracts", "contract_runs", "capture_epochs", "coverage_streams", "profile_photo_captures",
-            "contract_test_grants", "contract_test_allocations",
+            "contract_test_grants", "contract_test_allocations", "paid_photo_batches",
             "paid_source_batches", "paid_access_probe_batches", "post_aliases", "media_aliases", "post_media_coverage",
             "browser_limits", "browser_evidence", "profile_name_candidates", "profile_source_controls",
             "large_media_approvals",
@@ -1975,6 +2016,285 @@ class Database:
                 tuple(fields.values()) + (checkpoint_id,),
             )
 
+    def prepare_paid_photo_batch(
+        self,
+        *,
+        profile_id: int,
+        photo_capture_id: int,
+        actor_id: str,
+        normalized_input: dict[str, Any],
+        max_charge_usd: float,
+        input_cursor: str | None = None,
+        request_hash: str | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Persist one profile-photo Actor request before crossing the paid boundary."""
+
+        input_json = json.dumps(
+            normalized_input,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        request_hash = request_hash or canonical_request_hash(
+            {
+                "profile_id": profile_id,
+                "photo_capture_id": photo_capture_id,
+                "actor_id": actor_id,
+                "input_cursor": input_cursor or "",
+                "input": normalized_input,
+            }
+        )
+        now = utcnow()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO paid_photo_batches(
+                  request_hash,profile_id,photo_capture_id,actor_id,
+                  normalized_input_json,max_charge_usd,input_cursor,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    request_hash,
+                    profile_id,
+                    photo_capture_id,
+                    actor_id,
+                    input_json,
+                    max(0.0, float(max_charge_usd)),
+                    input_cursor,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM paid_photo_batches WHERE request_hash=?",
+                (request_hash,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("paid photo batch could not be prepared")
+            if (
+                int(row["profile_id"]) != profile_id
+                or int(row["photo_capture_id"]) != photo_capture_id
+                or str(row["actor_id"]) != actor_id
+                or str(row["normalized_input_json"]) != input_json
+            ):
+                raise ValueError("request_hash already belongs to a different paid photo request")
+            if str(row["status"]) == "prepared" and not row["run_id"]:
+                conn.execute(
+                    """UPDATE paid_photo_batches
+                    SET max_charge_usd=MAX(max_charge_usd,?),updated_at=?
+                    WHERE id=? AND status='prepared' AND run_id IS NULL""",
+                    (max(0.0, float(max_charge_usd)), now, row["id"]),
+                )
+                row = conn.execute(
+                    "SELECT * FROM paid_photo_batches WHERE id=?", (row["id"],)
+                ).fetchone()
+            return dict(row), bool(cursor.rowcount)
+
+    def transition_paid_photo_batch(
+        self,
+        batch_id: int,
+        status: str,
+        *,
+        expected_status: str | None = None,
+        **fields: Any,
+    ) -> dict[str, Any]:
+        if status not in BATCH_STATUSES:
+            raise ValueError(f"unsupported paid photo batch status: {status}")
+        allowed = {
+            "actor_run_id",
+            "run_id",
+            "dataset_id",
+            "key_value_store_id",
+            "raw_path",
+            "raw_sha256",
+            "charged_usd",
+            "raw_result_count",
+            "parsed_result_count",
+            "input_cursor",
+            "output_cursor",
+            "error",
+        }
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(f"unsupported paid photo batch fields: {sorted(unknown)}")
+        now = utcnow()
+        milestone = {
+            "launching": "launched_at",
+            "raw_saved": "raw_saved_at",
+            "imported": "imported_at",
+            "committed": "committed_at",
+        }.get(status)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT * FROM paid_photo_batches WHERE id=?", (batch_id,)
+            ).fetchone()
+            if current is None:
+                raise ValueError(f"unknown paid photo batch: {batch_id}")
+            if expected_status is not None and str(current["status"]) != expected_status:
+                raise RuntimeError(
+                    f"paid photo batch {batch_id} is {current['status']}, expected {expected_status}"
+                )
+            from .capture_v2 import validate_batch_transition
+
+            validate_batch_transition(str(current["status"]), status)
+            values = {"status": status, **fields, "updated_at": now}
+            if milestone and not current[milestone]:
+                values[milestone] = now
+            assignments = ",".join(f"{name}=?" for name in values)
+            compare_status = str(current["status"])
+            cursor = conn.execute(
+                f"UPDATE paid_photo_batches SET {assignments} WHERE id=? AND status=?",
+                tuple(values.values()) + (batch_id, compare_status),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    f"paid photo batch {batch_id} lost atomic transition from {compare_status}"
+                )
+            updated = conn.execute(
+                "SELECT * FROM paid_photo_batches WHERE id=?", (batch_id,)
+            ).fetchone()
+            return dict(updated)
+
+    def claim_paid_photo_batch_launch(
+        self,
+        batch_id: int,
+        *,
+        global_capacity_usd: float,
+        minimum_charge_usd: float,
+    ) -> tuple[dict[str, Any], bool]:
+        """Atomically reserve the photo run against every durable Apify ledger."""
+
+        now = utcnow()
+        minimum = max(0.0, float(minimum_charge_usd))
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT * FROM paid_photo_batches WHERE id=?", (batch_id,)
+            ).fetchone()
+            if current is None:
+                raise ValueError(f"unknown paid photo batch: {batch_id}")
+            if str(current["status"]) != "prepared" or current["run_id"]:
+                return dict(current), False
+            reservations = self._paid_budget_reservations_in_connection(
+                conn,
+                result_price=minimum,
+                excluding_photo_batch_id=batch_id,
+            )
+            available = max(
+                0.0,
+                float(global_capacity_usd)
+                - float(reservations["total_unsettled_usd"]),
+            )
+            clamped = min(max(0.0, float(current["max_charge_usd"])), available)
+            if clamped + 1e-12 < minimum:
+                conn.execute(
+                    "UPDATE paid_photo_batches SET max_charge_usd=?,updated_at=? "
+                    "WHERE id=? AND status='prepared'",
+                    (clamped, now, batch_id),
+                )
+                row = conn.execute(
+                    "SELECT * FROM paid_photo_batches WHERE id=?", (batch_id,)
+                ).fetchone()
+                return dict(row), False
+            cursor = conn.execute(
+                """UPDATE paid_photo_batches
+                SET status='launching',max_charge_usd=?,
+                    launched_at=COALESCE(launched_at,?),updated_at=?
+                WHERE id=? AND status='prepared' AND run_id IS NULL""",
+                (clamped, now, now, batch_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM paid_photo_batches WHERE id=?", (batch_id,)
+            ).fetchone()
+            return dict(row), cursor.rowcount == 1
+
+    def reconcile_paid_photo_batch(
+        self,
+        batch_id: int,
+        *,
+        run_id: str | None = None,
+        dataset_id: str | None = None,
+        key_value_store_id: str | None = None,
+        confirm_not_launched: bool = False,
+        abandon_import_failed: bool = False,
+    ) -> dict[str, Any]:
+        """Resolve or explicitly abandon one blocked paid photo batch."""
+
+        normalized_run_id = str(run_id or "").strip()
+        if sum(
+            bool(value)
+            for value in (
+                normalized_run_id,
+                confirm_not_launched,
+                abandon_import_failed,
+            )
+        ) != 1:
+            raise ValueError(
+                "provide exactly one of run_id, confirm_not_launched, "
+                "or abandon_import_failed"
+            )
+        now = utcnow()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT * FROM paid_photo_batches WHERE id=?", (batch_id,)
+            ).fetchone()
+            if current is None:
+                raise ValueError(f"unknown paid photo batch: {batch_id}")
+            expected_status = (
+                "import_failed" if abandon_import_failed else "needs_reconcile"
+            )
+            if str(current["status"]) != expected_status:
+                raise RuntimeError(
+                    f"paid photo batch {batch_id} is {current['status']}, "
+                    f"expected {expected_status}"
+                )
+            from .capture_v2 import validate_batch_transition
+
+            destination = "run_started" if normalized_run_id else "failed"
+            validate_batch_transition(str(current["status"]), destination)
+            diagnostic_id = int(current["actor_run_id"] or 0)
+            if normalized_run_id:
+                conn.execute(
+                    """UPDATE paid_photo_batches
+                    SET status='run_started',run_id=?,dataset_id=?,key_value_store_id=?,
+                        error=NULL,updated_at=?
+                    WHERE id=? AND status='needs_reconcile'""",
+                    (
+                        normalized_run_id,
+                        str(dataset_id or ""),
+                        str(key_value_store_id or ""),
+                        now,
+                        batch_id,
+                    ),
+                )
+                if diagnostic_id:
+                    conn.execute(
+                        """UPDATE actor_runs SET status='running',run_id=?,error=NULL,
+                        finished_at=NULL WHERE id=?""",
+                        (normalized_run_id, diagnostic_id),
+                    )
+            else:
+                reason = (
+                    "operator abandoned import_failed raw after Actor/schema switch"
+                    if abandon_import_failed
+                    else "operator confirmed provider run was not launched"
+                )
+                conn.execute(
+                    """UPDATE paid_photo_batches SET status='failed',error=?,updated_at=?
+                    WHERE id=? AND status=?""",
+                    (reason, now, batch_id, expected_status),
+                )
+                if diagnostic_id:
+                    conn.execute(
+                        """UPDATE actor_runs SET status='failed',error=?,finished_at=?
+                        WHERE id=?""",
+                        (reason, now, diagnostic_id),
+                    )
+            updated = conn.execute(
+                "SELECT * FROM paid_photo_batches WHERE id=?", (batch_id,)
+            ).fetchone()
+            return dict(updated)
+
     def prepare_paid_source_batch(
         self,
         *,
@@ -2434,8 +2754,9 @@ class Database:
         result_price: float,
         excluding_source_batch_id: int | None = None,
         excluding_access_probe_batch_id: int | None = None,
+        excluding_photo_batch_id: int | None = None,
     ) -> dict[str, float]:
-        source_unsettled = access_unsettled = contract_unsettled = 0.0
+        source_unsettled = access_unsettled = contract_unsettled = photo_unsettled = 0.0
         source_rows = conn.execute(
             """SELECT id,normalized_input_json,charged_usd
             FROM paid_source_batches
@@ -2481,6 +2802,21 @@ class Database:
                 float(row["max_charge_usd"] or 0) - float(row["charged_usd"] or 0),
             )
 
+        photo_rows = conn.execute(
+            """SELECT id,max_charge_usd,charged_usd
+            FROM paid_photo_batches
+            WHERE status IN ('launching','run_started','needs_reconcile')"""
+        ).fetchall()
+        for row in photo_rows:
+            if excluding_photo_batch_id is not None and int(row["id"]) == int(
+                excluding_photo_batch_id
+            ):
+                continue
+            photo_unsettled += max(
+                0.0,
+                float(row["max_charge_usd"] or 0) - float(row["charged_usd"] or 0),
+            )
+
         allocations = conn.execute(
             """SELECT a.id,a.authorized_usd,g.status AS grant_status,
             COALESCE(j.status,'') AS job_status,
@@ -2514,9 +2850,10 @@ class Database:
         return {
             "source_unsettled_usd": source_unsettled,
             "access_probe_unsettled_usd": access_unsettled,
+            "photo_unsettled_usd": photo_unsettled,
             "contract_test_unsettled_usd": contract_unsettled,
             "total_unsettled_usd": (
-                source_unsettled + access_unsettled + contract_unsettled
+                source_unsettled + access_unsettled + photo_unsettled + contract_unsettled
             ),
         }
 
@@ -2526,6 +2863,7 @@ class Database:
         posts_result_price_usd: float,
         excluding_source_batch_id: int | None = None,
         excluding_access_probe_batch_id: int | None = None,
+        excluding_photo_batch_id: int | None = None,
     ) -> dict[str, float]:
         """Read every durable paid ledger in one SQLite snapshot.
 
@@ -2542,6 +2880,7 @@ class Database:
                 result_price=result_price,
                 excluding_source_batch_id=excluding_source_batch_id,
                 excluding_access_probe_batch_id=excluding_access_probe_batch_id,
+                excluding_photo_batch_id=excluding_photo_batch_id,
             )
 
     def claim_paid_access_probe_launch(

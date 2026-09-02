@@ -53,6 +53,14 @@ browser_guard:
   breaker_hours: 24
   breaker_repeat_hours: 72
 
+photo_capture:
+  # 登入 Chromium 為主要來源；失敗或相片頁無法續抓時才啟動付費 Actor。
+  actor_fallback_enabled: true
+  # 單次 Actor 的硬上限；仍同時受全域每月 $5 上限與既有預算保留控制。
+  actor_max_charge_usd: 0.50
+  # 候選 Actor 目前的保守每筆價格，只用於本地原子預算保留。
+  actor_result_price_usd: 0.0029
+
 evidence:
   retention_days: 180
   cap_mib: 500
@@ -87,8 +95,13 @@ actors:
   # V2 候選 Actor 必須先通過 cursor / replay / knownPostIds 契約測試。
   posts_v2_primary: spbotdel/facebook-profile-posts-all-photos-scraper
   posts_v2_fallback: unseenuser/fb-posts
+  # 個人檔案照片候選 Actor；只能在持久化付費批次與預算上限檢查後作為備援。
+  # 此 Actor 一列資料中的 photos 陣列未提供完整分頁證據，不可單憑該列判定回溯完成。
+  profile_photos: vulnv/facebook-profile-scraper
   comments: apify/facebook-comments-scraper
   # Actor schema 日後改變時，可在下列 mapping 覆寫輸入欄位。
   profile_input: {}
   posts_input: {}
+  profile_photos_input:
+    urls: "{urls}"
   comments_input: {}

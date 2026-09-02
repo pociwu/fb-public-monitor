@@ -26,6 +26,62 @@ async def test_ingest_versions_and_deduplicates(tmp_path: Path):
     assert db.row("SELECT COUNT(*) count FROM versions")["count"] == 2
 
 
+def test_photo_reconcile_never_counts_absence_from_a_different_viewer(
+    tmp_path: Path,
+):
+    db = Database(tmp_path / "db.sqlite")
+    db.execute(
+        "INSERT INTO profiles(name,url,created_at,updated_at) "
+        "VALUES('p','https://facebook.com/100','x','x')"
+    )
+    entity_id = db.execute(
+        """INSERT INTO entities(
+        profile_id,kind,external_id,source_scope,source_viewer_scope_hash,
+        present,missing_successes,first_seen_at,last_seen_at
+        ) VALUES(1,'photo','viewer-a-only','account_visible','viewer-a',1,0,'x','x')"""
+    )
+    ingester = Ingester(db, tmp_path, MediaStore(db, tmp_path, 0, 30))
+
+    for _ in range(3):
+        ingester.reconcile(
+            1,
+            "photo",
+            set(),
+            None,
+            False,
+            source_scope="account_visible",
+            source_viewer_scope_hash="viewer-b",
+        )
+
+    untouched = db.row(
+        "SELECT present,missing_successes FROM entities WHERE id=?", (entity_id,)
+    )
+    assert untouched == {"present": 1, "missing_successes": 0}
+
+    ingester.reconcile(
+        1,
+        "photo",
+        set(),
+        None,
+        False,
+        source_scope="account_visible",
+        source_viewer_scope_hash="viewer-a",
+    )
+    ingester.reconcile(
+        1,
+        "photo",
+        set(),
+        None,
+        False,
+        source_scope="account_visible",
+        source_viewer_scope_hash="viewer-a",
+    )
+    removed = db.row(
+        "SELECT present,missing_successes FROM entities WHERE id=?", (entity_id,)
+    )
+    assert removed == {"present": 0, "missing_successes": 2}
+
+
 @pytest.mark.asyncio
 async def test_photo_is_stable_entity_and_silent_backfill_has_no_outbox(
     tmp_path: Path,
@@ -74,7 +130,7 @@ async def test_photo_is_stable_entity_and_silent_backfill_has_no_outbox(
     assert "說明：公開照片說明" in payload["text"]
     version = db.row("SELECT markdown_path FROM versions WHERE entity_id=?", (entity_id,))
     markdown = Path(version["markdown_path"]).read_text(encoding="utf-8")
-    assert "# 公開照片" in markdown
+    assert "# 帳號可見照片" in markdown
     assert "- 類型：照片" in markdown
     assert "2026-08-30 12:34" in markdown
 

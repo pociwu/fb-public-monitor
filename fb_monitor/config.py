@@ -30,9 +30,16 @@ class ActorConfig:
     posts: str = "unseenuser/fb-profile"
     posts_v2_primary: str = "spbotdel/facebook-profile-posts-all-photos-scraper"
     posts_v2_fallback: str = "unseenuser/fb-posts"
+    # This community Actor is only a candidate.  The service must keep it
+    # behind the durable paid-source/budget gate and must not treat one result row as
+    # proof that a profile's whole Photos surface has been exhausted.
+    profile_photos: str = "vulnv/facebook-profile-scraper"
     comments: str = "apify/facebook-comments-scraper"
     profile_input: dict[str, Any] = field(default_factory=dict)
     posts_input: dict[str, Any] = field(default_factory=dict)
+    profile_photos_input: dict[str, Any] = field(
+        default_factory=lambda: {"urls": "{urls}"}
+    )
     comments_input: dict[str, Any] = field(default_factory=dict)
 
 
@@ -150,6 +157,9 @@ class Settings:
     facebook_browser_enabled: bool = False
     facebook_browser_data_dir: Path = Path("/browser-data")
     facebook_browser_timeout_seconds: int = 60
+    photo_actor_fallback_enabled: bool = True
+    photo_actor_max_charge_usd: float = 0.50
+    photo_actor_result_price_usd: float = 2.90 / 1000
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     scheduler_enabled: bool = True
@@ -194,6 +204,7 @@ def load_settings(path: str | Path | None = None) -> Settings:
     browser_canary = raw.get("browser_canary", {})
     capture_v2 = raw.get("capture_v2", {})
     browser_guard = raw.get("browser_guard", {})
+    photo_capture = raw.get("photo_capture", {})
     evidence = raw.get("evidence", {})
     storage = raw.get("storage", {})
     budget = raw.get("budget", {})
@@ -223,9 +234,13 @@ def load_settings(path: str | Path | None = None) -> Settings:
         posts=actors_raw.get("posts", actor_defaults.posts),
         posts_v2_primary=actors_raw.get("posts_v2_primary", actor_defaults.posts_v2_primary),
         posts_v2_fallback=actors_raw.get("posts_v2_fallback", actor_defaults.posts_v2_fallback),
+        profile_photos=actors_raw.get("profile_photos", actor_defaults.profile_photos),
         comments=actors_raw.get("comments", actor_defaults.comments),
         profile_input=actors_raw.get("profile_input", {}),
         posts_input=actors_raw.get("posts_input", {}),
+        profile_photos_input=actors_raw.get(
+            "profile_photos_input", actor_defaults.profile_photos_input
+        ),
         comments_input=actors_raw.get("comments_input", {}),
     )
     settings = Settings(
@@ -272,6 +287,23 @@ def load_settings(path: str | Path | None = None) -> Settings:
         facebook_browser_enabled=os.getenv("FACEBOOK_BROWSER_ENABLED", "0") in {"1", "true", "True"},
         facebook_browser_data_dir=Path(os.getenv("FACEBOOK_BROWSER_DATA_DIR", "/browser-data")),
         facebook_browser_timeout_seconds=int(os.getenv("FACEBOOK_BROWSER_TIMEOUT_SECONDS", "60")),
+        photo_actor_fallback_enabled=os.getenv(
+            "PHOTO_ACTOR_FALLBACK_ENABLED",
+            str(photo_capture.get("actor_fallback_enabled", "1")),
+        ).lower() in {"1", "true", "yes", "on"},
+        photo_actor_max_charge_usd=max(
+            0.0,
+            float(
+                os.getenv(
+                    "PHOTO_ACTOR_MAX_CHARGE_USD",
+                    str(photo_capture.get("actor_max_charge_usd", 0.50)),
+                )
+            ),
+        ),
+        photo_actor_result_price_usd=max(
+            0.0001,
+            float(photo_capture.get("actor_result_price_usd", 2.90 / 1000)),
+        ),
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
         scheduler_enabled=os.getenv("FB_MONITOR_SCHEDULER", "1") not in {"0", "false", "False"},

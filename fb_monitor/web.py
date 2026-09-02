@@ -124,7 +124,7 @@ def _entity_content(item: dict[str, Any], kind: str) -> dict[str, str]:
     elif kind == "comment":
         title = author_name or "留言"
     elif kind == "photo":
-        title = str(_first_value(item, ("title", "name")) or "公開照片")
+        title = str(_first_value(item, ("title", "name")) or "照片")
     else:
         title = author_name or "貼文"
     return {"title": title, "text": text, "timestamp": timestamp}
@@ -195,7 +195,13 @@ def _canonical_photo_entity_ids(db: Database, profile_id: int) -> list[int]:
 def _profile_photo_capture_state(
     db: Database, profile_id: int, cfg: Settings
 ) -> dict[str, Any]:
-    """Return the latest dedicated public-photo capture generation."""
+    """Return the latest dedicated account-visible photo capture generation.
+
+    ``access_scope`` and ``source`` were added after the original capture
+    ledger.  Read them defensively from an eventual schema column first, then
+    from checkpoint/evidence JSON so an older database remains renderable
+    while it is being migrated.
+    """
     row = db.row(
         """SELECT * FROM profile_photo_captures
         WHERE profile_id=? ORDER BY generation DESC,id DESC LIMIT 1""",
@@ -225,12 +231,43 @@ def _profile_photo_capture_state(
         "running": "擷取中",
         "in_progress": "等待續抓",
         "complete": "已完成",
-        "source_limited": "公開來源受限",
+        "source_limited": "照片來源受限",
         "budget_paused": "額度暫停",
         "manual_paused": "人工暫停",
         "failed": "擷取失敗",
     }
     state = dict(row)
+    checkpoint = _json(row.get("checkpoint_json"))
+    evidence = _json(row.get("terminal_evidence_json"))
+    checkpoint = checkpoint if isinstance(checkpoint, dict) else {}
+    evidence = evidence if isinstance(evidence, dict) else {}
+
+    def optional_value(name: str) -> str:
+        for candidate in (row, checkpoint, evidence):
+            getter = getattr(candidate, "get", None)
+            value = (
+                getter(name)
+                if callable(getter)
+                else getattr(candidate, name, None)
+            )
+            if value not in (None, ""):
+                return str(value)
+        return ""
+
+    access_scope = optional_value("access_scope")
+    source = optional_value("source")
+    scope_labels = {
+        "account_visible": "登入帳號可見",
+        "actor_visible": "Apify Actor 可取得",
+        "mixed": "登入帳號＋Actor 補抓",
+        "public": "僅公開",
+        "anonymous_public": "匿名公開",
+    }
+    source_labels = {
+        "logged_in_browser": "登入 Chromium",
+        "apify_actor": "Apify 照片 Actor",
+        "logged_in_browser+apify_actor": "登入 Chromium＋Apify 補抓",
+    }
     state.update(
         {
             "status": status,
@@ -241,6 +278,12 @@ def _profile_photo_capture_state(
             "discovered_count": int(row.get("seen_count") or 0),
             "imported_count": int(row.get("new_count") or 0),
             "updated_display": display_time(row.get("updated_at"), cfg.timezone),
+            "access_scope": access_scope,
+            "access_scope_label": scope_labels.get(
+                access_scope, access_scope or "尚未記錄"
+            ),
+            "source": source,
+            "source_label": source_labels.get(source, source or "尚未記錄"),
         }
     )
     return state
@@ -1029,7 +1072,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(404)
         if not cfg.facebook_browser_enabled:
             return RedirectResponse(
-                url=f"/?error={quote('公開照片擷取需要先啟用 Facebook 直接瀏覽器')}",
+                url=f"/?error={quote('帳號可見照片擷取需要先啟用 Facebook 登入瀏覽器')}",
                 status_code=303,
             )
         created, coverage = request.app.state.service.queue_public_photo_capture(profile_id)
@@ -1037,13 +1080,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not created:
             status = str((coverage or {}).get("status") or "pending")
             message = (
-                f"{label} 的公開照片回溯已完成，不會重複排程"
+                f"{label} 的帳號可見照片回溯已完成，不會重複排程"
                 if status == "complete"
-                else f"{label} 的公開照片回溯已在佇列中（{status}），不會重複排程"
+                else f"{label} 的帳號可見照片回溯已在佇列中（{status}），不會重複排程"
             )
             return RedirectResponse(url=f"/?error={quote(message)}", status_code=303)
         return RedirectResponse(
-            url=f"/?notice={quote(f'已排入 {label} 公開照片完整回溯；可中斷續接且不重複下載')}",
+            url=f"/?notice={quote(f'已排入 {label} 帳號可見照片完整回溯；登入瀏覽器優先、Apify 照片 Actor 後備，可中斷續接且不重複下載')}",
             status_code=303,
         )
 
@@ -1324,9 +1367,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "migrate_profile_pics": "大頭照欄位更新", "dedupe_database": "資料庫去重",
             "contract_test_posts_v2": "Capture V2 Actor 契約測試",
             "capture_posts_v2": "Capture V2 貼文續抓",
-            "capture_profile_photos": "公開照片完整回溯",
+            "capture_profile_photos": "帳號可見照片完整回溯",
         }
-        status_labels = {"pending": "等待中", "running": "執行中", "done": "完成", "failed": "失敗", "source_limited": "公開來源受限", "cancelled": "已取消", "deferred_budget": "額度延後"}
+        status_labels = {"pending": "等待中", "running": "執行中", "done": "完成", "failed": "失敗", "source_limited": "照片來源受限", "cancelled": "已取消", "deferred_budget": "額度延後", "budget_paused": "預算暫停", "needs_reconcile": "待人工對帳"}
         for row in rows:
             row["type_label"] = type_labels.get(str(row["job_type"]), str(row["job_type"]))
             row["status_label"] = status_labels.get(str(row["status"]), str(row["status"]))

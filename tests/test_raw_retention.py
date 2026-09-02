@@ -101,6 +101,55 @@ def _probe_raw(db: Database, root: Path, *, status: str, suffix: str):
     return batch, raw
 
 
+def _photo_raw(
+    db: Database,
+    root: Path,
+    *,
+    capture_status: str,
+    batch_status: str,
+    suffix: str,
+):
+    db.sync_profiles([ProfileConfig(name="FB-100", url="https://facebook.com/100")])
+    capture_id = db.execute(
+        """INSERT INTO profile_photo_captures(
+          profile_id,generation,status,created_at,updated_at,completed_at
+        ) VALUES(1,1,?,'now','now',?)""",
+        (
+            capture_status,
+            (NOW - timedelta(days=91)).isoformat()
+            if capture_status == "complete"
+            else None,
+        ),
+    )
+    batch, _ = db.prepare_paid_photo_batch(
+        profile_id=1,
+        photo_capture_id=capture_id,
+        actor_id="test/photo-actor",
+        normalized_input={"urls": ["https://facebook.com/100"]},
+        max_charge_usd=0.1,
+        request_hash=(f"photo-{suffix}" * 64)[:64],
+    )
+    raw = root / "photo-capture" / "raw" / suffix[:2] / f"{suffix}.json.gz"
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    raw.write_bytes(b"photo-raw-evidence")
+    db.execute(
+        """UPDATE paid_photo_batches
+        SET status=?,raw_path=?,raw_saved_at=?,committed_at=?,updated_at=?
+        WHERE id=?""",
+        (
+            batch_status,
+            str(raw),
+            (NOW - timedelta(days=100)).isoformat(),
+            (NOW - timedelta(days=91)).isoformat()
+            if batch_status == "committed"
+            else None,
+            (NOW - timedelta(days=91)).isoformat(),
+            batch["id"],
+        ),
+    )
+    return batch, raw
+
+
 def test_cleanup_deletes_only_committed_raw_for_completed_old_epoch(tmp_path: Path):
     db = Database(tmp_path / "monitor.sqlite3")
     batch, raw = _scope(
@@ -200,3 +249,41 @@ def test_cleanup_retains_unresolved_access_probe_raw(tmp_path: Path):
         "SELECT raw_path FROM paid_access_probe_batches WHERE id=?", (batch["id"],)
     )
     assert saved["raw_path"] == str(raw)
+
+
+def test_cleanup_applies_retention_to_completed_photo_capture_raw(tmp_path: Path):
+    db = Database(tmp_path / "monitor.sqlite3")
+    batch, raw = _photo_raw(
+        db,
+        tmp_path,
+        capture_status="complete",
+        batch_status="committed",
+        suffix="g7",
+    )
+
+    result = cleanup_capture_raw(db, tmp_path, now=NOW)
+
+    assert result.deleted == 1
+    assert not raw.exists()
+    assert db.row(
+        "SELECT raw_path FROM paid_photo_batches WHERE id=?", (batch["id"],)
+    )["raw_path"] is None
+
+
+def test_cleanup_retains_unresolved_photo_capture_raw(tmp_path: Path):
+    db = Database(tmp_path / "monitor.sqlite3")
+    batch, raw = _photo_raw(
+        db,
+        tmp_path,
+        capture_status="source_limited",
+        batch_status="needs_reconcile",
+        suffix="h8",
+    )
+
+    result = cleanup_capture_raw(db, tmp_path, now=NOW)
+
+    assert result.deleted == 0
+    assert raw.exists()
+    assert db.row(
+        "SELECT raw_path FROM paid_photo_batches WHERE id=?", (batch["id"],)
+    )["raw_path"] == str(raw)

@@ -33,6 +33,11 @@ def test_browser_canary_defaults_are_conservative(tmp_path: Path):
     assert settings.browser_album_operations == 20
     assert settings.evidence_cap_bytes == 500 * 1024 * 1024
     assert settings.deploy_maintenance_flag == settings.data_dir / "deploy-maintenance"
+    assert settings.actors.profile_photos == "vulnv/facebook-profile-scraper"
+    assert settings.actors.profile_photos_input == {"urls": "{urls}"}
+    assert settings.photo_actor_fallback_enabled is True
+    assert settings.photo_actor_max_charge_usd == pytest.approx(0.50)
+    assert settings.photo_actor_result_price_usd == pytest.approx(0.0029)
 
 
 def test_deploy_maintenance_flag_can_live_on_a_dedicated_container_mount(
@@ -72,6 +77,9 @@ evidence:
 actors:
   posts_v2_primary: example/primary
   posts_v2_fallback: example/fallback
+  profile_photos: example/photos
+  profile_photos_input:
+    startUrls: "{urls}"
 """,
         encoding="utf-8",
     )
@@ -91,6 +99,8 @@ actors:
     assert settings.evidence_cap_bytes == 321 * 1024 * 1024
     assert settings.actors.posts_v2_primary == "example/primary"
     assert settings.actors.posts_v2_fallback == "example/fallback"
+    assert settings.actors.profile_photos == "example/photos"
+    assert settings.actors.profile_photos_input == {"startUrls": "{urls}"}
 
 
 def test_posts_cursor_contract_round_has_hard_twenty_cent_cap(tmp_path: Path):

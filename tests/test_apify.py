@@ -2,7 +2,9 @@ from datetime import UTC, datetime
 
 from decimal import Decimal
 
-from fb_monitor.apify import ApifyGateway, StartedActor
+import pytest
+
+from fb_monitor.apify import ActorRunTerminalError, ApifyGateway, StartedActor
 
 
 class FakeUser:
@@ -109,3 +111,27 @@ def test_capture_gateway_persists_identifiers_before_waiting_and_keeps_charge_ca
     assert result.items == [{"postId": "p1"}]
     assert result.summary == {"health": "ok"}
     assert result.charged_usd == 0.0123
+
+
+def test_finish_exposes_known_terminal_status_and_charge():
+    gateway = ApifyGateway("")
+
+    class FailedRun:
+        def wait_for_finish(self, wait_secs):
+            return {
+                "status": "FAILED",
+                "statusMessage": "container exited",
+                "usageTotalUsd": 0.027,
+            }
+
+    class FailedClient:
+        def run(self, run_id):
+            return FailedRun()
+
+    gateway.client = FailedClient()
+    with pytest.raises(ActorRunTerminalError) as raised:
+        gateway._finish_sync(StartedActor("failed-run", "data", "store"), 10)
+
+    assert raised.value.run_id == "failed-run"
+    assert raised.value.status == "FAILED"
+    assert raised.value.charged_usd == pytest.approx(0.027)

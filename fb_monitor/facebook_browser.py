@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import re
@@ -138,6 +139,40 @@ def _facebook_profile_identity(value: object) -> str:
     }:
         return ""
     return parts[0]
+
+
+def _facebook_photo_surface(value: object) -> str:
+    """Return the explicit Facebook photo collection represented by a URL."""
+    url = str(value or "")
+    if not url or not _is_facebook_host(url):
+        return ""
+    parsed = urlsplit(url)
+    parts = [part.casefold() for part in parsed.path.split("/") if part]
+    if parts and parts[-1] in {"photos_by", "photos_of"}:
+        return parts[-1]
+    query = {key.casefold(): values for key, values in parse_qs(parsed.query).items()}
+    section = str((query.get("sk") or [""])[0]).casefold()
+    if section in {"photos", "photos_by"}:
+        return "photos_by"
+    if section in {"photos_of", "tagged_photos"}:
+        return "photos_of"
+    return ""
+
+
+def _facebook_photo_surface_matches(
+    final_url: object,
+    requested_url: object,
+    profile_identity: str,
+) -> bool:
+    """Reject silent redirects from a requested photo tab to profile chrome."""
+    expected_surface = _facebook_photo_surface(requested_url)
+    if not expected_surface or _facebook_photo_surface(final_url) != expected_surface:
+        return False
+    final_identity = _facebook_profile_identity(final_url)
+    return bool(
+        final_identity
+        and final_identity.casefold() == str(profile_identity or "").casefold()
+    )
 
 
 def _facebook_permalink_owner(value: object) -> str:
@@ -1085,6 +1120,509 @@ class FacebookBrowserGateway:
                 await context.close()
         return result
 
+    async def account_profile_photos(
+        self,
+        profile_url: str,
+        progress: dict[str, Any] | None = None,
+        diagnostic_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Collect one resumable batch visible to the signed-in account.
+
+        This deliberately remains a separate entry point from
+        :meth:`public_profile_photos`.  It uses bounded ``photos_by`` and
+        ``photos_of`` inventories with the same permalink/media pipeline, but
+        requires the gateway's persistent browser directory to contain a valid
+        ``c_user`` session.
+        Keeping the two methods separate prevents authenticated results from
+        being silently labelled as anonymous/public inventory.
+        """
+        if not self.enabled:
+            raise FacebookBrowserError("Facebook 直接瀏覽器備援未啟用")
+        if not self.require_login:
+            raise FacebookBrowserError(
+                "帳號可見相片回溯必須使用 require_login=True 的登入瀏覽器"
+            )
+        profile_identity = _facebook_profile_identity(profile_url)
+        if not profile_identity:
+            raise FacebookBrowserError("Facebook 個人檔案網址無法辨識")
+        encoded_identity = quote(profile_identity, safe="._-")
+        surface_urls = {
+            "photos_by": f"https://www.facebook.com/{encoded_identity}/photos_by",
+            "photos_of": f"https://www.facebook.com/{encoded_identity}/photos_of",
+        }
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        async with async_playwright() as playwright:
+            try:
+                context = await playwright.chromium.launch_persistent_context(
+                    str(self.data_dir),
+                    headless=True,
+                    locale="zh-TW",
+                    timezone_id="Asia/Taipei",
+                    viewport={"width": 1365, "height": 900},
+                    args=["--disable-dev-shm-usage"],
+                )
+            except Exception as exc:
+                raise FacebookBrowserError(
+                    f"無法啟動 Chromium 帳號可見相片續抓：{exc}"
+                ) from exc
+            try:
+                try:
+                    cookies = await context.cookies("https://www.facebook.com")
+                    self._require_login(cookies)
+                except FacebookBrowserLoginRequired as exc:
+                    raise FacebookBrowserLoginRequired(
+                        "帳號可見相片回溯尚未建立 Facebook 登入狀態；"
+                        "請先進行互動式登入"
+                    ) from exc
+                c_user = next(
+                    str(cookie.get("value") or "")
+                    for cookie in cookies
+                    if cookie.get("name") == "c_user" and cookie.get("value")
+                )
+                viewer_scope_hash = hashlib.sha256(c_user.encode("utf-8")).hexdigest()
+                page = context.pages[0] if context.pages else await context.new_page()
+                try:
+                    checkpoint = dict(progress or {})
+                    previous_scope_hash = str(
+                        checkpoint.get("viewer_scope_hash") or ""
+                    )
+                    has_existing_inventory = bool(
+                        checkpoint.get("surfaces")
+                        or checkpoint.get("discovered_urls")
+                        or checkpoint.get("collected_items")
+                        or checkpoint.get("processed_urls")
+                    )
+                    viewer_scope_changed = bool(
+                        has_existing_inventory
+                        and (
+                            not previous_scope_hash
+                            or previous_scope_hash != viewer_scope_hash
+                        )
+                    )
+                    if viewer_scope_changed:
+                        # Inventory is permission-scope specific. Reusing it
+                        # after the signed-in Facebook account changes could
+                        # reconcile one account's visible set against another.
+                        checkpoint = {}
+                    raw_surfaces = checkpoint.get("surfaces")
+                    surface_progress: dict[str, dict[str, Any]] = {}
+                    if isinstance(raw_surfaces, dict):
+                        for surface_name in surface_urls:
+                            raw_progress = raw_surfaces.get(surface_name)
+                            surface_progress[surface_name] = (
+                                dict(raw_progress)
+                                if isinstance(raw_progress, dict)
+                                else {}
+                            )
+                    else:
+                        # Migrate the original one-surface account checkpoint:
+                        # it represented ``photos_by`` and must remain usable
+                        # without rescanning already completed permalinks.
+                        surface_progress["photos_by"] = dict(checkpoint)
+                        surface_progress["photos_of"] = {}
+
+                    # Media retries are scheduled against the merged account
+                    # checkpoint, while the durable permalink inventories live
+                    # inside each surface checkpoint. Route every requested
+                    # media ID to exactly one surface that discovered it. This
+                    # both makes a completed surface reopen the permalink and
+                    # avoids fetching the same photo twice when it appears in
+                    # both ``photos_by`` and ``photos_of``.
+                    requested_refresh_ids: list[str] = []
+                    requested_refresh_keys: set[str] = set()
+
+                    def remember_refresh_id(raw_value: object) -> None:
+                        value = str(raw_value or "").strip()
+                        media_id = _facebook_photo_media_identity(value) or value
+                        if (
+                            not media_id
+                            or len(media_id) > 512
+                            or not re.fullmatch(r"[A-Za-z0-9._:-]+", media_id)
+                            or media_id in requested_refresh_keys
+                        ):
+                            return
+                        requested_refresh_keys.add(media_id)
+                        requested_refresh_ids.append(media_id)
+
+                    for raw_media_id in checkpoint.get(
+                        "refresh_media_external_ids"
+                    ) or []:
+                        remember_refresh_id(raw_media_id)
+                    for surface_name in surface_urls:
+                        for raw_media_id in surface_progress[surface_name].pop(
+                            "refresh_media_external_ids", []
+                        ) or []:
+                            remember_refresh_id(raw_media_id)
+
+                    discovered_by_surface: dict[str, set[str]] = {}
+                    for surface_name in surface_urls:
+                        discovered_by_surface[surface_name] = {
+                            media_id
+                            for raw_url in surface_progress[surface_name].get(
+                                "discovered_urls"
+                            ) or []
+                            if (
+                                media_id := _facebook_photo_media_identity(raw_url)
+                            )
+                        }
+                    assigned_refresh_ids: dict[str, list[str]] = {
+                        surface_name: [] for surface_name in surface_urls
+                    }
+                    unmatched_refresh_ids: list[str] = []
+                    for media_id in requested_refresh_ids:
+                        target_surface = next(
+                            (
+                                surface_name
+                                for surface_name in surface_urls
+                                if media_id in discovered_by_surface[surface_name]
+                            ),
+                            "",
+                        )
+                        if target_surface:
+                            assigned_refresh_ids[target_surface].append(media_id)
+                        else:
+                            unmatched_refresh_ids.append(media_id)
+                    for surface_name, media_ids in assigned_refresh_ids.items():
+                        if media_ids:
+                            surface_progress[surface_name][
+                                "refresh_media_external_ids"
+                            ] = media_ids
+
+                    surface_results: dict[str, dict[str, Any]] = {}
+                    surface_failures: dict[str, dict[str, str]] = {}
+                    successful_surfaces: set[str] = set()
+                    remaining_operations = max(
+                        0, int(self.album_batch_max_operations)
+                    )
+                    remaining_new_photos = max(
+                        0, int(self.album_batch_max_new_photos)
+                    )
+                    # A requested CDN refresh is more urgent than ordinary
+                    # inventory work on the other surface. Stable sorting keeps
+                    # the default photos_by -> photos_of order otherwise.
+                    surface_order = sorted(
+                        surface_urls,
+                        key=lambda name: bool(assigned_refresh_ids[name]),
+                        reverse=True,
+                    )
+                    fatal_surface_error: FacebookBrowserError | None = None
+                    for surface_index, surface_name in enumerate(surface_order):
+                        surface_url = surface_urls[surface_name]
+                        try:
+                            surface_results[surface_name] = (
+                                await self._collect_public_profile_photo_inventory(
+                                    page,
+                                    surface_url,
+                                    profile_identity,
+                                    surface_progress[surface_name],
+                                    diagnostic_key=diagnostic_key,
+                                    enforce_profile_owner=(surface_name == "photos_by"),
+                                    batch_operation_limit=remaining_operations,
+                                    batch_new_photo_limit=remaining_new_photos,
+                                )
+                            )
+                            successful_surfaces.add(surface_name)
+                        except FacebookBrowserError as exc:
+                            if isinstance(exc, FacebookBrowserChallengeRequired):
+                                error_type = "challenge_required"
+                            elif isinstance(exc, FacebookBrowserLoginRequired):
+                                error_type = "login_required"
+                            else:
+                                error_type = "collector_error"
+                            reason = f"{error_type}:{exc}"
+                            failed_checkpoint = dict(surface_progress[surface_name])
+                            failed_checkpoint.update({
+                                "completed": False,
+                                "stalled_reason": reason,
+                                "resume_url": "",
+                                "surface_error_type": error_type,
+                                "surface_error": str(exc),
+                                "batch_operations": 0,
+                                "batch_new_photos": 0,
+                                "updated_at": time.time(),
+                            })
+                            surface_results[surface_name] = self._public_photo_result(
+                                failed_checkpoint, []
+                            )
+                            surface_failures[surface_name] = {
+                                "type": error_type,
+                                "reason": str(exc),
+                            }
+                            # A login wall or checkpoint affects the shared
+                            # persistent browser session, so further surfaces
+                            # must not navigate. Preserve their durable state
+                            # and mark them blocked by the same authenticated
+                            # session failure instead.
+                            if isinstance(
+                                exc,
+                                (FacebookBrowserChallengeRequired,
+                                 FacebookBrowserLoginRequired),
+                            ):
+                                fatal_surface_error = exc
+                                for remaining_name in surface_order[surface_index + 1:]:
+                                    remaining_checkpoint = dict(
+                                        surface_progress[remaining_name]
+                                    )
+                                    remaining_checkpoint.update({
+                                        "completed": False,
+                                        "stalled_reason": reason,
+                                        "resume_url": "",
+                                        "surface_error_type": error_type,
+                                        "surface_error": str(exc),
+                                        "batch_operations": 0,
+                                        "batch_new_photos": 0,
+                                        "updated_at": time.time(),
+                                    })
+                                    surface_results[remaining_name] = (
+                                        self._public_photo_result(
+                                            remaining_checkpoint, []
+                                        )
+                                    )
+                                    surface_failures[remaining_name] = {
+                                        "type": error_type,
+                                        "reason": str(exc),
+                                    }
+                                break
+                            continue
+                        used_operations = max(
+                            0,
+                            int(
+                                (surface_results[surface_name].get("progress") or {}).get(
+                                    "batch_operations"
+                                )
+                                or 0
+                            ),
+                        )
+                        used_new_photos = len(
+                            surface_results[surface_name].get("batch_items") or []
+                        )
+                        remaining_operations = max(
+                            0, remaining_operations - used_operations
+                        )
+                        remaining_new_photos = max(
+                            0, remaining_new_photos - used_new_photos
+                        )
+                    if not successful_surfaces and surface_failures:
+                        # With no usable surface there is no partial batch to
+                        # protect. Re-raise login/challenge verbatim so the
+                        # caller can trip its browser guard; otherwise expose
+                        # one stable browser error to the normal fallback path.
+                        if fatal_surface_error is not None:
+                            raise fatal_surface_error
+                        first_failure = next(iter(surface_failures.values()))
+                        raise FacebookBrowserError(first_failure["reason"])
+                except FacebookBrowserChallengeRequired:
+                    raise
+                except FacebookBrowserLoginRequired as exc:
+                    raise FacebookBrowserLoginRequired(
+                        "帳號可見相片回溯的 Facebook 登入狀態已失效；"
+                        "請重新進行互動式登入"
+                    ) from exc
+                except FacebookBrowserError:
+                    raise
+                except Exception as exc:
+                    await self._save_failure(page, diagnostic_key)
+                    raise FacebookBrowserError(
+                        f"Facebook 帳號可見相片解析失敗：{exc.__class__.__name__}"
+                    ) from exc
+            finally:
+                await context.close()
+
+        collector = "authenticated_facebook_photo_viewer"
+        access_scope = "account_visible"
+        surface_checkpoints = {
+            name: dict(result.get("progress") or {})
+            for name, result in surface_results.items()
+        }
+        for surface_name, surface_checkpoint in surface_checkpoints.items():
+            surface_checkpoint.update({
+                "account_surface": surface_name,
+                "access_scope": access_scope,
+                "collector": collector,
+                "viewer_scope_hash": viewer_scope_hash,
+            })
+
+        def unique_values(field: str) -> list[str]:
+            values: list[str] = []
+            keys: set[str] = set()
+            for surface_name in surface_urls:
+                for raw_value in surface_checkpoints[surface_name].get(field) or []:
+                    value = normalize_url(str(raw_value or ""))
+                    media_id = _facebook_photo_media_identity(value)
+                    key = f"media:{media_id}" if media_id else value
+                    if value and key and key not in keys:
+                        keys.add(key)
+                        values.append(value)
+            return values
+
+        def unique_items(field: str) -> list[dict[str, str]]:
+            values: list[dict[str, str]] = []
+            keys: set[str] = set()
+            for surface_name in surface_urls:
+                raw_items = (
+                    surface_results[surface_name].get(field)
+                    if field == "batch_items"
+                    else surface_checkpoints[surface_name].get(field)
+                )
+                for raw_item in raw_items or []:
+                    if not isinstance(raw_item, dict):
+                        continue
+                    item = {
+                        "id": str(raw_item.get("id") or "").strip(),
+                        "url": normalize_url(str(raw_item.get("url") or "")),
+                        "image": str(raw_item.get("image") or "").strip(),
+                    }
+                    key = (
+                        f"media:{item['id']}"
+                        if item["id"]
+                        else normalize_url(item["image"] or item["url"])
+                    )
+                    if key and item["image"] and key not in keys:
+                        keys.add(key)
+                        values.append(item)
+            return values
+
+        collected_items = unique_items("collected_items")
+        batch_items = unique_items("batch_items")
+        # The surface collector enforces the shared allowance passed above;
+        # keep this final guard at the merge seam so future implementations
+        # cannot accidentally emit two full batches again.
+        batch_items = batch_items[: max(0, int(self.album_batch_max_new_photos))]
+        discovered_urls = unique_values("discovered_urls")
+        processed_urls = unique_values("processed_urls")
+        remaining_refresh_ids: list[str] = []
+        remaining_refresh_keys: set[str] = set()
+        for raw_media_id in unmatched_refresh_ids:
+            if raw_media_id not in remaining_refresh_keys:
+                remaining_refresh_keys.add(raw_media_id)
+                remaining_refresh_ids.append(raw_media_id)
+        for surface_name in surface_urls:
+            for raw_media_id in surface_checkpoints[surface_name].get(
+                "refresh_media_external_ids"
+            ) or []:
+                media_id = str(raw_media_id or "").strip()
+                if media_id and media_id not in remaining_refresh_keys:
+                    remaining_refresh_keys.add(media_id)
+                    remaining_refresh_ids.append(media_id)
+        surface_evidence: dict[str, dict[str, Any]] = {}
+        all_terminal = True
+        stalled: list[str] = []
+        resume_url = ""
+        for surface_name in surface_urls:
+            surface_result = surface_results[surface_name]
+            surface_checkpoint = surface_checkpoints[surface_name]
+            terminal = bool(
+                surface_result.get("completed")
+                and surface_checkpoint.get("grid_complete")
+                and (
+                    surface_checkpoint.get("discovered_urls")
+                    or surface_checkpoint.get("grid_empty_confirmed")
+                )
+                and surface_result.get("terminal_reason")
+            )
+            all_terminal = all_terminal and terminal
+            reason = str(
+                surface_result.get("stalled_reason")
+                or surface_checkpoint.get("stalled_reason")
+                or ""
+            )
+            if reason:
+                stalled.append(f"{surface_name}:{reason}")
+            if not resume_url and not terminal:
+                resume_url = str(surface_checkpoint.get("resume_url") or "")
+            surface_evidence[surface_name] = {
+                "photos_url": surface_urls[surface_name],
+                "grid_complete": bool(surface_checkpoint.get("grid_complete")),
+                "completed": bool(surface_result.get("completed")),
+                "terminal_verified": terminal,
+                "terminal_reason": str(surface_result.get("terminal_reason") or ""),
+                "stalled_reason": reason,
+                "discovered_count": int(surface_result.get("discovered_count") or 0),
+                "processed_count": int(surface_result.get("processed_count") or 0),
+            }
+
+        checkpoint.update({
+            "schema_version": 5,
+            "surface": "account_visible_photo_pages",
+            "access_scope": access_scope,
+            "collector": collector,
+            "viewer_scope_hash": viewer_scope_hash,
+            "viewer_scope_changed": viewer_scope_changed,
+            "previous_viewer_scope_hash": (
+                previous_scope_hash if viewer_scope_changed else ""
+            ),
+            "profile_url": normalize_url(profile_url),
+            "surfaces": surface_checkpoints,
+            "collected_items": collected_items,
+            "discovered_urls": discovered_urls,
+            "processed_urls": processed_urls,
+            "grid_complete": all(
+                bool(value.get("grid_complete"))
+                for value in surface_checkpoints.values()
+            ),
+            "grid_empty_confirmed": all(
+                bool(value.get("grid_empty_confirmed"))
+                for value in surface_checkpoints.values()
+            ),
+            "completed": all_terminal,
+            "terminal_reason": (
+                "account_photo_surfaces_processed" if all_terminal else ""
+            ),
+            "stalled_reason": ";".join(stalled),
+            "resume_url": "" if all_terminal or stalled else resume_url,
+            "declared_total": len(discovered_urls),
+            "discovered_count": len(discovered_urls),
+            "processed_count": len(processed_urls),
+            "pending_count": max(0, len(discovered_urls) - len(processed_urls)),
+            "batch_new_photos": len(batch_items),
+            "batch_operations": sum(
+                max(0, int(value.get("batch_operations") or 0))
+                for value in surface_checkpoints.values()
+            ),
+            "updated_at": time.time(),
+        })
+        if remaining_refresh_ids:
+            checkpoint["refresh_media_external_ids"] = remaining_refresh_ids
+        else:
+            checkpoint.pop("refresh_media_external_ids", None)
+        evidence = {
+            "access_scope": access_scope,
+            "collector": collector,
+            "authenticated_cookie_verified": True,
+            "viewer_scope_hash": viewer_scope_hash,
+            "viewer_scope_changed": viewer_scope_changed,
+            "previous_viewer_scope_hash": (
+                previous_scope_hash if viewer_scope_changed else ""
+            ),
+            "surfaces": surface_evidence,
+            "all_surfaces_terminal": all_terminal,
+            "surface_failures": surface_failures,
+            "login_required": any(
+                failure.get("type") == "login_required"
+                for failure in surface_failures.values()
+            ),
+            "challenge_required": any(
+                failure.get("type") == "challenge_required"
+                for failure in surface_failures.values()
+            ),
+        }
+        return {
+            "items": collected_items,
+            "batch_items": batch_items,
+            "progress": checkpoint,
+            "access_scope": access_scope,
+            "collector": collector,
+            "evidence": evidence,
+            "discovered_count": len(discovered_urls),
+            "processed_count": len(processed_urls),
+            "pending_count": max(0, len(discovered_urls) - len(processed_urls)),
+            "grid_complete": bool(checkpoint["grid_complete"]),
+            "resumable": bool(not all_terminal and not stalled and resume_url),
+            "completed": all_terminal,
+            "terminal_reason": str(checkpoint["terminal_reason"]),
+            "stalled_reason": str(checkpoint["stalled_reason"]),
+        }
+
     async def _collect_public_profile_photo_inventory(
         self,
         page: Page,
@@ -1093,12 +1631,15 @@ class FacebookBrowserGateway:
         progress: dict[str, Any] | None = None,
         *,
         diagnostic_key: str | None = None,
+        enforce_profile_owner: bool = True,
+        batch_operation_limit: int | None = None,
+        batch_new_photo_limit: int | None = None,
     ) -> dict[str, Any]:
         """Discover the whole target grid, then fetch a bounded media batch."""
         original_state = progress if isinstance(progress, dict) else {}
         state = dict(original_state)
         previous_schema = int(state.get("schema_version") or 0)
-        profile_root_url = photos_url.removesuffix("/photos_by")
+        profile_root_url = photos_url.removesuffix("/photos_by").removesuffix("/photos_of")
 
         profile_owner_aliases: list[str] = []
         allowed_owner_keys: set[str] = set()
@@ -1148,7 +1689,11 @@ class FacebookBrowserGateway:
             if not _facebook_photo_media_identity(normalized):
                 return
             owner = _facebook_permalink_owner(normalized)
-            if owner and owner.casefold() not in allowed_owner_keys:
+            if (
+                enforce_profile_owner
+                and owner
+                and owner.casefold() not in allowed_owner_keys
+            ):
                 return
             key = photo_key(normalized)
             if key and key not in discovered_keys:
@@ -1236,12 +1781,18 @@ class FacebookBrowserGateway:
             )
             if response and response.status == 429:
                 raise FacebookBrowserChallengeRequired(
-                    "Facebook 公開相片頁回應 HTTP 429"
+                    "Facebook 相片頁回應 HTTP 429"
                 )
             if response and response.status >= 400:
-                raise FacebookBrowserError(f"Facebook 公開相片頁 HTTP {response.status}")
+                raise FacebookBrowserError(f"Facebook 相片頁 HTTP {response.status}")
             await page.wait_for_timeout(round(random.uniform(2200, 3800)))
             await self._raise_for_access_wall(page, diagnostic_key)
+            if not _facebook_photo_surface_matches(
+                getattr(page, "url", ""), photos_url, profile_identity
+            ):
+                raise FacebookBrowserError(
+                    "facebook_photo_surface_redirected_or_unverified"
+                )
 
             previous_depth = max(0, int(state.get("grid_scroll_depth") or 0))
             stable_rounds = 0
@@ -1501,10 +2052,17 @@ class FacebookBrowserGateway:
             for url in refresh_pending_urls + ordinary_pending_urls
             if 0 < failure_attempts(url) < self.profile_photo_permalink_max_attempts
         ]
-        operation_limit = max(
-            1,
-            min(self.album_batch_max_operations, self.album_batch_max_new_photos),
-        )
+        operation_cap = max(1, int(self.album_batch_max_operations))
+        new_photo_cap = max(1, int(self.album_batch_max_new_photos))
+        if batch_operation_limit is not None:
+            operation_cap = max(
+                0, min(operation_cap, int(batch_operation_limit))
+            )
+        if batch_new_photo_limit is not None:
+            new_photo_cap = max(
+                0, min(new_photo_cap, int(batch_new_photo_limit))
+            )
+        operation_limit = min(operation_cap, new_photo_cap)
         for viewer_url in (unattempted_urls + retry_urls)[:operation_limit]:
             batch_operations += 1
             expected_media_id = _facebook_photo_media_identity(viewer_url)

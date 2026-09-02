@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -6,6 +7,7 @@ import pytest
 
 from fb_monitor.facebook_browser import (
     FacebookBrowserChallengeRequired,
+    FacebookBrowserError,
     FacebookBrowserGateway,
     FacebookBrowserLoginRequired,
     normalize_browser_canary_posts,
@@ -1261,6 +1263,46 @@ async def test_public_photo_grid_limit_is_resumable_without_stalled_reason(
 
 
 @pytest.mark.asyncio
+async def test_photo_surface_redirect_to_profile_root_is_not_terminal_evidence(
+    tmp_path: Path, monkeypatch
+):
+    class Response:
+        status = 200
+
+    class FakePage:
+        url = ""
+
+        async def goto(self, url: str, **kwargs):
+            self.url = "https://www.facebook.com/100"
+            return Response()
+
+        async def wait_for_timeout(self, milliseconds: int):
+            return None
+
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=True)
+
+    async def no_access_wall(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(
+        gateway,
+        "_raise_for_access_wall",
+        no_access_wall,
+    )
+
+    with pytest.raises(
+        FacebookBrowserError,
+        match="facebook_photo_surface_redirected_or_unverified",
+    ):
+        await gateway._collect_public_profile_photo_inventory(
+            FakePage(),
+            "https://www.facebook.com/100/photos_of",
+            "100",
+            enforce_profile_owner=False,
+        )
+
+
+@pytest.mark.asyncio
 async def test_public_photo_grid_replays_checkpoint_then_adds_only_bounded_new_scrolls(
     tmp_path: Path, monkeypatch
 ):
@@ -1655,6 +1697,628 @@ async def test_public_profile_photos_rejects_authenticated_cookie_before_navigat
 
     assert context.cookie_reads == 1
     assert context.page.visited == []
+    assert context.closed is True
+
+
+@pytest.mark.asyncio
+async def test_account_profile_photos_requires_authenticated_gateway(tmp_path: Path):
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=False)
+
+    with pytest.raises(FacebookBrowserError, match="require_login=True"):
+        await gateway.account_profile_photos("https://www.facebook.com/100")
+
+
+@pytest.mark.asyncio
+async def test_account_profile_photos_requires_login_cookie_before_navigation(
+    tmp_path: Path, monkeypatch
+):
+    browser = EmptyCookieBrowser()
+    context = browser.Context()
+    monkeypatch.setattr(
+        "fb_monitor.facebook_browser.async_playwright", lambda: browser.Manager(context)
+    )
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=True)
+
+    async def unexpected(*args, **kwargs):
+        raise AssertionError("missing login must stop before collector navigation")
+
+    monkeypatch.setattr(gateway, "_collect_public_profile_photo_inventory", unexpected)
+
+    with pytest.raises(FacebookBrowserLoginRequired, match="互動式登入"):
+        await gateway.account_profile_photos("https://www.facebook.com/100")
+
+    assert context.cookie_reads == 1
+    assert context.page.visited == []
+    assert context.closed is True
+
+
+@pytest.mark.asyncio
+async def test_account_profile_photos_uses_logged_in_photos_surface_and_marks_scope(
+    tmp_path: Path, monkeypatch
+):
+    browser = EmptyCookieBrowser()
+
+    class LoggedInContext(browser.Context):
+        async def cookies(self, url: str):
+            self.cookie_reads += 1
+            return [{"name": "c_user", "value": "operator-account"}]
+
+    context = LoggedInContext()
+    monkeypatch.setattr(
+        "fb_monitor.facebook_browser.async_playwright", lambda: browser.Manager(context)
+    )
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=True)
+    observed = []
+
+    async def collect(page, source_url, profile_identity, progress, **kwargs):
+        observed.append({
+            "source_url": source_url,
+            "profile_identity": profile_identity,
+            "progress": progress,
+            **kwargs,
+        })
+        checkpoint = {
+            "collected_items": [],
+            "discovered_urls": [],
+            "processed_urls": [],
+            "grid_complete": False,
+            "completed": False,
+            "terminal_reason": "",
+            "stalled_reason": "",
+            "resume_url": source_url,
+        }
+        return gateway._public_photo_result(checkpoint, [])
+
+    monkeypatch.setattr(gateway, "_collect_public_profile_photo_inventory", collect)
+    initial_progress = {"resume_url": "https://www.facebook.com/photo.php?fbid=122"}
+
+    result = await gateway.account_profile_photos(
+        "https://www.facebook.com/profile.php?id=100123",
+        initial_progress,
+        "profile-7-account-photos",
+    )
+
+    assert [entry["source_url"] for entry in observed] == [
+        "https://www.facebook.com/100123/photos_by",
+        "https://www.facebook.com/100123/photos_of",
+    ]
+    assert all(entry["profile_identity"] == "100123" for entry in observed)
+    assert observed[0]["progress"] == initial_progress
+    assert observed[1]["progress"] == {}
+    assert all(
+        entry["diagnostic_key"] == "profile-7-account-photos"
+        for entry in observed
+    )
+    assert observed[0]["enforce_profile_owner"] is True
+    assert observed[1]["enforce_profile_owner"] is False
+    assert result["progress"]["access_scope"] == "account_visible"
+    assert result["progress"]["collector"] == "authenticated_facebook_photo_viewer"
+    expected_scope_hash = hashlib.sha256(b"operator-account").hexdigest()
+    assert result["progress"]["viewer_scope_hash"] == expected_scope_hash
+    assert result["progress"]["viewer_scope_changed"] is False
+    assert all(
+        surface["viewer_scope_hash"] == expected_scope_hash
+        for surface in result["progress"]["surfaces"].values()
+    )
+    assert result["access_scope"] == "account_visible"
+    assert result["collector"] == "authenticated_facebook_photo_viewer"
+    assert result["evidence"]["access_scope"] == "account_visible"
+    assert result["evidence"]["collector"] == "authenticated_facebook_photo_viewer"
+    assert result["evidence"]["authenticated_cookie_verified"] is True
+    assert result["evidence"]["viewer_scope_hash"] == expected_scope_hash
+    assert result["evidence"]["all_surfaces_terminal"] is False
+    assert set(result["evidence"]["surfaces"]) == {"photos_by", "photos_of"}
+    assert context.cookie_reads == 1
+    assert context.closed is True
+
+
+@pytest.mark.asyncio
+async def test_account_profile_photos_merges_and_deduplicates_both_terminal_surfaces(
+    tmp_path: Path, monkeypatch
+):
+    browser = EmptyCookieBrowser()
+
+    class LoggedInContext(browser.Context):
+        async def cookies(self, url: str):
+            return [{"name": "c_user", "value": "100999"}]
+
+    context = LoggedInContext()
+    monkeypatch.setattr(
+        "fb_monitor.facebook_browser.async_playwright", lambda: browser.Manager(context)
+    )
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=True)
+
+    async def collect(page, source_url, profile_identity, progress, **kwargs):
+        tagged = source_url.endswith("/photos_of")
+        unique_id = "2" if tagged else "1"
+        items = [
+            {
+                "id": "shared",
+                "url": "https://www.facebook.com/photo.php?fbid=shared",
+                "image": "https://scontent.example.fbcdn.net/shared.jpg",
+            },
+            {
+                "id": unique_id,
+                "url": f"https://www.facebook.com/photo.php?fbid={unique_id}",
+                "image": f"https://scontent.example.fbcdn.net/{unique_id}.jpg",
+            },
+        ]
+        checkpoint = {
+            "collected_items": items,
+            "discovered_urls": [item["url"] for item in items],
+            "processed_urls": [item["url"] for item in items],
+            "grid_complete": True,
+            "grid_empty_confirmed": False,
+            "completed": True,
+            "terminal_reason": "grid_inventory_processed",
+            "stalled_reason": "",
+            "resume_url": "",
+        }
+        return gateway._public_photo_result(checkpoint, items)
+
+    monkeypatch.setattr(gateway, "_collect_public_profile_photo_inventory", collect)
+
+    result = await gateway.account_profile_photos("https://www.facebook.com/100")
+
+    assert result["completed"] is True
+    assert result["grid_complete"] is True
+    assert result["terminal_reason"] == "account_photo_surfaces_processed"
+    assert result["evidence"]["all_surfaces_terminal"] is True
+    assert all(
+        evidence["terminal_verified"]
+        for evidence in result["evidence"]["surfaces"].values()
+    )
+    assert [item["id"] for item in result["items"]] == ["shared", "1", "2"]
+    assert [item["id"] for item in result["batch_items"]] == ["shared", "1", "2"]
+    assert result["discovered_count"] == 3
+    assert result["processed_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_account_profile_photos_shares_permalink_and_new_photo_limits_across_surfaces(
+    tmp_path: Path, monkeypatch
+):
+    browser = EmptyCookieBrowser()
+
+    class LoggedInContext(browser.Context):
+        async def cookies(self, url: str):
+            return [{"name": "c_user", "value": "100999"}]
+
+    context = LoggedInContext()
+    monkeypatch.setattr(
+        "fb_monitor.facebook_browser.async_playwright", lambda: browser.Manager(context)
+    )
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=True)
+    gateway.album_batch_max_operations = 5
+    gateway.album_batch_max_new_photos = 3
+    observed_limits: list[tuple[int, int]] = []
+
+    async def collect(page, source_url, profile_identity, progress, **kwargs):
+        operation_limit = int(kwargs["batch_operation_limit"])
+        new_photo_limit = int(kwargs["batch_new_photo_limit"])
+        observed_limits.append((operation_limit, new_photo_limit))
+        if source_url.endswith("/photos_by"):
+            operation_count = min(4, operation_limit)
+            item_count = min(2, new_photo_limit)
+            prefix = "by"
+        else:
+            operation_count = min(1, operation_limit)
+            item_count = min(1, new_photo_limit)
+            prefix = "of"
+        items = [
+            {
+                "id": f"{prefix}-{index}",
+                "url": f"https://www.facebook.com/photo.php?fbid={prefix}-{index}",
+                "image": f"https://scontent.example.fbcdn.net/{prefix}-{index}.jpg",
+            }
+            for index in range(item_count)
+        ]
+        checkpoint = {
+            "collected_items": items,
+            "discovered_urls": [item["url"] for item in items],
+            "processed_urls": [item["url"] for item in items],
+            "grid_complete": False,
+            "grid_empty_confirmed": False,
+            "completed": False,
+            "terminal_reason": "",
+            "stalled_reason": "",
+            "resume_url": source_url,
+            "batch_operations": operation_count,
+        }
+        return gateway._public_photo_result(checkpoint, items)
+
+    monkeypatch.setattr(gateway, "_collect_public_profile_photo_inventory", collect)
+
+    result = await gateway.account_profile_photos("https://www.facebook.com/100")
+
+    assert observed_limits == [(5, 3), (1, 1)]
+    assert len(result["batch_items"]) == 3
+    assert sum(
+        int(surface.get("batch_operations") or 0)
+        for surface in result["progress"]["surfaces"].values()
+    ) == 5
+
+
+@pytest.mark.asyncio
+async def test_account_profile_photos_dispatches_top_level_refresh_to_completed_surface(
+    tmp_path: Path, monkeypatch
+):
+    browser = EmptyCookieBrowser()
+    viewer = "100999"
+
+    class LoggedInContext(browser.Context):
+        async def cookies(self, url: str):
+            return [{"name": "c_user", "value": viewer}]
+
+    context = LoggedInContext()
+    monkeypatch.setattr(
+        "fb_monitor.facebook_browser.async_playwright", lambda: browser.Manager(context)
+    )
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=True)
+    by_url = "https://www.facebook.com/photo.php?fbid=11"
+    of_url = "https://www.facebook.com/photo.php?fbid=22"
+
+    async def no_access_wall(current_page, diagnostic_key=None):
+        return None
+
+    async def current_media_id(current_page):
+        return (parse_qs(urlsplit(current_page.url).query).get("fbid") or [""])[0]
+
+    async def refreshed_image(current_page):
+        media_id = await current_media_id(current_page)
+        return f"https://scontent.example.fbcdn.net/{media_id}.jpg?fresh=1"
+
+    monkeypatch.setattr(gateway, "_raise_for_access_wall", no_access_wall)
+    monkeypatch.setattr(gateway, "_current_viewer_media_id", current_media_id)
+    monkeypatch.setattr(gateway, "_public_photo_original_image", refreshed_image)
+
+    def completed_surface(media_id: str, viewer_url: str) -> dict:
+        return {
+            "schema_version": 4,
+            "grid_complete": True,
+            "grid_empty_confirmed": False,
+            "completed": True,
+            "terminal_reason": "grid_inventory_processed",
+            "discovered_urls": [viewer_url],
+            "processed_urls": [viewer_url],
+            "collected_items": [{
+                "id": media_id,
+                "url": viewer_url,
+                "image": f"https://scontent.example.fbcdn.net/{media_id}.jpg?expired=1",
+            }],
+        }
+
+    scope_hash = hashlib.sha256(viewer.encode()).hexdigest()
+    result = await gateway.account_profile_photos(
+        "https://www.facebook.com/100",
+        {
+            "access_scope": "account_visible",
+            "viewer_scope_hash": scope_hash,
+            "surfaces": {
+                "photos_by": completed_surface("11", by_url),
+                "photos_of": completed_surface("22", of_url),
+            },
+            "refresh_media_external_ids": ["22"],
+        },
+    )
+
+    assert context.page.visited == [of_url]
+    assert [item["id"] for item in result["batch_items"]] == ["22"]
+    assert next(item for item in result["items"] if item["id"] == "22")[
+        "image"
+    ].endswith("?fresh=1")
+    assert result["progress"]["surfaces"]["photos_by"].get(
+        "refresh_media_external_ids", []
+    ) == []
+    assert result["progress"]["surfaces"]["photos_of"][
+        "refresh_media_external_ids"
+    ] == []
+    assert result["progress"].get("refresh_media_external_ids", []) == []
+
+
+@pytest.mark.asyncio
+async def test_account_profile_photos_requires_both_surfaces_to_reach_terminal(
+    tmp_path: Path, monkeypatch
+):
+    browser = EmptyCookieBrowser()
+
+    class LoggedInContext(browser.Context):
+        async def cookies(self, url: str):
+            return [{"name": "c_user", "value": "100999"}]
+
+    context = LoggedInContext()
+    monkeypatch.setattr(
+        "fb_monitor.facebook_browser.async_playwright", lambda: browser.Manager(context)
+    )
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=True)
+
+    async def collect(page, source_url, profile_identity, progress, **kwargs):
+        complete = source_url.endswith("/photos_by")
+        checkpoint = {
+            "collected_items": [],
+            "discovered_urls": [],
+            "processed_urls": [],
+            "grid_complete": complete,
+            "grid_empty_confirmed": complete,
+            "completed": complete,
+            "terminal_reason": "explicit_empty_grid" if complete else "",
+            "stalled_reason": "",
+            "resume_url": "" if complete else source_url,
+        }
+        return gateway._public_photo_result(checkpoint, [])
+
+    monkeypatch.setattr(gateway, "_collect_public_profile_photo_inventory", collect)
+
+    result = await gateway.account_profile_photos("https://www.facebook.com/100")
+
+    assert result["completed"] is False
+    assert result["grid_complete"] is False
+    assert result["resumable"] is True
+    assert result["progress"]["resume_url"].endswith("/photos_of")
+    assert result["evidence"]["surfaces"]["photos_by"]["terminal_verified"] is True
+    assert result["evidence"]["surfaces"]["photos_of"]["terminal_verified"] is False
+
+
+@pytest.mark.asyncio
+async def test_account_profile_photos_preserves_successful_surface_when_other_fails(
+    tmp_path: Path, monkeypatch
+):
+    browser = EmptyCookieBrowser()
+
+    class LoggedInContext(browser.Context):
+        async def cookies(self, url: str):
+            return [{"name": "c_user", "value": "100999"}]
+
+    context = LoggedInContext()
+    monkeypatch.setattr(
+        "fb_monitor.facebook_browser.async_playwright", lambda: browser.Manager(context)
+    )
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=True)
+    photo = {
+        "id": "11",
+        "url": "https://www.facebook.com/photo.php?fbid=11",
+        "image": "https://scontent.example.fbcdn.net/11.jpg",
+    }
+
+    async def collect(page, source_url, profile_identity, progress, **kwargs):
+        if source_url.endswith("/photos_of"):
+            raise FacebookBrowserError(
+                "facebook_photo_surface_redirected_or_unverified"
+            )
+        checkpoint = {
+            "collected_items": [photo],
+            "discovered_urls": [photo["url"]],
+            "processed_urls": [photo["url"]],
+            "grid_complete": True,
+            "grid_empty_confirmed": False,
+            "completed": True,
+            "terminal_reason": "grid_inventory_processed",
+            "stalled_reason": "",
+            "resume_url": "",
+            "batch_operations": 1,
+        }
+        return gateway._public_photo_result(checkpoint, [photo])
+
+    monkeypatch.setattr(gateway, "_collect_public_profile_photo_inventory", collect)
+
+    result = await gateway.account_profile_photos("https://www.facebook.com/100")
+
+    assert result["completed"] is False
+    assert result["resumable"] is False
+    assert result["batch_items"] == [photo]
+    assert result["items"] == [photo]
+    assert result["progress"]["surfaces"]["photos_by"]["completed"] is True
+    assert result["progress"]["surfaces"]["photos_of"]["completed"] is False
+    assert "photos_of:collector_error:" in result["stalled_reason"]
+    assert result["evidence"]["surface_failures"]["photos_of"]["type"] == (
+        "collector_error"
+    )
+    assert result["evidence"]["all_surfaces_terminal"] is False
+
+
+@pytest.mark.asyncio
+async def test_account_profile_photos_resumes_each_surface_from_its_own_checkpoint(
+    tmp_path: Path, monkeypatch
+):
+    browser = EmptyCookieBrowser()
+    viewer = "100999"
+
+    class LoggedInContext(browser.Context):
+        async def cookies(self, url: str):
+            return [{"name": "c_user", "value": viewer}]
+
+    context = LoggedInContext()
+    monkeypatch.setattr(
+        "fb_monitor.facebook_browser.async_playwright", lambda: browser.Manager(context)
+    )
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=True)
+    observed = {}
+
+    async def collect(page, source_url, profile_identity, progress, **kwargs):
+        surface = "photos_of" if source_url.endswith("/photos_of") else "photos_by"
+        observed[surface] = dict(progress)
+        checkpoint = dict(progress)
+        checkpoint.update({
+            "collected_items": [],
+            "discovered_urls": [],
+            "processed_urls": [],
+            "grid_complete": False,
+            "grid_empty_confirmed": False,
+            "completed": False,
+            "terminal_reason": "",
+            "stalled_reason": "",
+            "resume_url": source_url,
+        })
+        return gateway._public_photo_result(checkpoint, [])
+
+    monkeypatch.setattr(gateway, "_collect_public_profile_photo_inventory", collect)
+    scope_hash = hashlib.sha256(viewer.encode()).hexdigest()
+    progress = {
+        "access_scope": "account_visible",
+        "viewer_scope_hash": scope_hash,
+        "surfaces": {
+            "photos_by": {"grid_scroll_depth": 3, "resume_url": "by-cursor"},
+            "photos_of": {"grid_scroll_depth": 7, "resume_url": "of-cursor"},
+        },
+    }
+
+    result = await gateway.account_profile_photos(
+        "https://www.facebook.com/100", progress
+    )
+
+    assert observed["photos_by"]["grid_scroll_depth"] == 3
+    assert observed["photos_by"]["resume_url"] == "by-cursor"
+    assert observed["photos_of"]["grid_scroll_depth"] == 7
+    assert observed["photos_of"]["resume_url"] == "of-cursor"
+    assert result["progress"]["surfaces"]["photos_by"]["grid_scroll_depth"] == 3
+    assert result["progress"]["surfaces"]["photos_of"]["grid_scroll_depth"] == 7
+
+
+@pytest.mark.asyncio
+async def test_account_profile_photos_keeps_partial_mixed_scope_for_same_viewer(
+    tmp_path: Path, monkeypatch
+):
+    browser = EmptyCookieBrowser()
+    viewer = "100999"
+
+    class LoggedInContext(browser.Context):
+        async def cookies(self, url: str):
+            return [{"name": "c_user", "value": viewer}]
+
+    context = LoggedInContext()
+    monkeypatch.setattr(
+        "fb_monitor.facebook_browser.async_playwright", lambda: browser.Manager(context)
+    )
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=True)
+    observed: dict[str, dict] = {}
+
+    async def collect(page, source_url, profile_identity, progress, **kwargs):
+        surface = "photos_of" if source_url.endswith("/photos_of") else "photos_by"
+        observed[surface] = dict(progress)
+        checkpoint = dict(progress)
+        checkpoint.update({
+            "collected_items": list(progress.get("collected_items") or []),
+            "discovered_urls": list(progress.get("discovered_urls") or []),
+            "processed_urls": list(progress.get("processed_urls") or []),
+            "grid_complete": False,
+            "grid_empty_confirmed": False,
+            "completed": False,
+            "terminal_reason": "",
+            "stalled_reason": "",
+            "resume_url": source_url,
+        })
+        return gateway._public_photo_result(checkpoint, [])
+
+    monkeypatch.setattr(gateway, "_collect_public_profile_photo_inventory", collect)
+    scope_hash = hashlib.sha256(viewer.encode()).hexdigest()
+    partial_url = "https://www.facebook.com/photo.php?fbid=11"
+    result = await gateway.account_profile_photos(
+        "https://www.facebook.com/100",
+        {
+            "access_scope": "mixed",
+            "viewer_scope_hash": scope_hash,
+            "surfaces": {
+                "photos_by": {
+                    "schema_version": 4,
+                    "grid_scroll_depth": 3,
+                    "discovered_urls": [partial_url],
+                    "processed_urls": [],
+                    "collected_items": [],
+                    "resume_url": "https://www.facebook.com/100/photos_by",
+                },
+            },
+            "actor_collected_items": [{"id": "actor-supplement"}],
+        },
+    )
+
+    assert observed["photos_by"]["grid_scroll_depth"] == 3
+    assert observed["photos_by"]["discovered_urls"] == [partial_url]
+    assert observed["photos_of"] == {}
+    assert result["progress"]["viewer_scope_changed"] is False
+    assert result["evidence"]["previous_viewer_scope_hash"] == ""
+
+
+@pytest.mark.asyncio
+async def test_account_profile_photos_resets_inventory_when_viewer_scope_changes(
+    tmp_path: Path, monkeypatch
+):
+    browser = EmptyCookieBrowser()
+
+    class LoggedInContext(browser.Context):
+        async def cookies(self, url: str):
+            return [{"name": "c_user", "value": "new-viewer"}]
+
+    context = LoggedInContext()
+    monkeypatch.setattr(
+        "fb_monitor.facebook_browser.async_playwright", lambda: browser.Manager(context)
+    )
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=True)
+    observed_progress = []
+
+    async def collect(page, source_url, profile_identity, progress, **kwargs):
+        observed_progress.append(dict(progress))
+        checkpoint = {
+            "collected_items": [],
+            "discovered_urls": [],
+            "processed_urls": [],
+            "grid_complete": True,
+            "grid_empty_confirmed": True,
+            "completed": True,
+            "terminal_reason": "explicit_empty_grid",
+            "stalled_reason": "",
+            "resume_url": "",
+        }
+        return gateway._public_photo_result(checkpoint, [])
+
+    monkeypatch.setattr(gateway, "_collect_public_profile_photo_inventory", collect)
+    old_hash = hashlib.sha256(b"old-viewer").hexdigest()
+    progress = {
+        "access_scope": "account_visible",
+        "viewer_scope_hash": old_hash,
+        "surfaces": {
+            "photos_by": {"discovered_urls": ["https://facebook.com/photo.php?fbid=1"]},
+            "photos_of": {"discovered_urls": ["https://facebook.com/photo.php?fbid=2"]},
+        },
+        "discovered_urls": ["https://facebook.com/photo.php?fbid=1"],
+        "collected_items": [{"id": "1", "url": "old", "image": "old"}],
+    }
+
+    result = await gateway.account_profile_photos(
+        "https://www.facebook.com/100", progress
+    )
+
+    new_hash = hashlib.sha256(b"new-viewer").hexdigest()
+    assert observed_progress == [{}, {}]
+    assert result["progress"]["viewer_scope_hash"] == new_hash
+    assert result["progress"]["viewer_scope_changed"] is True
+    assert result["progress"]["previous_viewer_scope_hash"] == old_hash
+    assert result["evidence"]["viewer_scope_changed"] is True
+
+
+@pytest.mark.asyncio
+async def test_account_profile_photos_reports_expired_login_clearly(
+    tmp_path: Path, monkeypatch
+):
+    browser = EmptyCookieBrowser()
+
+    class LoggedInContext(browser.Context):
+        async def cookies(self, url: str):
+            return [{"name": "c_user", "value": "operator-account"}]
+
+    context = LoggedInContext()
+    monkeypatch.setattr(
+        "fb_monitor.facebook_browser.async_playwright", lambda: browser.Manager(context)
+    )
+    gateway = FacebookBrowserGateway(True, tmp_path, require_login=True)
+
+    async def expired(*args, **kwargs):
+        raise FacebookBrowserLoginRequired("generic login wall")
+
+    monkeypatch.setattr(gateway, "_collect_public_profile_photo_inventory", expired)
+
+    with pytest.raises(FacebookBrowserLoginRequired, match="登入狀態已失效"):
+        await gateway.account_profile_photos("https://www.facebook.com/100")
+
     assert context.closed is True
 
 

@@ -113,7 +113,7 @@ def markdown_for(item: dict[str, Any], kind: str) -> str:
         url = first(item, URL_KEYS[kind]) or ""
         date = display_time(first(item, ("created_at", "date", "timestamp", "publishTime", "time")))
         return (
-            "# 公開照片\n\n"
+            "# 帳號可見照片\n\n"
             "- 類型：照片\n"
             f"- 時間：{date}\n"
             f"- 來源：{url}\n\n"
@@ -880,12 +880,40 @@ class Ingester:
                 counts["errors"] += 1
         return counts
 
-    def reconcile(self, profile_id: int, kind: str, seen: set[str], limit: int | None, notify: bool, parent_external_id: str | None = None) -> None:
-        sql = "SELECT * FROM entities WHERE profile_id=? AND kind=? AND present=1 ORDER BY published_at DESC, id DESC"
+    def reconcile(
+        self,
+        profile_id: int,
+        kind: str,
+        seen: set[str],
+        limit: int | None,
+        notify: bool,
+        parent_external_id: str | None = None,
+        source_scope: str | None = None,
+        source_viewer_scope_hash: str | None = None,
+    ) -> None:
+        sql = "SELECT * FROM entities WHERE profile_id=? AND kind=? AND present=1"
         params: tuple[Any, ...] = (profile_id, kind)
         if parent_external_id is not None:
-            sql = "SELECT * FROM entities WHERE profile_id=? AND kind=? AND parent_external_id=? AND present=1 ORDER BY published_at DESC, id DESC"
-            params = (profile_id, kind, parent_external_id)
+            sql += " AND parent_external_id=?"
+            params += (parent_external_id,)
+        if source_scope is not None:
+            # Legacy rows have no provenance. Include them once so a verified
+            # signed-in inventory can adopt or retire them, while Actor-only
+            # supplemental rows never expand the primary reconciliation scope.
+            sql += " AND (source_scope IS NULL OR source_scope=?)"
+            params += (source_scope,)
+        if source_viewer_scope_hash is not None:
+            # Visibility is tied to the signed-in Facebook account.  An item
+            # that viewer A can see must not accumulate missing observations
+            # merely because a later scan is performed as viewer B.  NULL is
+            # included for one-time adoption of rows created before this
+            # provenance field existed.
+            sql += (
+                " AND (source_viewer_scope_hash IS NULL "
+                "OR source_viewer_scope_hash=?)"
+            )
+            params += (source_viewer_scope_hash,)
+        sql += " ORDER BY published_at DESC, id DESC"
         if limit:
             sql += " LIMIT ?"
             params += (limit,)

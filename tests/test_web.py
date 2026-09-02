@@ -513,6 +513,7 @@ def test_dashboard_queues_one_public_photo_capture_and_rejects_cross_site(
     assert dashboard.status_code == 200
     assert 'action="/profiles/1/capture-photos"' in dashboard.text
     assert "擷取全部照片" in dashboard.text
+    assert "登入帳號可見的所有照片" in dashboard.text
     assert rejected.status_code == 403
     assert missing.status_code == 404
     assert queued.status_code == 303 and "notice=" in queued.headers["location"]
@@ -556,6 +557,18 @@ def test_public_photo_capture_requires_browser_and_photo_tab_previews_downloads(
         "INSERT INTO entity_media(entity_id,version_id,media_id,role,discovery_path,position) VALUES(?,?,?,?,?,0)",
         (entity_id, version_id, media_id, "image", "$.image"),
     )
+    db.execute(
+        """INSERT INTO profile_photo_captures(
+        profile_id,generation,status,checkpoint_json,terminal_evidence_json,
+        created_at,updated_at,completed_at
+        ) VALUES(1,1,'complete',?,'{}',?,?,?)""",
+        (
+            '{"access_scope":"account_visible","source":"logged_in_browser"}',
+            now,
+            now,
+            now,
+        ),
+    )
 
     with TestClient(app) as client:
         dashboard = client.get("/")
@@ -563,7 +576,9 @@ def test_public_photo_capture_requires_browser_and_photo_tab_previews_downloads(
         photos = client.get("/profiles/1?kind=photo")
 
     assert dashboard.status_code == 200
-    assert "1 張公開照片" in dashboard.text
+    assert "1 張照片" in dashboard.text
+    assert "範圍：登入帳號可見" in dashboard.text
+    assert "來源：登入 Chromium" in dashboard.text
     assert "照片擷取未啟用" in dashboard.text
     assert f'data-lightbox-src="/media/{media_id}"' in dashboard.text
     assert disabled.status_code == 303 and "error=" in disabled.headers["location"]
@@ -656,7 +671,7 @@ def test_photo_count_and_list_keep_one_canonical_ready_file_but_all_pending_ids(
 
     assert canonical_id < duplicate_id < pending_ids[0] < pending_ids[1]
     assert dashboard.status_code == 200
-    assert "3 張公開照片" in dashboard.text
+    assert "3 張照片" in dashboard.text
     assert dashboard.text.count(
         f'data-lightbox-src="/media/{ready_media_id}"'
     ) == 1

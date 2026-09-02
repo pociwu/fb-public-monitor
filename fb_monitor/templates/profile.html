@@ -6,10 +6,10 @@
 </section>
 <section class="panel capture-profile-panel">
   <div class="panel-heading">
-    <div><h2>公開照片完整回溯</h2><small>只使用匿名可讀的照片頁；沿用游標續抓，已下載內容依內容去重。</small></div>
-    <form method="post" action="/profiles/{{ profile.id }}/capture-photos" onsubmit="return confirm('{% if profile.photo_capture.status == 'complete' %}重新核對{% else %}開始完整回溯{% endif %} {{ profile.display_name or profile.name }} 所有可匿名公開取得的照片？')"><button class="button" type="submit"{% if not browser_enabled or profile.photo_capture.active %} disabled{% endif %}>{% if not browser_enabled %}照片擷取未啟用{% elif profile.photo_capture.active %}照片回溯中{% elif profile.photo_capture.status == 'complete' %}重新核對全部照片{% else %}擷取全部照片{% endif %}</button></form>
+    <div><h2>帳號可見照片完整回溯</h2><small>優先使用已登入 Chromium 擷取；來源受限時由 Apify 照片 Actor 補抓。Actor 不接收登入 cookie，不能單獨證明登入帳號可見清冊完整。沿用游標續抓，已下載內容依內容去重。</small></div>
+    <form method="post" action="/profiles/{{ profile.id }}/capture-photos" onsubmit="return confirm('{% if profile.photo_capture.status == 'complete' %}重新核對{% else %}開始完整回溯{% endif %} {{ profile.display_name or profile.name }} 登入帳號可見的所有照片？來源受限時 Actor 只作補抓且不使用登入 cookie。')"><button class="button" type="submit"{% if not browser_enabled or profile.photo_capture.active %} disabled{% endif %}>{% if not browser_enabled %}照片擷取未啟用{% elif profile.photo_capture.active %}照片回溯中{% elif profile.photo_capture.status == 'complete' %}重新核對全部照片{% else %}擷取全部照片{% endif %}</button></form>
   </div>
-  <div class="capture-kv"><span class="badge {{ profile.photo_capture.status }}">{{ profile.photo_capture.status_label }}</span><span>已保存 {{ profile.photo_count }} 張</span><span>本輪已發現 {{ profile.photo_capture.discovered_count }} 張</span>{% if profile.photo_capture.updated_display %}<span>更新：{{ profile.photo_capture.updated_display }}</span>{% endif %}</div>
+  <div class="capture-kv"><span class="badge {{ profile.photo_capture.status }}">{{ profile.photo_capture.status_label }}</span><span>範圍：{{ profile.photo_capture.access_scope_label }}</span><span>來源：{{ profile.photo_capture.source_label }}</span><span>已保存 {{ profile.photo_count }} 張</span><span>本輪已發現 {{ profile.photo_capture.discovered_count }} 張</span>{% if profile.photo_capture.updated_display %}<span>更新：{{ profile.photo_capture.updated_display }}</span>{% endif %}</div>
   {% if profile.photo_capture.limited_reason %}<p class="muted">來源限制：{{ profile.photo_capture.limited_reason }}</p>{% endif %}
 </section>
 <section class="panel capture-profile-panel">
@@ -61,7 +61,7 @@
       {% include "_media_gallery.html" %}
       <div class="entity-card-body">
         <div class="entity-heading"><div><span class="eyebrow">{{'留言' if kind=='comment' else ('照片' if kind=='photo' else '貼文')}}</span><h2>{{e.content.title}}</h2></div><span class="badge {{'ok' if e.present else 'gone'}}">{{'存在' if e.present else '已消失'}}</span></div>
-        {% if e.content.text %}<div class="content-text clamp" data-expandable>{{e.content.text}}</div><button class="text-toggle" type="button" hidden>顯示更多</button>{% else %}<p class="content-text muted">{% if kind=='photo' %}公開照片{% elif e.video_count %}影片貼文{% elif e.image_count %}圖片貼文{% else %}無文字內容{% endif %}</p>{% endif %}
+        {% if e.content.text %}<div class="content-text clamp" data-expandable>{{e.content.text}}</div><button class="text-toggle" type="button" hidden>顯示更多</button>{% else %}<p class="content-text muted">{% if kind=='photo' %}照片{% elif e.video_count %}影片貼文{% elif e.image_count %}圖片貼文{% else %}無文字內容{% endif %}</p>{% endif %}
         {% if kind=='comment' and e.parent_external_id %}<p class="parent-link"><a href="{{e.parent_external_id}}" target="_blank" rel="noreferrer">查看所屬貼文</a></p>{% endif %}
         <div class="entity-meta"><span>{{e.content.timestamp if e.content.timestamp != '時間未知' else e.published_display}}</span><span>{{e.version_count}} 版本</span><span>{{e.media_count}} 媒體</span></div>
         <div class="card-actions"><a class="button" href="/entities/{{e.id}}">查看詳細與版本</a>{% if e.source_url %}<a class="button secondary" href="{{e.source_url}}" target="_blank" rel="noreferrer">Facebook 來源</a>{% endif %}</div>

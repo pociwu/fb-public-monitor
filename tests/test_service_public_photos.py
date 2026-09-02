@@ -7,9 +7,15 @@ from pathlib import Path
 
 import pytest
 
+from fb_monitor.apify import (
+    ActorResult,
+    ActorRunTerminalError,
+    MonthlyUsage,
+    StartedActor,
+)
 from fb_monitor.browser_guard import BrowserDecision
 from fb_monitor.config import load_settings
-from fb_monitor.facebook_browser import FacebookBrowserError
+from fb_monitor.facebook_browser import FacebookBrowserError, FacebookBrowserLoginRequired
 from fb_monitor.service import MonitorService
 
 
@@ -59,6 +65,640 @@ def completed_photo_result(items: list[dict], *, declared_total: int | None = No
         "terminal_reason": "grid_inventory_processed",
         "stalled_reason": "",
     }
+
+
+@pytest.mark.asyncio
+async def test_account_login_failure_uses_crash_safe_photo_actor_fallback(
+    tmp_path: Path, monkeypatch
+):
+    service = make_service(tmp_path, monkeypatch)
+    service.apify.token = "test-token"
+    _, capture = service.queue_public_photo_capture(1)
+    payload = json.loads(
+        service.db.row(
+            "SELECT payload_json FROM jobs WHERE job_type='capture_profile_photos'"
+        )["payload_json"]
+    )
+    monkeypatch.setattr(
+        service.browser_guard,
+        "acquire",
+        lambda profile_id: BrowserDecision(True, "allowed", None, 1),
+    )
+
+    async def login_required(*args, **kwargs):
+        raise FacebookBrowserLoginRequired("login expired")
+
+    monkeypatch.setattr(
+        service.facebook_browser, "account_profile_photos", login_required
+    )
+    monkeypatch.setattr(
+        service.apify,
+        "monthly_usage",
+        lambda: _async_value(
+            MonthlyUsage(0.0, "2026-09-01T00:00:00+00:00", "2026-10-01T00:00:00+00:00")
+        ),
+    )
+    starts: list[tuple[str, dict, float]] = []
+
+    async def start(actor_id, actor_payload, max_charge):
+        starts.append((actor_id, actor_payload, max_charge))
+        return StartedActor("run-photo-1", "dataset-1", "store-1")
+
+    image_url = "https://scontent-tpe1-1.xx.fbcdn.net/v/photo-1.jpg?oh=one"
+
+    async def finish(started):
+        assert started.run_id == "run-photo-1"
+        return ActorResult(
+            items=[{"photos": [image_url], "totalPhotos": 1}],
+            summary={"coverageStatus": "COMPLETE", "pagination": {"hasMore": False}},
+            run_id=started.run_id,
+            charged_usd=0.01,
+            raw_result_count=1,
+        )
+
+    async def download(url):
+        path = tmp_path / "actor-photo.jpg"
+        path.write_bytes(b"actor-photo")
+        return {
+            "status": "ready",
+            "sha256": hashlib.sha256(b"actor-photo").hexdigest(),
+            "path": str(path),
+            "mime_type": "image/jpeg",
+            "size_bytes": path.stat().st_size,
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(service.apify, "start", start)
+    monkeypatch.setattr(service.apify, "finish", finish)
+    monkeypatch.setattr(service.media, "download", download)
+
+    await service.capture_profile_photos(1, payload)
+
+    refreshed = service.db.row(
+        "SELECT * FROM profile_photo_captures WHERE id=?", (capture["id"],)
+    )
+    checkpoint = json.loads(refreshed["checkpoint_json"])
+    batch = service.db.row(
+        "SELECT * FROM paid_photo_batches WHERE photo_capture_id=?", (capture["id"],)
+    )
+    assert refreshed["status"] == "source_limited"
+    assert checkpoint["source"] == "apify_actor"
+    assert checkpoint["access_scope"] == "actor_visible"
+    assert checkpoint["actor_inventory_completed"] is True
+    assert "登入帳號可見清冊" in refreshed["limited_reason"]
+    assert batch["status"] == "committed"
+    assert batch["run_id"] == "run-photo-1"
+    assert len(starts) == 1
+    entity = service.db.row(
+        """SELECT * FROM entities
+        WHERE profile_id=1 AND kind='photo'"""
+    )
+    assert entity["source_scope"] == "actor_visible"
+    assert entity["source_collector"] == "apify_profile_photo_actor"
+    media = service.db.row(
+        """SELECT m.* FROM media m
+        JOIN entity_media em ON em.media_id=m.id
+        WHERE em.entity_id=? AND m.status='ready'""",
+        (entity["id"],),
+    )
+    assert Path(media["path"]).read_bytes() == b"actor-photo"
+    assert media["sha256"] == hashlib.sha256(b"actor-photo").hexdigest()
+    assert service.db.row("SELECT COUNT(*) count FROM outbox")["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_photo_actor_input_with_login_cookie_is_rejected_before_paid_batch(
+    tmp_path: Path, monkeypatch
+):
+    service = make_service(tmp_path, monkeypatch)
+    service.apify.token = "test-token"
+    service.settings.actors.profile_photos_input = {
+        "urls": "{urls}",
+        "headers": {"Cookie": "c_user=123; xs=secret"},
+    }
+    _, capture = service.queue_public_photo_capture(1)
+    payload = json.loads(
+        service.db.row(
+            "SELECT payload_json FROM jobs WHERE job_type='capture_profile_photos'"
+        )["payload_json"]
+    )
+    monkeypatch.setattr(
+        service.browser_guard,
+        "acquire",
+        lambda profile_id: BrowserDecision(True, "allowed", None, 1),
+    )
+
+    async def login_required(*args, **kwargs):
+        raise FacebookBrowserLoginRequired("login expired")
+
+    monkeypatch.setattr(
+        service.facebook_browser, "account_profile_photos", login_required
+    )
+
+    outcome = await service.capture_profile_photos(1, payload)
+
+    assert outcome == "source_limited"
+    assert "禁止包含登入認證欄位" in service.db.row(
+        "SELECT limited_reason FROM profile_photo_captures WHERE id=?",
+        (capture["id"],),
+    )["limited_reason"]
+    assert service.db.row("SELECT COUNT(*) count FROM paid_photo_batches")["count"] == 0
+    assert service.db.row("SELECT COUNT(*) count FROM actor_runs")["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_unfinished_paid_photo_run_resumes_before_browser(
+    tmp_path: Path, monkeypatch
+):
+    service = make_service(tmp_path, monkeypatch)
+    service.apify.token = "test-token"
+    _, capture = service.queue_public_photo_capture(1)
+    payload = json.loads(
+        service.db.row(
+            "SELECT payload_json FROM jobs WHERE job_type='capture_profile_photos'"
+        )["payload_json"]
+    )
+    batch, _ = service.db.prepare_paid_photo_batch(
+        profile_id=1,
+        photo_capture_id=int(capture["id"]),
+        actor_id=service.settings.actors.profile_photos,
+        normalized_input={"urls": ["https://www.facebook.com/100"]},
+        max_charge_usd=0.1,
+    )
+    service.db.transition_paid_photo_batch(batch["id"], "launching")
+    service.db.transition_paid_photo_batch(
+        batch["id"],
+        "run_started",
+        expected_status="launching",
+        run_id="existing-run",
+        dataset_id="existing-dataset",
+        key_value_store_id="existing-store",
+    )
+    service.settings.photo_actor_fallback_enabled = False
+    service.settings.actors.profile_photos = "changed/actor"
+    service.db.set_profile_source_control(
+        1, "apify", frozen=True, reason="operator freeze"
+    )
+
+    async def browser_must_not_run(*args, **kwargs):
+        raise AssertionError("browser must not run before paid batch recovery")
+
+    async def start_must_not_run(*args, **kwargs):
+        raise AssertionError("existing paid run must not be purchased again")
+
+    finished: list[str] = []
+
+    async def finish(started):
+        finished.append(started.run_id)
+        return ActorResult(
+            items=[{"photos": ["https://scontent.example.fbcdn.net/v/recovered.jpg"]}],
+            summary={"coverageStatus": "COMPLETE", "pagination": {"hasMore": False}},
+            run_id=started.run_id,
+            charged_usd=0.01,
+            raw_result_count=1,
+        )
+
+    async def download(url):
+        path = tmp_path / "recovered.jpg"
+        path.write_bytes(b"recovered")
+        return {
+            "status": "ready",
+            "sha256": hashlib.sha256(b"recovered").hexdigest(),
+            "path": str(path),
+            "mime_type": "image/jpeg",
+            "size_bytes": path.stat().st_size,
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(
+        service.facebook_browser, "account_profile_photos", browser_must_not_run
+    )
+    monkeypatch.setattr(service.apify, "start", start_must_not_run)
+    monkeypatch.setattr(service.apify, "finish", finish)
+    monkeypatch.setattr(service.media, "download", download)
+
+    outcome = await service.capture_profile_photos(1, payload)
+
+    assert outcome == "source_limited"
+    assert finished == ["existing-run"]
+    assert service.db.row(
+        "SELECT status FROM paid_photo_batches WHERE id=?", (batch["id"],)
+    )["status"] == "committed"
+
+
+@pytest.mark.asyncio
+async def test_manual_retry_after_settled_actor_batch_starts_fresh_first_page(
+    tmp_path: Path, monkeypatch
+):
+    service = make_service(tmp_path, monkeypatch)
+    service.apify.token = "test-token"
+    service.settings.actors.profile_photos_input = {
+        "urls": "{urls}",
+        "cursor": "{cursor}",
+    }
+    _, capture = service.queue_public_photo_capture(1)
+    browser_item = {
+        "id": "browser-kept",
+        "url": "https://www.facebook.com/photo.php?fbid=70001&id=100",
+        "image": "https://scontent.example.fbcdn.net/v/browser-kept.jpg",
+    }
+    checkpoint = {
+        "access_scope": "mixed",
+        "collected_items": [browser_item],
+        "discovered_urls": [browser_item["url"]],
+        "processed_urls": [browser_item["url"]],
+        "discovered_count": 1,
+        "processed_count": 1,
+        "grid_complete": False,
+        "actor_retry_nonce": 3,
+        "actor_next_cursor": "stale-page-2",
+        "actor_seen_cursors": ["stale-page-1"],
+        "actor_collected_items": [{"id": "stale-actor-item"}],
+        "actor_processed_item_ids": ["stale-actor-item"],
+    }
+    service.db.execute(
+        "UPDATE jobs SET status='source_limited' WHERE job_type='capture_profile_photos'"
+    )
+    service.db.execute(
+        """UPDATE profile_photo_captures SET status='source_limited',checkpoint_json=?
+        WHERE id=?""",
+        (json.dumps(checkpoint), capture["id"]),
+    )
+    old_batch, _ = service.db.prepare_paid_photo_batch(
+        profile_id=1,
+        photo_capture_id=int(capture["id"]),
+        actor_id=service.settings.actors.profile_photos,
+        normalized_input={"urls": ["https://www.facebook.com/100"]},
+        max_charge_usd=0.1,
+        request_hash="settled-old-photo-run",
+    )
+    service.db.execute(
+        """UPDATE paid_photo_batches SET status='committed',run_id='old-run'
+        WHERE id=?""",
+        (old_batch["id"],),
+    )
+
+    created, resumed = service.queue_public_photo_capture(1)
+
+    assert created is True
+    assert resumed["id"] == capture["id"]
+    retry_checkpoint = json.loads(resumed["checkpoint_json"])
+    assert retry_checkpoint["actor_retry_nonce"] == 4
+    assert retry_checkpoint["collected_items"] == [browser_item]
+    assert retry_checkpoint["discovered_urls"] == [browser_item["url"]]
+    assert "actor_next_cursor" not in retry_checkpoint
+    assert "actor_processed_item_ids" not in retry_checkpoint
+    payload = json.loads(
+        service.db.row(
+            """SELECT payload_json FROM jobs
+            WHERE job_type='capture_profile_photos' AND status='pending'"""
+        )["payload_json"]
+    )
+    monkeypatch.setattr(
+        service.browser_guard,
+        "acquire",
+        lambda profile_id: BrowserDecision(True, "allowed", None, 1),
+    )
+
+    async def login_required(*args, **kwargs):
+        raise FacebookBrowserLoginRequired("login expired")
+
+    monkeypatch.setattr(
+        service.facebook_browser, "account_profile_photos", login_required
+    )
+    monkeypatch.setattr(
+        service.apify,
+        "monthly_usage",
+        lambda: _async_value(
+            MonthlyUsage(
+                0.0,
+                "2026-09-01T00:00:00+00:00",
+                "2026-10-01T00:00:00+00:00",
+            )
+        ),
+    )
+    starts: list[dict] = []
+
+    async def start(actor_id, actor_payload, max_charge):
+        starts.append(actor_payload)
+        return StartedActor("fresh-run", "fresh-dataset", "fresh-store")
+
+    async def finish(started):
+        return ActorResult(
+            items=[
+                {
+                    "photos": [
+                        "https://scontent.example.fbcdn.net/v/fresh-photo.jpg"
+                    ]
+                }
+            ],
+            summary={"coverageStatus": "COMPLETE", "pagination": {"hasMore": False}},
+            run_id=started.run_id,
+            charged_usd=0.01,
+            raw_result_count=1,
+        )
+
+    async def download(url):
+        path = tmp_path / "fresh-photo.jpg"
+        path.write_bytes(b"fresh-photo")
+        return {
+            "status": "ready",
+            "sha256": hashlib.sha256(b"fresh-photo").hexdigest(),
+            "path": str(path),
+            "mime_type": "image/jpeg",
+            "size_bytes": path.stat().st_size,
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(service.apify, "start", start)
+    monkeypatch.setattr(service.apify, "finish", finish)
+    monkeypatch.setattr(service.media, "download", download)
+
+    outcome = await service.capture_profile_photos(1, payload)
+
+    assert outcome == "source_limited"
+    assert len(starts) == 1
+    assert starts[0]["cursor"] == ""
+    batches = service.db.rows(
+        "SELECT status,run_id FROM paid_photo_batches WHERE photo_capture_id=? ORDER BY id",
+        (capture["id"],),
+    )
+    assert [(row["status"], row["run_id"]) for row in batches] == [
+        ("committed", "old-run"),
+        ("committed", "fresh-run"),
+    ]
+    final_checkpoint = json.loads(
+        service.db.row(
+            "SELECT checkpoint_json FROM profile_photo_captures WHERE id=?",
+            (capture["id"],),
+        )["checkpoint_json"]
+    )
+    assert final_checkpoint["collected_items"] == [browser_item]
+
+
+@pytest.mark.asyncio
+async def test_actor_collision_cannot_replace_browser_photo_version_or_provenance(
+    tmp_path: Path, monkeypatch
+):
+    service = make_service(tmp_path, monkeypatch)
+    service.apify.token = "test-token"
+    _, capture = service.queue_public_photo_capture(1)
+    payload = json.loads(
+        service.db.row(
+            "SELECT payload_json FROM jobs WHERE job_type='capture_profile_photos'"
+        )["payload_json"]
+    )
+    monkeypatch.setattr(
+        service.browser_guard,
+        "acquire",
+        lambda profile_id: BrowserDecision(True, "allowed", None, 1),
+    )
+    browser_image = "https://scontent.example.fbcdn.net/v/browser-90001.jpg"
+    actor_image = "https://scontent.example.fbcdn.net/v/actor-90001.jpg"
+    browser_item = {
+        "id": "90001",
+        "url": "https://www.facebook.com/photo.php?fbid=90001&id=100",
+        "image": browser_image,
+        "caption": "browser caption",
+    }
+
+    async def stalled_browser(*args, **kwargs):
+        progress = {
+            "access_scope": "account_visible",
+            "viewer_scope_hash": "viewer-browser",
+            "collected_items": [browser_item],
+            "discovered_urls": [browser_item["url"]],
+            "processed_urls": [browser_item["url"]],
+            "discovered_count": 1,
+            "processed_count": 1,
+            "grid_complete": False,
+            "completed": False,
+        }
+        return {
+            "items": [browser_item],
+            "batch_items": [browser_item],
+            "progress": progress,
+            "completed": False,
+            "resumable": False,
+            "stalled_reason": "browser surface stopped",
+        }
+
+    monkeypatch.setattr(
+        service.facebook_browser, "account_profile_photos", stalled_browser
+    )
+    monkeypatch.setattr(
+        service.apify,
+        "monthly_usage",
+        lambda: _async_value(
+            MonthlyUsage(
+                0.0,
+                "2026-09-01T00:00:00+00:00",
+                "2026-10-01T00:00:00+00:00",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        service.apify,
+        "start",
+        lambda *args, **kwargs: _async_value(
+            StartedActor("collision-run", "collision-dataset", "collision-store")
+        ),
+    )
+
+    async def finish(started):
+        return ActorResult(
+            items=[
+                {
+                    "photoId": "90001",
+                    "permalinkUrl": browser_item["url"],
+                    "imageUrl": actor_image,
+                    "caption": "actor caption",
+                }
+            ],
+            summary={"coverageStatus": "COMPLETE", "pagination": {"hasMore": False}},
+            run_id=started.run_id,
+            charged_usd=0.01,
+            raw_result_count=1,
+        )
+
+    downloaded: list[str] = []
+
+    async def download(url):
+        downloaded.append(url)
+        path = tmp_path / f"download-{len(downloaded)}.jpg"
+        body = url.encode()
+        path.write_bytes(body)
+        return {
+            "status": "ready",
+            "sha256": hashlib.sha256(body).hexdigest(),
+            "path": str(path),
+            "mime_type": "image/jpeg",
+            "size_bytes": path.stat().st_size,
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(service.apify, "finish", finish)
+    monkeypatch.setattr(service.media, "download", download)
+
+    outcome = await service.capture_profile_photos(1, payload)
+
+    assert outcome == "source_limited"
+    entity = service.db.row(
+        """SELECT * FROM entities
+        WHERE profile_id=1 AND kind='photo' AND external_id='90001'"""
+    )
+    assert entity["source_scope"] == "account_visible"
+    assert entity["source_collector"] == "authenticated_facebook_photo_viewer"
+    assert entity["source_viewer_scope_hash"] == "viewer-browser"
+    assert entity["source_url"] == browser_item["url"]
+    assert service.db.row(
+        "SELECT COUNT(*) count FROM versions WHERE entity_id=?", (entity["id"],)
+    )["count"] == 1
+    version = service.db.row(
+        "SELECT raw_path FROM versions WHERE id=?", (entity["current_version_id"],)
+    )
+    raw = json.loads(Path(version["raw_path"]).read_text(encoding="utf-8"))
+    assert raw["caption"] == "browser caption"
+    assert raw["image"]["url"] == browser_image
+    assert downloaded == [browser_image]
+
+
+@pytest.mark.asyncio
+async def test_large_actor_raw_is_imported_twenty_at_a_time_without_repurchase(
+    tmp_path: Path, monkeypatch
+):
+    service = make_service(tmp_path, monkeypatch)
+    service.apify.token = "test-token"
+    _, capture = service.queue_public_photo_capture(1)
+    first_payload = json.loads(
+        service.db.row(
+            "SELECT payload_json FROM jobs WHERE job_type='capture_profile_photos'"
+        )["payload_json"]
+    )
+    monkeypatch.setattr(
+        service.browser_guard,
+        "acquire",
+        lambda profile_id: BrowserDecision(True, "allowed", None, 1),
+    )
+
+    async def login_required(*args, **kwargs):
+        raise FacebookBrowserLoginRequired("login expired")
+
+    monkeypatch.setattr(
+        service.facebook_browser, "account_profile_photos", login_required
+    )
+    monkeypatch.setattr(
+        service.apify,
+        "monthly_usage",
+        lambda: _async_value(
+            MonthlyUsage(
+                0.0,
+                "2026-09-01T00:00:00+00:00",
+                "2026-10-01T00:00:00+00:00",
+            )
+        ),
+    )
+    starts: list[str] = []
+    finishes: list[str] = []
+
+    async def start(actor_id, actor_payload, max_charge):
+        starts.append(actor_id)
+        return StartedActor("large-run", "large-dataset", "large-store")
+
+    actor_photos = [
+        {
+            "photoId": str(80000 + index),
+            "permalinkUrl": (
+                f"https://www.facebook.com/photo.php?fbid={80000 + index}&id=100"
+            ),
+            "imageUrl": (
+                f"https://scontent.example.fbcdn.net/v/large-{index}.jpg"
+            ),
+        }
+        for index in range(55)
+    ]
+
+    async def finish(started):
+        finishes.append(started.run_id)
+        return ActorResult(
+            items=actor_photos,
+            summary={"coverageStatus": "COMPLETE", "pagination": {"hasMore": False}},
+            run_id=started.run_id,
+            charged_usd=0.05,
+            raw_result_count=55,
+        )
+
+    downloads: list[str] = []
+
+    async def download(url):
+        downloads.append(url)
+        path = tmp_path / f"large-{len(downloads)}.jpg"
+        body = url.encode()
+        path.write_bytes(body)
+        return {
+            "status": "ready",
+            "sha256": hashlib.sha256(body).hexdigest(),
+            "path": str(path),
+            "mime_type": "image/jpeg",
+            "size_bytes": path.stat().st_size,
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(service.apify, "start", start)
+    monkeypatch.setattr(service.apify, "finish", finish)
+    monkeypatch.setattr(service.media, "download", download)
+
+    assert await service.capture_profile_photos(1, first_payload) is None
+    first_checkpoint = json.loads(
+        service.db.row(
+            "SELECT checkpoint_json FROM profile_photo_captures WHERE id=?",
+            (capture["id"],),
+        )["checkpoint_json"]
+    )
+    assert len(first_checkpoint["actor_processed_item_ids"]) == 20
+    batch = service.db.row(
+        "SELECT * FROM paid_photo_batches WHERE photo_capture_id=?", (capture["id"],)
+    )
+    assert batch["status"] == "imported"
+
+    second_payload = json.loads(
+        service.db.row(
+            """SELECT payload_json FROM jobs
+            WHERE dedupe_key=? AND status='pending'""",
+            (f"capture-account-photos:{capture['id']}:1",),
+        )["payload_json"]
+    )
+    assert await service.capture_profile_photos(1, second_payload) is None
+    second_checkpoint = json.loads(
+        service.db.row(
+            "SELECT checkpoint_json FROM profile_photo_captures WHERE id=?",
+            (capture["id"],),
+        )["checkpoint_json"]
+    )
+    assert len(second_checkpoint["actor_processed_item_ids"]) == 40
+
+    third_payload = json.loads(
+        service.db.row(
+            """SELECT payload_json FROM jobs
+            WHERE dedupe_key=? AND status='pending'""",
+            (f"capture-account-photos:{capture['id']}:2",),
+        )["payload_json"]
+    )
+    assert await service.capture_profile_photos(1, third_payload) == "source_limited"
+
+    assert len(starts) == 1
+    assert finishes == ["large-run"]
+    assert len(downloads) == 55
+    assert service.db.row(
+        "SELECT COUNT(*) count FROM entities WHERE profile_id=1 AND kind='photo'"
+    )["count"] == 55
+    assert service.db.row(
+        "SELECT status FROM paid_photo_batches WHERE id=?", (batch["id"],)
+    )["status"] == "committed"
+
+
+async def _async_value(value):
+    return value
 
 
 def test_queue_public_photo_capture_is_profile_scoped_and_idempotent(
@@ -155,7 +795,7 @@ async def test_public_photo_job_obeys_shared_browser_guard(
         raise AssertionError("BrowserGuard 拒絕時不得啟動 Chromium")
 
     monkeypatch.setattr(
-        service.facebook_anonymous_browser, "public_profile_photos", unexpected
+        service.facebook_browser, "account_profile_photos", unexpected
     )
 
     await service._run_next_job()
@@ -244,14 +884,14 @@ async def test_public_photo_capture_saves_photos_silently_and_completes_with_evi
         }
 
     monkeypatch.setattr(
-        service.facebook_anonymous_browser,
-        "public_profile_photos",
+        service.facebook_browser,
+        "account_profile_photos",
         public_profile_photos,
     )
     monkeypatch.setattr(service.media, "download", download)
     reconciled: list[tuple[int, str, set[str], int | None, bool]] = []
 
-    def reconcile(profile_id, kind, seen, limit, notify):
+    def reconcile(profile_id, kind, seen, limit, notify, **kwargs):
         # The generation terminal marker is the replay/idempotency gate and
         # must be durable before missing counters can advance.
         state = service.db.row(
@@ -274,7 +914,7 @@ async def test_public_photo_capture_saves_photos_silently_and_completes_with_evi
     evidence = json.loads(refreshed["terminal_evidence_json"])
     assert refreshed["status"] == "complete"
     assert refreshed["seen_count"] == 2
-    assert evidence["auth_scope"] == "anonymous"
+    assert evidence["auth_scope"] == "account_visible"
     assert evidence["terminal_reason"] == "declared_last_position"
     assert successes == [1]
     assert reconciled == [(1, "photo", {"photo-1", "photo-2"}, None, False)]
@@ -286,6 +926,99 @@ async def test_public_photo_capture_saves_photos_silently_and_completes_with_evi
     assert service.db.row(
         "SELECT COUNT(*) count FROM outbox WHERE kind='media'"
     )["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_viewer_scope_change_resets_old_inventory_count(
+    tmp_path: Path, monkeypatch
+):
+    service = make_service(tmp_path, monkeypatch)
+    _, capture = service.queue_public_photo_capture(1)
+    service.db.execute(
+        "UPDATE profile_photo_captures SET seen_count=50 WHERE id=?",
+        (capture["id"],),
+    )
+    payload = json.loads(
+        service.db.row(
+            "SELECT payload_json FROM jobs WHERE job_type='capture_profile_photos'"
+        )["payload_json"]
+    )
+    monkeypatch.setattr(
+        service.browser_guard,
+        "acquire",
+        lambda profile_id: BrowserDecision(True, "allowed", None, 1),
+    )
+    monkeypatch.setattr(service.browser_guard, "record_success", lambda profile_id: None)
+
+    item = {
+        "id": "new-viewer-photo",
+        "url": "https://www.facebook.com/photo.php?fbid=20001",
+        "image": "https://scontent.example.fbcdn.net/v/new-viewer.jpg",
+    }
+
+    async def account_profile_photos(*args, **kwargs):
+        result = completed_photo_result([item])
+        result["progress"].update(
+            {
+                "access_scope": "account_visible",
+                "source": "logged_in_browser",
+                "viewer_scope_hash": "new-viewer-hash",
+                "viewer_scope_changed": True,
+                "previous_viewer_scope_hash": "old-viewer-hash",
+            }
+        )
+        return result
+
+    async def download(url):
+        path = tmp_path / "new-viewer.jpg"
+        path.write_bytes(b"new-viewer-photo")
+        return {
+            "status": "ready",
+            "sha256": hashlib.sha256(b"new-viewer-photo").hexdigest(),
+            "path": str(path),
+            "mime_type": "image/jpeg",
+            "size_bytes": path.stat().st_size,
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(
+        service.facebook_browser, "account_profile_photos", account_profile_photos
+    )
+    monkeypatch.setattr(service.media, "download", download)
+    reconciled = []
+    monkeypatch.setattr(
+        service.ingester,
+        "reconcile",
+        lambda *args, **kwargs: reconciled.append((args, kwargs)),
+    )
+
+    await service.capture_profile_photos(1, payload)
+
+    refreshed = service.db.row(
+        "SELECT status,seen_count,terminal_evidence_json "
+        "FROM profile_photo_captures WHERE id=?",
+        (capture["id"],),
+    )
+    evidence = json.loads(refreshed["terminal_evidence_json"])
+    assert refreshed["status"] == "complete"
+    assert refreshed["seen_count"] == 1
+    assert evidence["viewer_scope_changed"] is True
+    assert evidence["viewer_scope_hash"] == "new-viewer-hash"
+    entity = service.db.row(
+        """SELECT source_viewer_scope_hash FROM entities
+        WHERE profile_id=1 AND kind='photo' AND external_id='new-viewer-photo'"""
+    )
+    assert entity["source_viewer_scope_hash"] == "new-viewer-hash"
+    assert reconciled == [
+        (
+            (1, "photo", {"new-viewer-photo"}, None),
+            {
+                "notify": False,
+                "source_scope": "account_visible",
+                "source_viewer_scope_hash": "new-viewer-hash",
+            },
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -322,8 +1055,8 @@ async def test_public_photo_capture_continues_from_checkpoint_without_duplicate_
         }
 
     monkeypatch.setattr(
-        service.facebook_anonymous_browser,
-        "public_profile_photos",
+        service.facebook_browser,
+        "account_profile_photos",
         public_profile_photos,
     )
 
@@ -419,8 +1152,8 @@ async def test_completed_inventory_refreshes_only_pending_media_on_retry(
         }
 
     monkeypatch.setattr(
-        service.facebook_anonymous_browser,
-        "public_profile_photos",
+        service.facebook_browser,
+        "account_profile_photos",
         public_profile_photos,
     )
     monkeypatch.setattr(service.media, "download", download)
@@ -489,8 +1222,8 @@ async def test_ready_media_row_with_missing_file_cannot_complete_capture(
         }
 
     monkeypatch.setattr(
-        service.facebook_anonymous_browser,
-        "public_profile_photos",
+        service.facebook_browser,
+        "account_profile_photos",
         public_profile_photos,
     )
     monkeypatch.setattr(service.media, "download", download)
@@ -546,8 +1279,8 @@ async def test_unresolved_permalink_stops_without_empty_media_retry_loop(
         }
 
     monkeypatch.setattr(
-        service.facebook_anonymous_browser,
-        "public_profile_photos",
+        service.facebook_browser,
+        "account_profile_photos",
         public_profile_photos,
     )
     monkeypatch.setattr(service.media, "download", download)
@@ -608,8 +1341,8 @@ async def test_later_generation_notifies_only_new_unique_photo_bytes(
         }
 
     monkeypatch.setattr(
-        service.facebook_anonymous_browser,
-        "public_profile_photos",
+        service.facebook_browser,
+        "account_profile_photos",
         public_profile_photos,
     )
     monkeypatch.setattr(service.media, "download", download)
@@ -694,7 +1427,7 @@ async def test_photo_browser_failure_stays_in_photo_ledger_not_profile_health(
         raise FacebookBrowserError("public photo DOM changed")
 
     monkeypatch.setattr(
-        service.facebook_anonymous_browser, "public_profile_photos", failed
+        service.facebook_browser, "account_profile_photos", failed
     )
 
     await service._run_next_job()
@@ -706,8 +1439,9 @@ async def test_photo_browser_failure_stays_in_photo_ledger_not_profile_health(
     failed_capture = service.db.row(
         "SELECT * FROM profile_photo_captures WHERE id=?", (capture["id"],)
     )
-    assert job["status"] == "failed"
-    assert failed_capture["status"] == "failed"
+    assert job["status"] == "source_limited"
+    assert failed_capture["status"] == "source_limited"
+    assert "APIFY_TOKEN" in failed_capture["limited_reason"]
     assert "DOM changed" in failed_capture["limited_reason"]
     assert profile["consecutive_failures"] == 0
 
@@ -733,3 +1467,702 @@ def test_daily_entity_hash_dedupe_does_not_merge_photo_inventory(
     assert service.db.row(
         "SELECT COUNT(*) count FROM entities WHERE profile_id=1 AND kind='photo'"
     )["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_actor_seen_count_does_not_raise_account_completion_threshold(
+    tmp_path: Path, monkeypatch
+):
+    service = make_service(tmp_path, monkeypatch)
+    _, capture = service.queue_public_photo_capture(1)
+    service.db.execute(
+        "UPDATE jobs SET status='source_limited' WHERE job_type='capture_profile_photos'"
+    )
+    checkpoint = {
+        "account_seen_count": 0,
+        "actor_seen_count": 100,
+        "actor_discovered_count": 100,
+        "completed": False,
+    }
+    service.db.execute(
+        """UPDATE profile_photo_captures SET status='source_limited',seen_count=100,
+        checkpoint_json=? WHERE id=?""",
+        (json.dumps(checkpoint), capture["id"]),
+    )
+    old_batch, _ = service.db.prepare_paid_photo_batch(
+        profile_id=1,
+        photo_capture_id=int(capture["id"]),
+        actor_id=service.settings.actors.profile_photos,
+        normalized_input={"urls": ["https://www.facebook.com/100"]},
+        max_charge_usd=0.1,
+        request_hash="old-actor-100",
+    )
+    service.db.execute(
+        "UPDATE paid_photo_batches SET status='committed' WHERE id=?",
+        (old_batch["id"],),
+    )
+    now = datetime.now(UTC).isoformat()
+    service.db.execute(
+        """INSERT INTO entities(profile_id,kind,external_id,source_scope,
+        source_collector,present,first_seen_at,last_seen_at)
+        VALUES(1,'photo','actor-only','actor_visible','apify_profile_photo_actor',1,?,?)""",
+        (now, now),
+    )
+
+    _, resumed = service.queue_public_photo_capture(1)
+    payload = json.loads(
+        service.db.row(
+            """SELECT payload_json FROM jobs WHERE status='pending'
+            AND job_type='capture_profile_photos' ORDER BY id DESC LIMIT 1"""
+        )["payload_json"]
+    )
+    monkeypatch.setattr(
+        service.browser_guard,
+        "acquire",
+        lambda profile_id: BrowserDecision(True, "allowed", None, 1),
+    )
+    account_items = [
+        {
+            "id": f"account-{index}",
+            "url": f"https://www.facebook.com/photo.php?fbid={91000 + index}&id=100",
+            "image": f"https://scontent.example.fbcdn.net/v/account-{index}.jpg",
+        }
+        for index in range(50)
+    ]
+
+    async def account_photos(profile_url, progress, diagnostic_key):
+        result = completed_photo_result(account_items)
+        result["progress"] = {
+            **progress,
+            **result["progress"],
+            "access_scope": "account_visible",
+            "collector": "authenticated_facebook_photo_viewer",
+        }
+        return result
+
+    async def download(url):
+        path = tmp_path / f"account-{hashlib.sha256(url.encode()).hexdigest()[:10]}.jpg"
+        body = url.encode()
+        path.write_bytes(body)
+        return {
+            "status": "ready",
+            "sha256": hashlib.sha256(body).hexdigest(),
+            "path": str(path),
+            "mime_type": "image/jpeg",
+            "size_bytes": path.stat().st_size,
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(service.facebook_browser, "account_profile_photos", account_photos)
+    monkeypatch.setattr(service.media, "download", download)
+
+    await service.capture_profile_photos(1, payload)
+    for _ in range(4):
+        current = service.db.row(
+            "SELECT status FROM profile_photo_captures WHERE id=?",
+            (resumed["id"],),
+        )
+        if current["status"] == "complete":
+            break
+        continuation = service.db.row(
+            """SELECT payload_json FROM jobs WHERE status='pending'
+            AND job_type='capture_profile_photos' ORDER BY id DESC LIMIT 1"""
+        )
+        await service.capture_profile_photos(
+            1, json.loads(continuation["payload_json"])
+        )
+
+    completed = service.db.row(
+        "SELECT * FROM profile_photo_captures WHERE id=?", (resumed["id"],)
+    )
+    completed_checkpoint = json.loads(completed["checkpoint_json"])
+    assert completed["status"] == "complete"
+    assert completed["seen_count"] == 50
+    assert completed_checkpoint["account_seen_count"] == 50
+    assert completed_checkpoint["actor_seen_count"] == 100
+    assert service.db.row(
+        "SELECT present FROM entities WHERE external_id='actor-only'"
+    )["present"] == 1
+
+
+@pytest.mark.asyncio
+async def test_replay_after_post_ingest_crash_restores_one_photo_notification(
+    tmp_path: Path, monkeypatch
+):
+    service = make_service(tmp_path, monkeypatch)
+    _, prior = service.queue_public_photo_capture(1)
+    service.db.execute(
+        "UPDATE jobs SET status='done' WHERE job_type='capture_profile_photos'"
+    )
+    service.db.execute(
+        """UPDATE profile_photo_captures SET status='complete',
+        terminal_evidence_json='{}' WHERE id=?""",
+        (prior["id"],),
+    )
+    _, capture = service.queue_public_photo_capture(1)
+    payload = json.loads(
+        service.db.row(
+            """SELECT payload_json FROM jobs WHERE status='pending'
+            AND job_type='capture_profile_photos' ORDER BY id DESC LIMIT 1"""
+        )["payload_json"]
+    )
+    monkeypatch.setattr(
+        service.browser_guard,
+        "acquire",
+        lambda profile_id: BrowserDecision(True, "allowed", None, 1),
+    )
+    item = {
+        "id": "crash-photo",
+        "url": "https://www.facebook.com/photo.php?fbid=99111&id=100",
+        "image": "https://scontent.example.fbcdn.net/v/crash-photo.jpg",
+    }
+
+    async def account_photos(*args, **kwargs):
+        return completed_photo_result([item])
+
+    async def download(url):
+        path = tmp_path / "crash-photo.jpg"
+        path.write_bytes(b"crash-photo")
+        return {
+            "status": "ready",
+            "sha256": hashlib.sha256(b"crash-photo").hexdigest(),
+            "path": str(path),
+            "mime_type": "image/jpeg",
+            "size_bytes": path.stat().st_size,
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(service.facebook_browser, "account_profile_photos", account_photos)
+    monkeypatch.setattr(service.media, "download", download)
+    original_ingest = service.ingester.ingest
+    crashed = False
+
+    async def crash_after_ingest(*args, **kwargs):
+        nonlocal crashed
+        result = await original_ingest(*args, **kwargs)
+        if not crashed:
+            crashed = True
+            raise RuntimeError("simulated crash after durable ingest")
+        return result
+
+    monkeypatch.setattr(service.ingester, "ingest", crash_after_ingest)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await service.capture_profile_photos(1, payload)
+    monkeypatch.setattr(service.ingester, "ingest", original_ingest)
+
+    await service.capture_profile_photos(1, payload)
+    await service.capture_profile_photos(1, payload)
+
+    assert service.db.row(
+        """SELECT COUNT(DISTINCT ev.id) count FROM events ev JOIN outbox o ON o.event_id=ev.id
+        WHERE ev.event_type LIKE 'photo_%'"""
+    )["count"] == 1
+    assert service.db.row(
+        "SELECT status FROM profile_photo_captures WHERE id=?", (capture["id"],)
+    )["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_imported_actor_raw_recovers_when_disabled_frozen_and_token_missing(
+    tmp_path: Path, monkeypatch
+):
+    service = make_service(tmp_path, monkeypatch)
+    _, capture = service.queue_public_photo_capture(1)
+    payload = json.loads(
+        service.db.row(
+            "SELECT payload_json FROM jobs WHERE job_type='capture_profile_photos'"
+        )["payload_json"]
+    )
+    batch, _ = service.db.prepare_paid_photo_batch(
+        profile_id=1,
+        photo_capture_id=int(capture["id"]),
+        actor_id="original/photo-actor",
+        normalized_input={"urls": ["https://www.facebook.com/100"]},
+        max_charge_usd=0.1,
+        request_hash="recover-saved-photo-raw",
+    )
+    batch = service.db.transition_paid_photo_batch(batch["id"], "launching")
+    batch = service.db.transition_paid_photo_batch(
+        batch["id"], "run_started", run_id="saved-run"
+    )
+    actor_result = ActorResult(
+        items=[{"photos": ["https://scontent.example.fbcdn.net/v/saved.jpg"]}],
+        summary={"coverageStatus": "COMPLETE", "pagination": {"hasMore": False}},
+        run_id="saved-run",
+        charged_usd=0.01,
+        raw_result_count=1,
+    )
+    raw_path, raw_sha = service._save_photo_actor_raw(batch, actor_result)
+    batch = service.db.transition_paid_photo_batch(
+        batch["id"],
+        "raw_saved",
+        raw_path=str(raw_path),
+        raw_sha256=raw_sha,
+        raw_result_count=1,
+    )
+    service.db.transition_paid_photo_batch(
+        batch["id"], "imported", parsed_result_count=1
+    )
+    service.settings.photo_actor_fallback_enabled = False
+    service.settings.actors.profile_photos = "changed/photo-actor"
+    service.apify.token = ""
+    service.db.set_profile_source_control(1, "apify", frozen=True, reason="frozen")
+
+    async def must_not_run(*args, **kwargs):
+        raise AssertionError("saved raw recovery must not call browser/provider")
+
+    async def download(url):
+        path = tmp_path / "saved.jpg"
+        path.write_bytes(b"saved")
+        return {
+            "status": "ready",
+            "sha256": hashlib.sha256(b"saved").hexdigest(),
+            "path": str(path),
+            "mime_type": "image/jpeg",
+            "size_bytes": path.stat().st_size,
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(service.facebook_browser, "account_profile_photos", must_not_run)
+    monkeypatch.setattr(service.apify, "start", must_not_run)
+    monkeypatch.setattr(service.apify, "finish", must_not_run)
+    monkeypatch.setattr(service.media, "download", download)
+
+    assert await service.capture_profile_photos(1, payload) == "source_limited"
+    assert service.db.row(
+        "SELECT status FROM paid_photo_batches WHERE id=?", (batch["id"],)
+    )["status"] == "committed"
+
+
+@pytest.mark.asyncio
+async def test_browser_partial_is_persisted_when_actor_fallback_is_disabled(
+    tmp_path: Path, monkeypatch
+):
+    service = make_service(tmp_path, monkeypatch)
+    service.settings.photo_actor_fallback_enabled = False
+    _, capture = service.queue_public_photo_capture(1)
+    payload = json.loads(
+        service.db.row(
+            "SELECT payload_json FROM jobs WHERE job_type='capture_profile_photos'"
+        )["payload_json"]
+    )
+    monkeypatch.setattr(
+        service.browser_guard,
+        "acquire",
+        lambda profile_id: BrowserDecision(True, "allowed", None, 1),
+    )
+    item = {
+        "id": "partial-browser",
+        "url": "https://www.facebook.com/photo.php?fbid=77111&id=100",
+        "image": "https://scontent.example.fbcdn.net/v/partial-browser.jpg",
+    }
+
+    async def partial(*args, **kwargs):
+        return {
+            "items": [item],
+            "batch_items": [item],
+            "progress": {
+                "access_scope": "account_visible",
+                "collected_items": [item],
+                "discovered_urls": [item["url"]],
+                "processed_urls": [item["url"]],
+                "discovered_count": 1,
+                "processed_count": 1,
+                "grid_complete": False,
+            },
+            "completed": False,
+            "resumable": False,
+            "stalled_reason": "photos_of blocked",
+        }
+
+    async def download(url):
+        path = tmp_path / "partial-browser.jpg"
+        path.write_bytes(b"partial")
+        return {
+            "status": "ready",
+            "sha256": hashlib.sha256(b"partial").hexdigest(),
+            "path": str(path),
+            "mime_type": "image/jpeg",
+            "size_bytes": path.stat().st_size,
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(service.facebook_browser, "account_profile_photos", partial)
+    monkeypatch.setattr(service.media, "download", download)
+    original_actor_fallback = service._capture_profile_photos_actor
+    durable_handoff_sizes: list[int] = []
+
+    async def verify_durable_handoff(profile, current_capture, progress):
+        saved = json.loads(
+            service.db.row(
+                "SELECT checkpoint_json FROM profile_photo_captures WHERE id=?",
+                (capture["id"],),
+            )["checkpoint_json"]
+        )
+        durable_handoff_sizes.append(
+            len(saved.get("fallback_browser_batch_items") or [])
+        )
+        return await original_actor_fallback(profile, current_capture, progress)
+
+    monkeypatch.setattr(
+        service, "_capture_profile_photos_actor", verify_durable_handoff
+    )
+
+    assert await service.capture_profile_photos(1, payload) == "source_limited"
+    assert durable_handoff_sizes == [1]
+    entity = service.db.row(
+        "SELECT * FROM entities WHERE profile_id=1 AND external_id='partial-browser'"
+    )
+    assert entity["source_scope"] == "account_visible"
+    assert service.db.row(
+        "SELECT status FROM profile_photo_captures WHERE id=?", (capture["id"],)
+    )["status"] == "source_limited"
+
+
+@pytest.mark.asyncio
+async def test_actor_raw_retries_failed_download_before_marking_item_processed(
+    tmp_path: Path, monkeypatch
+):
+    service = make_service(tmp_path, monkeypatch)
+    service.apify.token = "test-token"
+    _, capture = service.queue_public_photo_capture(1)
+    first_payload = json.loads(
+        service.db.row(
+            "SELECT payload_json FROM jobs WHERE job_type='capture_profile_photos'"
+        )["payload_json"]
+    )
+    monkeypatch.setattr(
+        service.browser_guard,
+        "acquire",
+        lambda profile_id: BrowserDecision(True, "allowed", None, 1),
+    )
+
+    async def login_required(*args, **kwargs):
+        raise FacebookBrowserLoginRequired("login expired")
+
+    monkeypatch.setattr(service.facebook_browser, "account_profile_photos", login_required)
+    monkeypatch.setattr(
+        service.apify,
+        "monthly_usage",
+        lambda: _async_value(
+            MonthlyUsage(
+                0.0,
+                "2026-09-01T00:00:00+00:00",
+                "2026-10-01T00:00:00+00:00",
+            )
+        ),
+    )
+    starts: list[str] = []
+    finishes: list[str] = []
+
+    async def start(actor_id, actor_payload, max_charge):
+        starts.append(actor_id)
+        return StartedActor("retry-media-run", "retry-media-data", "retry-media-store")
+
+    actor_photos = [
+        {
+            "photoId": str(88000 + index),
+            "permalinkUrl": f"https://www.facebook.com/photo.php?fbid={88000 + index}&id=100",
+            "imageUrl": f"https://scontent.example.fbcdn.net/v/transient-{index}.jpg",
+        }
+        for index in range(25)
+    ]
+
+    async def finish(started):
+        finishes.append(started.run_id)
+        return ActorResult(
+            items=actor_photos,
+            summary={"coverageStatus": "COMPLETE", "pagination": {"hasMore": False}},
+            run_id=started.run_id,
+            charged_usd=0.02,
+            raw_result_count=25,
+        )
+
+    attempts: dict[str, int] = {}
+
+    async def download(url):
+        attempts[url] = attempts.get(url, 0) + 1
+        if "transient-0.jpg" in url and attempts[url] == 1:
+            return {"status": "pending", "source_url": url, "error": "temporary CDN"}
+        path = tmp_path / f"retry-{hashlib.sha256(url.encode()).hexdigest()[:12]}.jpg"
+        body = url.encode()
+        path.write_bytes(body)
+        return {
+            "status": "ready",
+            "sha256": hashlib.sha256(body).hexdigest(),
+            "path": str(path),
+            "mime_type": "image/jpeg",
+            "size_bytes": path.stat().st_size,
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(service.apify, "start", start)
+    monkeypatch.setattr(service.apify, "finish", finish)
+    monkeypatch.setattr(service.media, "download", download)
+
+    assert await service.capture_profile_photos(1, first_payload) is None
+    first_checkpoint = json.loads(
+        service.db.row(
+            "SELECT checkpoint_json FROM profile_photo_captures WHERE id=?",
+            (capture["id"],),
+        )["checkpoint_json"]
+    )
+    assert len(first_checkpoint["actor_processed_item_ids"]) == 19
+    assert sum(attempts.values()) == 20
+    batch = service.db.row(
+        "SELECT * FROM paid_photo_batches WHERE photo_capture_id=?", (capture["id"],)
+    )
+    assert batch["status"] == "imported"
+
+    continuation = service.db.row(
+        """SELECT payload_json FROM jobs WHERE status='pending'
+        AND dedupe_key=?""",
+        (f"capture-account-photos:{capture['id']}:1",),
+    )
+    assert await service.capture_profile_photos(
+        1, json.loads(continuation["payload_json"])
+    ) == "source_limited"
+
+    final_checkpoint = json.loads(
+        service.db.row(
+            "SELECT checkpoint_json FROM profile_photo_captures WHERE id=?",
+            (capture["id"],),
+        )["checkpoint_json"]
+    )
+    assert len(final_checkpoint["actor_processed_item_ids"]) == 25
+    assert attempts[
+        "https://scontent.example.fbcdn.net/v/transient-0.jpg"
+    ] == 2
+    assert starts == [service.settings.actors.profile_photos]
+    assert finishes == ["retry-media-run"]
+    assert service.db.row(
+        "SELECT status FROM paid_photo_batches WHERE id=?", (batch["id"],)
+    )["status"] == "committed"
+
+
+@pytest.mark.asyncio
+async def test_terminal_actor_failure_is_settled_and_manual_retry_starts_new_run(
+    tmp_path: Path, monkeypatch
+):
+    service = make_service(tmp_path, monkeypatch)
+    service.apify.token = "test-token"
+    _, capture = service.queue_public_photo_capture(1)
+    first_payload = json.loads(
+        service.db.row(
+            "SELECT payload_json FROM jobs WHERE job_type='capture_profile_photos'"
+        )["payload_json"]
+    )
+    monkeypatch.setattr(
+        service.browser_guard,
+        "acquire",
+        lambda profile_id: BrowserDecision(True, "allowed", None, 1),
+    )
+
+    async def login_required(*args, **kwargs):
+        raise FacebookBrowserLoginRequired("login expired")
+
+    monkeypatch.setattr(service.facebook_browser, "account_profile_photos", login_required)
+    monkeypatch.setattr(
+        service.apify,
+        "monthly_usage",
+        lambda: _async_value(
+            MonthlyUsage(
+                0.0,
+                "2026-09-01T00:00:00+00:00",
+                "2026-10-01T00:00:00+00:00",
+            )
+        ),
+    )
+    starts: list[str] = []
+
+    async def start(actor_id, actor_payload, max_charge):
+        run_id = f"terminal-run-{len(starts) + 1}"
+        starts.append(run_id)
+        return StartedActor(run_id, f"data-{run_id}", f"store-{run_id}")
+
+    async def finish(started):
+        if started.run_id == "terminal-run-1":
+            raise ActorRunTerminalError(
+                started.run_id, "FAILED", "known provider failure", 0.03
+            )
+        return ActorResult(
+            items=[{"photos": ["https://scontent.example.fbcdn.net/v/retry-ok.jpg"]}],
+            summary={"coverageStatus": "COMPLETE", "pagination": {"hasMore": False}},
+            run_id=started.run_id,
+            charged_usd=0.01,
+            raw_result_count=1,
+        )
+
+    async def download(url):
+        path = tmp_path / "retry-ok.jpg"
+        path.write_bytes(b"retry-ok")
+        return {
+            "status": "ready",
+            "sha256": hashlib.sha256(b"retry-ok").hexdigest(),
+            "path": str(path),
+            "mime_type": "image/jpeg",
+            "size_bytes": path.stat().st_size,
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(service.apify, "start", start)
+    monkeypatch.setattr(service.apify, "finish", finish)
+    monkeypatch.setattr(service.media, "download", download)
+
+    assert await service.capture_profile_photos(1, first_payload) == "source_limited"
+    failed_batch = service.db.row(
+        "SELECT * FROM paid_photo_batches WHERE photo_capture_id=?", (capture["id"],)
+    )
+    assert failed_batch["status"] == "failed"
+    assert failed_batch["charged_usd"] == pytest.approx(0.03)
+    assert service.db.row(
+        "SELECT estimated_usd FROM usage WHERE category='photos'"
+    )["estimated_usd"] >= 0.03
+
+    service.db.execute(
+        "UPDATE jobs SET status='source_limited' WHERE job_type='capture_profile_photos'"
+    )
+    _, resumed = service.queue_public_photo_capture(1)
+    retry_checkpoint = json.loads(resumed["checkpoint_json"])
+    assert retry_checkpoint["actor_retry_nonce"] == 1
+    retry_payload = json.loads(
+        service.db.row(
+            """SELECT payload_json FROM jobs WHERE status='pending'
+            AND job_type='capture_profile_photos' ORDER BY id DESC LIMIT 1"""
+        )["payload_json"]
+    )
+    assert await service.capture_profile_photos(1, retry_payload) == "source_limited"
+    assert starts == ["terminal-run-1", "terminal-run-2"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_actor_finish_timeout_remains_needs_reconcile(
+    tmp_path: Path, monkeypatch
+):
+    service = make_service(tmp_path, monkeypatch)
+    service.apify.token = "test-token"
+    _, capture = service.queue_public_photo_capture(1)
+    payload = json.loads(
+        service.db.row(
+            "SELECT payload_json FROM jobs WHERE job_type='capture_profile_photos'"
+        )["payload_json"]
+    )
+    monkeypatch.setattr(
+        service.browser_guard,
+        "acquire",
+        lambda profile_id: BrowserDecision(True, "allowed", None, 1),
+    )
+
+    async def login_required(*args, **kwargs):
+        raise FacebookBrowserLoginRequired("login expired")
+
+    monkeypatch.setattr(service.facebook_browser, "account_profile_photos", login_required)
+    monkeypatch.setattr(
+        service.apify,
+        "monthly_usage",
+        lambda: _async_value(
+            MonthlyUsage(
+                0.0,
+                "2026-09-01T00:00:00+00:00",
+                "2026-10-01T00:00:00+00:00",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        service.apify,
+        "start",
+        lambda *args, **kwargs: _async_value(
+            StartedActor("timeout-run", "timeout-data", "timeout-store")
+        ),
+    )
+
+    async def finish_timeout(started):
+        raise TimeoutError("provider status query timed out")
+
+    monkeypatch.setattr(service.apify, "finish", finish_timeout)
+
+    with pytest.raises(TimeoutError, match="timed out"):
+        await service.capture_profile_photos(1, payload)
+    assert service.db.row(
+        "SELECT status FROM paid_photo_batches WHERE photo_capture_id=?",
+        (capture["id"],),
+    )["status"] == "needs_reconcile"
+
+
+@pytest.mark.asyncio
+async def test_browser_handoff_uses_whole_twenty_item_allowance_before_actor_raw(
+    tmp_path: Path, monkeypatch
+):
+    service = make_service(tmp_path, monkeypatch)
+    service.apify.token = "test-token"
+    _, capture = service.queue_public_photo_capture(1)
+    profile = service.db.row("SELECT * FROM profiles WHERE id=1")
+    browser_items = [
+        {
+            "id": f"browser-{index}",
+            "url": f"https://www.facebook.com/photo.php?fbid={93000 + index}&id=100",
+            "image": f"https://scontent.example.fbcdn.net/v/browser-{index}.jpg",
+        }
+        for index in range(20)
+    ]
+    progress = {
+        "access_scope": "account_visible",
+        "collected_items": browser_items,
+        "fallback_browser_batch_items": browser_items,
+    }
+    monkeypatch.setattr(
+        service.apify,
+        "monthly_usage",
+        lambda: _async_value(
+            MonthlyUsage(
+                0.0,
+                "2026-09-01T00:00:00+00:00",
+                "2026-10-01T00:00:00+00:00",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        service.apify,
+        "start",
+        lambda *args, **kwargs: _async_value(
+            StartedActor("allowance-run", "allowance-data", "allowance-store")
+        ),
+    )
+    actor_items = [
+        {
+            "photoId": str(94000 + index),
+            "permalinkUrl": f"https://www.facebook.com/photo.php?fbid={94000 + index}&id=100",
+            "imageUrl": f"https://scontent.example.fbcdn.net/v/actor-{index}.jpg",
+        }
+        for index in range(55)
+    ]
+    monkeypatch.setattr(
+        service.apify,
+        "finish",
+        lambda started: _async_value(
+            ActorResult(
+                items=actor_items,
+                summary={
+                    "coverageStatus": "COMPLETE",
+                    "pagination": {"hasMore": False},
+                },
+                run_id=started.run_id,
+                charged_usd=0.05,
+                raw_result_count=55,
+            )
+        ),
+    )
+
+    result = await service._capture_profile_photos_actor(
+        profile, capture, progress
+    )
+
+    assert len(result["batch_items"]) == 20
+    assert all(
+        item["_capture_access_scope"] == "account_visible"
+        for item in result["batch_items"]
+    )
+    assert result["actor_batch_candidate_ids"] == []
+    assert len(result["actor_page_item_ids"]) == 55
+    assert result["resumable"] is True
+    assert result["actor_batch_ready_to_commit"] is False

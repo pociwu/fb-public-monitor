@@ -34,6 +34,23 @@ class StartedActor:
     key_value_store_id: str
 
 
+class ActorRunTerminalError(RuntimeError):
+    """The provider positively reported a terminal unsuccessful run."""
+
+    def __init__(
+        self,
+        run_id: str,
+        status: str,
+        message: str = "",
+        charged_usd: float | None = None,
+    ):
+        self.run_id = run_id
+        self.status = status.upper()
+        self.charged_usd = charged_usd
+        detail = message or self.status or "unknown"
+        super().__init__(f"Actor run {run_id} 未成功（{self.status}）：{detail}")
+
+
 class ApifyGateway:
     def __init__(self, token: str):
         self.token = token
@@ -130,6 +147,18 @@ class ApifyGateway:
         if not isinstance(run, dict):
             raise RuntimeError(f"Actor run {started.run_id} 未回傳完成狀態")
         status = str(run.get("status") or "").upper()
+        if status in {"FAILED", "ABORTED", "TIMED-OUT", "TIMED_OUT"}:
+            raise ActorRunTerminalError(
+                started.run_id,
+                status,
+                str(run.get("statusMessage") or status),
+                (
+                    float(run.get("usageTotalUsd") or run.get("usageUsd"))
+                    if run.get("usageTotalUsd") is not None
+                    or run.get("usageUsd") is not None
+                    else None
+                ),
+            )
         if status not in {"SUCCEEDED"}:
             message = run.get("statusMessage") or status or "unknown"
             raise RuntimeError(f"Actor run {started.run_id} 未成功：{message}")

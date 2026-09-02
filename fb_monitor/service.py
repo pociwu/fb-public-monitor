@@ -7,13 +7,20 @@ import json
 import logging
 import os
 import random
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .apify import ActorResult, ApifyGateway, MonthlyUsage, StartedActor
+from .apify import (
+    ActorResult,
+    ActorRunTerminalError,
+    ApifyGateway,
+    MonthlyUsage,
+    StartedActor,
+)
 from .brightdata import BrightDataError, BrightDataGateway
 from .browser_guard import BrowserDecision, BrowserGuard
 from .capture_coordinator import (
@@ -44,7 +51,7 @@ from .capture_v2 import (
     request_hash as capture_request_hash,
 )
 from .config import Settings, actor_input, load_settings
-from .db import Database, utcnow
+from .db import Database, canonical_request_hash, utcnow
 from .facebook_browser import (
     FacebookBrowserChallengeRequired,
     FacebookBrowserError,
@@ -56,6 +63,7 @@ from .facebook_browser import (
 from .ingest import Ingester, external_id, is_placeholder_profile_name, monitored_projection, profile_display_name
 from .media import MediaStore, extract_media
 from .normalize import content_hash, facebook_post_identity, normalize_url
+from .photo_actor import parse_photo_actor_output, validate_photo_actor_input
 from .raw_retention import cleanup_capture_raw
 from .telegram import TelegramSender
 from .serpapi import SerpApiError, SerpApiGateway, SerpApiNoResults, SerpApiQuotaExceeded, profile_id_from_url
@@ -63,7 +71,12 @@ from .storage import collect_storage_snapshot, daily_storage_message
 from .timeutil import telegram_time
 
 log = logging.getLogger(__name__)
-PRICES = {"profile": 5.40 / 1000, "posts": 4.99 / 1000, "comments": 1.40 / 1000}
+PRICES = {
+    "profile": 5.40 / 1000,
+    "posts": 4.99 / 1000,
+    "comments": 1.40 / 1000,
+    "photos": 2.90 / 1000,
+}
 REPAIR_MIGRATION = "schema_media_v2_20260719"
 PROFILE_PIC_MIGRATION = "profile_pic_fields_v3_20260719"
 NOTIFICATION_HYGIENE_MIGRATION = "notification_hygiene_v5_20260723"
@@ -173,6 +186,7 @@ class MonitorService:
         self.stop_event = asyncio.Event()
         self._maintenance_lock = asyncio.Lock()
         self._config_mtime = settings.config_path.stat().st_mtime
+        self._last_stale_job_recovery_monotonic = 0.0
 
     def _serpapi_aliases(self, profile: dict[str, Any]) -> tuple[str, ...]:
         """Return only identity-bearing aliases, never an unverified display name."""
@@ -525,6 +539,51 @@ class MonitorService:
                     self.db.execute(
                         "UPDATE capture_epochs SET status='needs_reconcile',updated_at=? WHERE id=?",
                         (now, epoch_id),
+                    )
+            elif job["job_type"] == "capture_profile_photos":
+                photo_capture_id = int(payload.get("photo_capture_id") or 0)
+                batch = self.db.row(
+                    """SELECT * FROM paid_photo_batches
+                    WHERE photo_capture_id=? AND status IN(
+                      'launching','run_started','needs_reconcile'
+                    ) ORDER BY id DESC LIMIT 1""",
+                    (photo_capture_id,),
+                )
+                if batch:
+                    batch_status = str(batch.get("status") or "")
+                    if batch_status == "launching":
+                        if batch.get("run_id"):
+                            self.db.transition_paid_photo_batch(
+                                int(batch["id"]),
+                                "run_started",
+                                expected_status="launching",
+                            )
+                        else:
+                            self.db.transition_paid_photo_batch(
+                                int(batch["id"]),
+                                "needs_reconcile",
+                                expected_status="launching",
+                                error="服務重啟時發現照片 Actor launch 結果不明；禁止自動重買",
+                            )
+                            reconcile_reason = "照片 Actor launch 結果不明；需人工 reconcile"
+                    elif batch_status == "run_started" and not batch.get("run_id"):
+                        self.db.transition_paid_photo_batch(
+                            int(batch["id"]),
+                            "needs_reconcile",
+                            expected_status="run_started",
+                            error="服務重啟時發現照片 Actor run_started 缺少 run_id",
+                        )
+                        reconcile_reason = "照片 Actor run_started 缺少 run_id；需人工 reconcile"
+                    elif batch_status == "needs_reconcile":
+                        reconcile_reason = str(
+                            batch.get("error") or "照片 Actor 付費批次需人工 reconcile"
+                        )
+                if reconcile_reason and photo_capture_id:
+                    self.db.execute(
+                        """UPDATE profile_photo_captures
+                        SET status='source_limited',limited_reason=?,next_job_at=NULL,
+                            completed_at=?,updated_at=? WHERE id=?""",
+                        (reconcile_reason, now, now, photo_capture_id),
                     )
             elif job["job_type"] == "contract_test_posts_v2":
                 actor_id = str(
@@ -2887,9 +2946,15 @@ class MonitorService:
             self._ensure_capture_v2_epoch(refreshed, "contract_passed")
 
     def _capture_v2_raw_path(self, request_hash: str) -> Path:
+        return self._provider_raw_path("capture-v2", request_hash)
+
+    def _photo_actor_raw_path(self, request_hash: str) -> Path:
+        return self._provider_raw_path("photo-capture", request_hash)
+
+    def _provider_raw_path(self, namespace: str, request_hash: str) -> Path:
         return (
             self.settings.data_dir
-            / "capture-v2"
+            / namespace
             / "raw"
             / request_hash[:2]
             / f"{request_hash}.json.gz"
@@ -2900,9 +2965,36 @@ class MonitorService:
         batch: dict[str, Any],
         result: ActorResult,
     ) -> tuple[Path, str]:
+        return self._save_provider_raw(
+            batch,
+            result,
+            namespace="capture-v2",
+            format_name="capture-v2-apify-raw-v1",
+        )
+
+    def _save_photo_actor_raw(
+        self,
+        batch: dict[str, Any],
+        result: ActorResult,
+    ) -> tuple[Path, str]:
+        return self._save_provider_raw(
+            batch,
+            result,
+            namespace="photo-capture",
+            format_name="profile-photo-apify-raw-v1",
+        )
+
+    def _save_provider_raw(
+        self,
+        batch: dict[str, Any],
+        result: ActorResult,
+        *,
+        namespace: str,
+        format_name: str,
+    ) -> tuple[Path, str]:
         """Durably save the provider response before any database import."""
-        path = self._capture_v2_raw_path(str(batch["request_hash"]))
-        raw_root = self.settings.data_dir / "capture-v2" / "raw"
+        path = self._provider_raw_path(namespace, str(batch["request_hash"]))
+        raw_root = self.settings.data_dir / namespace / "raw"
         path.parent.mkdir(parents=True, exist_ok=True)
         for directory in (raw_root, path.parent):
             try:
@@ -2925,7 +3017,7 @@ class MonitorService:
                 pass
             return path, hashlib.sha256(existing).hexdigest()
         document = {
-            "format": "capture-v2-apify-raw-v1",
+            "format": format_name,
             "request_hash": str(batch["request_hash"]),
             "actor_id": str(batch["actor_id"]),
             "run_id": result.run_id,
@@ -4212,6 +4304,10 @@ class MonitorService:
                         pass
                     continue
                 self._reload_config_if_changed()
+                monotonic_now = time.monotonic()
+                if monotonic_now - self._last_stale_job_recovery_monotonic >= 60:
+                    self._recover_stale_capture_v2_jobs()
+                    self._last_stale_job_recovery_monotonic = monotonic_now
                 self._enqueue_due_visits()
                 self._enqueue_due_special_detection()
                 await self._run_next_job()
@@ -4466,12 +4562,11 @@ class MonitorService:
     def queue_public_photo_capture(
         self, profile_id: int
     ) -> tuple[bool, dict[str, Any]]:
-        """Queue one anonymous, profile-scoped Photos-page inventory.
+        """Queue one signed-in-account-visible, profile-scoped photo inventory.
 
         Photo-page inventory has its own generation ledger.  It must not claim
-        the single active Capture V2 epoch slot or pass a browser-only intent
-        through the paid Actor state machine.  A logged-in browser is never
-        used to create public inventory.
+        the single active Capture V2 epoch slot.  Chromium is the primary
+        source and the separately budgeted photo Actor is a durable fallback.
         """
         profile = self.db.row(
             "SELECT * FROM profiles WHERE id=? AND enabled=1", (profile_id,)
@@ -4479,7 +4574,7 @@ class MonitorService:
         if not profile:
             raise ValueError("找不到啟用中的監控帳號")
         if not self.settings.facebook_browser_enabled:
-            raise FacebookBrowserError("Facebook 公開照片瀏覽器尚未啟用")
+            raise FacebookBrowserError("Facebook 登入帳號照片瀏覽器尚未啟用")
 
         now = utcnow()
         already_active = False
@@ -4519,6 +4614,72 @@ class MonitorService:
                 capture_id = int(latest["id"])
                 generation = int(latest["generation"])
                 already_active = capture_id in active_capture_ids
+
+                # A terminal Actor batch is immutable: replaying the same
+                # request hash would only re-import its old raw file.  A new
+                # manual attempt of the same incomplete generation therefore
+                # gets a monotonically increasing nonce after (and only after)
+                # every paid batch is settled.  Browser inventory remains in
+                # the checkpoint so Chromium/permalink progress is not lost;
+                # Actor pagination and supplemental inventory start at page 1.
+                terminal_actor_batch = conn.execute(
+                    """SELECT 1 FROM paid_photo_batches
+                    WHERE photo_capture_id=? AND status IN ('committed','failed')
+                    LIMIT 1""",
+                    (capture_id,),
+                ).fetchone()
+                unsettled_actor_batch = conn.execute(
+                    """SELECT 1 FROM paid_photo_batches
+                    WHERE photo_capture_id=? AND status NOT IN ('committed','failed')
+                    LIMIT 1""",
+                    (capture_id,),
+                ).fetchone()
+                if (
+                    not already_active
+                    and str(latest.get("status") or "")
+                    in {"source_limited", "failed"}
+                    and terminal_actor_batch is not None
+                    and unsettled_actor_batch is None
+                ):
+                    try:
+                        retry_checkpoint = json.loads(
+                            str(latest.get("checkpoint_json") or "{}")
+                        )
+                    except (TypeError, json.JSONDecodeError):
+                        retry_checkpoint = {}
+                    if not isinstance(retry_checkpoint, dict):
+                        retry_checkpoint = {}
+                    try:
+                        previous_nonce = int(
+                            retry_checkpoint.get("actor_retry_nonce") or 0
+                        )
+                    except (TypeError, ValueError):
+                        previous_nonce = 0
+                    retry_checkpoint["actor_retry_nonce"] = max(
+                        0, previous_nonce
+                    ) + 1
+                    for key in (
+                        "actor_next_cursor",
+                        "actor_seen_cursors",
+                        "actor_batch_id",
+                        "actor_run_id",
+                        "actor_id",
+                        "actor_evidence",
+                        "actor_inventory_completed",
+                        "actor_declared_total",
+                        "actor_discovered_urls",
+                        "actor_discovered_count",
+                        "actor_collected_items",
+                        "actor_processed_item_ids",
+                        "actor_fallback_error",
+                    ):
+                        retry_checkpoint.pop(key, None)
+                    retry_checkpoint["completed"] = False
+                    retry_checkpoint["terminal_reason"] = ""
+                    retry_checkpoint["stalled_reason"] = ""
+                    latest["checkpoint_json"] = json.dumps(
+                        retry_checkpoint, ensure_ascii=False, sort_keys=True
+                    )
             else:
                 generation = int((latest or {}).get("generation") or 0) + 1
                 cursor = conn.execute(
@@ -4533,9 +4694,16 @@ class MonitorService:
             if not already_active:
                 conn.execute(
                     """UPDATE profile_photo_captures
-                    SET status='pending',limited_reason=NULL,next_job_at=?,
+                    SET status='pending',checkpoint_json=?,limited_reason=NULL,next_job_at=?,
                         completed_at=NULL,updated_at=? WHERE id=?""",
-                    (now, now, capture_id),
+                    (
+                        str(latest.get("checkpoint_json") or "{}")
+                        if resumable and latest
+                        else "{}",
+                        now,
+                        now,
+                        capture_id,
+                    ),
                 )
 
         capture = self.db.row(
@@ -4548,7 +4716,7 @@ class MonitorService:
             profile_id=profile_id,
             job_type="capture_profile_photos",
             priority=-120,
-            dedupe_key=f"capture-public-photos:{capture_id}:0",
+            dedupe_key=f"capture-account-photos:{capture_id}:0",
             payload={
                 "photo_capture_id": capture_id,
                 "iteration": 0,
@@ -4560,17 +4728,627 @@ class MonitorService:
         ) or capture
         return created, refreshed
 
+    async def _capture_profile_photos_actor(
+        self,
+        profile: dict[str, Any],
+        capture: dict[str, Any],
+        progress: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Run or resume one crash-safe paid photo fallback batch."""
+
+        profile_id = int(profile["id"])
+        capture_id = int(capture["id"])
+        template = getattr(self.settings.actors, "profile_photos_input", {}) or {
+            "urls": "{urls}"
+        }
+        actor_cursor = str(progress.get("actor_next_cursor") or "").strip()
+
+        # Durable recovery comes before every mutable setting gate.  Once a
+        # paid run crossed the launch boundary, disabling the fallback,
+        # freezing the profile, rotating the configured Actor, or removing the
+        # token must not strand saved raw/import work.  Only a provider API
+        # call to finish an existing run still requires the token.
+        batch = self.db.row(
+            """SELECT * FROM paid_photo_batches
+            WHERE photo_capture_id=? AND status IN(
+              'prepared','launching','run_started','needs_reconcile',
+              'raw_saved','import_failed','imported'
+            ) ORDER BY id DESC LIMIT 1""",
+            (capture_id,),
+        )
+        status = str(batch.get("status") or "") if batch else ""
+        if batch:
+            actor_id = str(batch["actor_id"])
+            try:
+                payload = json.loads(str(batch["normalized_input_json"] or "{}"))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("照片 Actor 已保留的 canonical input 損毀") from exc
+            if not isinstance(payload, dict):
+                raise RuntimeError("照片 Actor 已保留的 canonical input 格式錯誤")
+            try:
+                validate_photo_actor_input(payload)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"照片 Actor 已保留 input 含登入認證欄位（{exc}），已拒絕傳送"
+                ) from exc
+        else:
+            if not getattr(self.settings, "photo_actor_fallback_enabled", True):
+                raise RuntimeError("Apify 照片 Actor 後備已停用")
+            actor_id = str(
+                getattr(self.settings.actors, "profile_photos", "") or ""
+            ).strip()
+            if not actor_id:
+                raise RuntimeError("尚未設定 Apify 照片 Actor")
+            if self.db.profile_source_frozen(profile_id, "apify"):
+                raise ApifyFrozen("此帳號已凍結 Apify 照片後備")
+            payload = actor_input(
+                template,
+                url=str(profile["url"]),
+                profile_url=str(profile["url"]),
+                urls=[str(profile["url"])],
+                cursor=actor_cursor,
+            )
+            if not isinstance(payload, dict):
+                raise RuntimeError("Apify 照片 Actor input mapping 必須產生物件")
+            try:
+                validate_photo_actor_input(payload)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Apify 照片 Actor input 禁止包含登入認證欄位（{exc}）"
+                ) from exc
+            request_hash = canonical_request_hash(
+                {
+                    "purpose": "profile_photos_fallback",
+                    "profile_id": profile_id,
+                    "photo_capture_id": capture_id,
+                    "actor_id": actor_id,
+                    "input_cursor": actor_cursor,
+                    "retry_nonce": str(progress.get("actor_retry_nonce") or ""),
+                    "input": payload,
+                }
+            )
+            batch, _ = self.db.prepare_paid_photo_batch(
+                profile_id=profile_id,
+                photo_capture_id=capture_id,
+                actor_id=actor_id,
+                normalized_input=payload,
+                max_charge_usd=max(
+                    0.0,
+                    float(getattr(self.settings, "photo_actor_max_charge_usd", 0.50)),
+                ),
+                input_cursor=actor_cursor or None,
+                request_hash=request_hash,
+            )
+            status = str(batch["status"])
+
+        if status == "launching":
+            diagnostic_id = int(batch.get("actor_run_id") or 0)
+            batch = self.db.transition_paid_photo_batch(
+                int(batch["id"]),
+                "needs_reconcile",
+                expected_status="launching",
+                error="Actor launch 結果不明；禁止自動重買照片批次",
+            )
+            if diagnostic_id:
+                self.db.finish_actor_run(
+                    diagnostic_id,
+                    status="needs_reconcile",
+                    error=str(batch["error"]),
+                )
+            raise RuntimeError("照片 Actor launch 結果不明；需要對帳後才能繼續")
+        if status == "needs_reconcile":
+            raise RuntimeError("照片 Actor 付費執行待對帳；禁止自動重買")
+        if status == "failed":
+            raise RuntimeError(str(batch.get("error") or "照片 Actor 批次已失敗"))
+
+        usage: MonthlyUsage | None = None
+        if status == "prepared":
+            if not getattr(self.settings, "photo_actor_fallback_enabled", True):
+                raise RuntimeError("Apify 照片 Actor 後備已停用")
+            if not self.apify.token:
+                raise RuntimeError("APIFY_TOKEN 尚未設定，無法啟動照片 Actor 後備")
+            if self.db.profile_source_frozen(profile_id, "apify"):
+                raise ApifyFrozen("此帳號已凍結 Apify 照片後備")
+            official_remaining, usage = await self._official_available()
+            reservations = self.db.paid_budget_reservations(
+                posts_result_price_usd=PRICES["posts"],
+                excluding_photo_batch_id=int(batch["id"]),
+            )
+            outstanding_reserve = self._capture_v2_outstanding_reserve(
+                spending_profile_id=profile_id,
+                purpose="profile_photos",
+            )
+            global_capacity = max(
+                0.0,
+                self.settings.monthly_budget_usd
+                - float(usage.used_usd)
+                - outstanding_reserve,
+            )
+            max_charge = min(
+                max(
+                    0.0,
+                    float(getattr(self.settings, "photo_actor_max_charge_usd", 0.50)),
+                ),
+                official_remaining,
+                max(
+                    0.0,
+                    global_capacity - float(reservations["total_unsettled_usd"]),
+                ),
+            )
+            # Refresh a formerly budget-clamped prepared row at a new billing
+            # cycle, then let the atomic claim re-check all ledgers.
+            batch, _ = self.db.prepare_paid_photo_batch(
+                profile_id=profile_id,
+                photo_capture_id=capture_id,
+                actor_id=actor_id,
+                normalized_input=payload,
+                max_charge_usd=max_charge,
+                input_cursor=str(batch.get("input_cursor") or "") or None,
+                request_hash=str(batch["request_hash"]),
+            )
+            minimum_charge = max(
+                0.0001,
+                float(getattr(self.settings, "photo_actor_result_price_usd", PRICES["photos"])),
+            )
+            batch, claimed = self.db.claim_paid_photo_batch_launch(
+                int(batch["id"]),
+                global_capacity_usd=global_capacity,
+                minimum_charge_usd=minimum_charge,
+            )
+            if not claimed:
+                if str(batch.get("status") or "") == "prepared":
+                    raise BudgetExceeded(
+                        "Apify 照片後備預算不足",
+                        self._usage_cycle_resume(usage),
+                    )
+                raise RuntimeError("照片 Actor 批次已由另一個 worker 取得")
+            diagnostic_id = self.db.start_actor_run(
+                profile_id,
+                "profile_photos",
+                actor_id,
+                "account_browser_fallback",
+                payload,
+            )
+            batch = self.db.transition_paid_photo_batch(
+                int(batch["id"]),
+                "launching",
+                expected_status="launching",
+                actor_run_id=diagnostic_id,
+                error=None,
+            )
+            if self.db.profile_source_frozen(profile_id, "apify"):
+                self.db.transition_paid_photo_batch(
+                    int(batch["id"]),
+                    "failed",
+                    expected_status="launching",
+                    error="凍結於 Actor 啟動邊界生效；未產生付費執行",
+                )
+                self.db.finish_actor_run(
+                    diagnostic_id,
+                    status="failed",
+                    error="凍結於 Actor 啟動邊界生效；未啟動",
+                )
+                raise ApifyFrozen("此帳號已凍結 Apify 照片後備")
+            try:
+                started = await self.apify.start(
+                    actor_id,
+                    payload,
+                    float(batch["max_charge_usd"]),
+                )
+            except Exception as exc:
+                self.db.transition_paid_photo_batch(
+                    int(batch["id"]),
+                    "needs_reconcile",
+                    expected_status="launching",
+                    error=str(exc)[:4000],
+                )
+                self.db.finish_actor_run(
+                    diagnostic_id,
+                    status="needs_reconcile",
+                    error=str(exc),
+                )
+                raise RuntimeError(
+                    "照片 Actor launch 結果不明；已停止自動重買"
+                ) from exc
+            batch = self.db.transition_paid_photo_batch(
+                int(batch["id"]),
+                "run_started",
+                expected_status="launching",
+                run_id=started.run_id,
+                dataset_id=started.dataset_id,
+                key_value_store_id=started.key_value_store_id,
+                error=None,
+            )
+            status = "run_started"
+
+        raw: dict[str, Any] | None = None
+        if status in {"raw_saved", "import_failed", "imported", "committed"}:
+            raw = self._load_capture_v2_raw(batch["raw_path"])
+        elif status == "run_started":
+            diagnostic_id = int(batch.get("actor_run_id") or 0)
+            started = StartedActor(
+                str(batch.get("run_id") or ""),
+                str(batch.get("dataset_id") or ""),
+                str(batch.get("key_value_store_id") or ""),
+            )
+            if not started.run_id:
+                self.db.transition_paid_photo_batch(
+                    int(batch["id"]),
+                    "needs_reconcile",
+                    expected_status="run_started",
+                    error="run_started 缺少 run_id",
+                )
+                raise RuntimeError("照片 Actor run_started 缺少 run_id；禁止自動重買")
+            path = self._photo_actor_raw_path(str(batch["request_hash"]))
+            result: ActorResult | None = None
+            if path.is_file():
+                raw = self._load_capture_v2_raw(path)
+                raw_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+            else:
+                if not self.apify.token:
+                    raise RuntimeError(
+                        "APIFY_TOKEN 尚未設定，無法收尾已啟動的照片 Actor run"
+                    )
+                try:
+                    result = await self.apify.finish(started)
+                    path, raw_sha256 = self._save_photo_actor_raw(batch, result)
+                except ActorRunTerminalError as exc:
+                    settled_charge = (
+                        max(0.0, float(exc.charged_usd))
+                        if exc.charged_usd is not None
+                        else max(
+                            float(batch.get("max_charge_usd") or 0),
+                            float(
+                                getattr(
+                                    self.settings,
+                                    "photo_actor_result_price_usd",
+                                    PRICES["photos"],
+                                )
+                            ),
+                        )
+                    )
+                    self.db.transition_paid_photo_batch(
+                        int(batch["id"]),
+                        "failed",
+                        expected_status="run_started",
+                        error=str(exc)[:4000],
+                        charged_usd=settled_charge,
+                    )
+                    self.db.add_usage(
+                        datetime.now(UTC).strftime("%Y-%m"),
+                        "photos",
+                        0,
+                        settled_charge,
+                    )
+                    if diagnostic_id:
+                        self.db.finish_actor_run(
+                            diagnostic_id,
+                            status="failed",
+                            run_id=started.run_id,
+                            error=str(exc),
+                            charged_usd=settled_charge,
+                        )
+                    raise RuntimeError(
+                        f"照片 Actor run 已明確失敗：{exc.status}"
+                    ) from exc
+                except Exception as exc:
+                    self.db.transition_paid_photo_batch(
+                        int(batch["id"]),
+                        "needs_reconcile",
+                        expected_status="run_started",
+                        error=str(exc)[:4000],
+                    )
+                    if diagnostic_id:
+                        self.db.finish_actor_run(
+                            diagnostic_id,
+                            status="needs_reconcile",
+                            run_id=started.run_id,
+                            error=str(exc),
+                        )
+                    raise
+                raw = self._load_capture_v2_raw(path)
+                estimate = max(
+                    float(result.charged_usd),
+                    int(result.raw_result_count or len(result.items))
+                    * float(getattr(self.settings, "photo_actor_result_price_usd", PRICES["photos"])),
+                ) + 0.001
+                self.db.add_usage(
+                    datetime.now(UTC).strftime("%Y-%m"),
+                    "photos",
+                    int(result.raw_result_count or len(result.items)),
+                    estimate,
+                )
+            batch = self.db.transition_paid_photo_batch(
+                int(batch["id"]),
+                "raw_saved",
+                expected_status="run_started",
+                raw_path=str(path),
+                raw_sha256=raw_sha256,
+                charged_usd=float(
+                    result.charged_usd if result else raw.get("charged_usd") or 0
+                ),
+                raw_result_count=(
+                    int(result.raw_result_count or len(result.items))
+                    if result
+                    else len(raw["items"])
+                ),
+                error=None,
+            )
+        else:
+            raise RuntimeError(f"照片 Actor 批次狀態無法自動處理：{status}")
+
+        assert raw is not None
+        if (
+            str(raw.get("request_hash") or "") != str(batch["request_hash"])
+            or str(raw.get("actor_id") or "") != str(batch["actor_id"])
+        ):
+            raise RuntimeError("照片 Actor raw 的 request_hash 或 Actor 不符")
+        try:
+            parsed = parse_photo_actor_output(
+                raw["items"],
+                raw.get("summary"),
+                target_profile_id=str(profile.get("fb_id") or ""),
+            )
+        except Exception as exc:
+            if str(batch["status"]) in {"raw_saved", "imported"}:
+                batch = self.db.transition_paid_photo_batch(
+                    int(batch["id"]),
+                    "import_failed",
+                    expected_status=str(batch["status"]),
+                    error=str(exc)[:4000],
+                )
+            raise RuntimeError(f"照片 Actor 輸出無法解析：{exc}") from exc
+        if str(batch["status"]) in {"raw_saved", "import_failed"}:
+            batch = self.db.transition_paid_photo_batch(
+                int(batch["id"]),
+                "imported",
+                expected_status=str(batch["status"]),
+                parsed_result_count=len(parsed.items),
+                output_cursor=parsed.next_cursor,
+                error=None,
+            )
+
+        diagnostic_id = int(batch.get("actor_run_id") or 0)
+        if diagnostic_id:
+            self.db.finish_actor_run(
+                diagnostic_id,
+                status="succeeded" if parsed.items else "succeeded_zero",
+                run_id=str(raw.get("run_id") or batch.get("run_id") or ""),
+                result_count=len(parsed.items),
+                charged_usd=float(raw.get("charged_usd") or batch.get("charged_usd") or 0),
+                summary=raw.get("summary"),
+                samples=parsed.items,
+                raw_result_count=int(raw.get("raw_result_count") or len(raw["items"])),
+                parsed_result_count=len(parsed.items),
+            )
+
+        browser_items = [
+            {**item, "_capture_access_scope": "account_visible",
+             "_capture_collector": "authenticated_facebook_photo_viewer"}
+            for item in progress.get("collected_items") or []
+            if isinstance(item, dict)
+            and progress.get("access_scope") in {"account_visible", "mixed"}
+        ]
+        prior_actor_items = [
+            item
+            for item in progress.get("actor_collected_items") or []
+            if isinstance(item, dict)
+        ]
+        actor_run_id = str(raw.get("run_id") or batch.get("run_id") or "")
+        actor_items = [
+            {**item, "_capture_access_scope": "actor_visible",
+             "_capture_collector": "apify_profile_photo_actor",
+             "_capture_run_id": actor_run_id}
+            for item in parsed.items
+        ]
+
+        def actor_item_identity(item: dict[str, Any]) -> str:
+            """Return the same stable identity used by photo ingestion."""
+            image = item.get("image") or item.get("image_url") or ""
+            payload = {
+                "photoId": item.get("id") or item.get("photo_id") or "",
+                "url": item.get("url") or item.get("source_url") or "",
+                "image": {"url": image} if isinstance(image, str) else image,
+            }
+            return external_id(payload, "photo")
+
+        processed_actor_item_ids = {
+            str(value)
+            for value in progress.get("actor_processed_item_ids") or []
+            if str(value)
+        }
+        fallback_browser_by_id: dict[str, dict[str, Any]] = {}
+        for item in progress.get("fallback_browser_batch_items") or []:
+            if not isinstance(item, dict):
+                continue
+            marked = {
+                **item,
+                "_capture_access_scope": "account_visible",
+                "_capture_collector": "authenticated_facebook_photo_viewer",
+            }
+            identity = actor_item_identity(marked)
+            if identity and identity not in fallback_browser_by_id:
+                fallback_browser_by_id[identity] = marked
+        fallback_browser_all = list(fallback_browser_by_id.values())
+        fallback_browser_batch = fallback_browser_all[:20]
+        fallback_browser_remaining = fallback_browser_all[20:]
+        fallback_browser_ids = {
+            actor_item_identity(item) for item in fallback_browser_batch
+        }
+        fallback_browser_ids.discard("")
+        unprocessed_actor_items: list[dict[str, Any]] = []
+        page_item_ids: set[str] = set()
+        for item in actor_items:
+            identity = actor_item_identity(item)
+            if (
+                not identity
+                or identity in processed_actor_item_ids
+                or identity in fallback_browser_ids
+                or identity in page_item_ids
+            ):
+                continue
+            page_item_ids.add(identity)
+            unprocessed_actor_items.append(item)
+        # One worker invocation imports at most twenty Actor photos.  The paid
+        # batch remains ``imported`` while more rows from its saved raw output
+        # are pending, so continuations replay local raw instead of purchasing
+        # the Actor again.
+        actor_allowance = max(0, 20 - len(fallback_browser_batch))
+        actor_batch_items = unprocessed_actor_items[:actor_allowance]
+        actor_batch_item_ids = {
+            actor_item_identity(item) for item in actor_batch_items
+        }
+        actor_batch_item_ids.discard("")
+        # These IDs become durable ``processed`` markers only after the outer
+        # ingestion loop verifies a ready file on disk.
+        actor_raw_items_pending = bool(
+            fallback_browser_remaining or unprocessed_actor_items
+        )
+        merged_actor: dict[str, dict[str, Any]] = {}
+        for item in [*prior_actor_items, *actor_items]:
+            identity = str(item.get("id") or item.get("url") or item.get("image") or "")
+            if identity:
+                merged_actor[identity] = item
+        merged_actor_items = list(merged_actor.values())
+        actor_discovered_urls = [
+            str(item.get("url") or item.get("image") or "")
+            for item in merged_actor_items
+            if item.get("url") or item.get("image")
+        ]
+        merged_items: dict[str, dict[str, Any]] = {}
+        # Actor results are supplemental. A matching signed-in browser item
+        # wins provenance and remains part of the primary inventory.
+        for item in [*merged_actor_items, *browser_items]:
+            identity = str(item.get("id") or item.get("url") or item.get("image") or "")
+            if identity:
+                merged_items[identity] = item
+        combined_items = list(merged_items.values())
+        cursor_supported = "{cursor}" in json.dumps(
+            template, ensure_ascii=False, sort_keys=True
+        )
+        seen_actor_cursors = {
+            str(value) for value in progress.get("actor_seen_cursors") or []
+            if str(value)
+        }
+        # When an imported batch is replayed, the checkpoint may already hold
+        # that page's output cursor.  The durable batch input cursor is the
+        # actual cursor currently being processed and must drive loop checks.
+        batch_input_cursor = str(batch.get("input_cursor") or "").strip()
+        if batch_input_cursor:
+            seen_actor_cursors.add(batch_input_cursor)
+        repeated_cursor = bool(
+            parsed.next_cursor and parsed.next_cursor in seen_actor_cursors
+        )
+        provider_resumable = bool(
+            parsed.has_next_page
+            and parsed.next_cursor
+            and cursor_supported
+            and not repeated_cursor
+        )
+        resumable = actor_raw_items_pending or provider_resumable
+        actor_inventory_completed = bool(
+            parsed.completed
+            and not parsed.has_next_page
+            and not actor_raw_items_pending
+        )
+        # The configured Actor does not receive the operator's browser session.
+        # It may supplement the archive, but even a terminal Actor result cannot
+        # prove that every item visible to the logged-in account was enumerated.
+        completed = False
+        terminal_reason = parsed.terminal_reason or (
+            "actor_terminal_evidence" if actor_inventory_completed else ""
+        )
+        stalled_reason = ""
+        if actor_raw_items_pending:
+            stalled_reason = ""
+        elif actor_inventory_completed:
+            stalled_reason = (
+                "Apify 已完成 Actor 可見範圍的補抓，但無法證明登入帳號可見清冊完整"
+            )
+        elif repeated_cursor:
+            stalled_reason = "照片 Actor 回傳重複游標，已停止以避免無限迴圈"
+        elif not resumable:
+            stalled_reason = (
+                "照片 Actor 回傳後續游標，但 profile_photos_input 未映射 {cursor}"
+                if parsed.next_cursor and not cursor_supported
+                else "照片 Actor 未提供可驗證的完整終點"
+            )
+        updated_progress = dict(progress)
+        updated_progress.update(
+            {
+                "source": (
+                    "logged_in_browser+apify_actor" if browser_items else "apify_actor"
+                ),
+                "access_scope": "mixed" if browser_items else "actor_visible",
+                "collector": "apify_profile_photo_actor",
+                "actor_id": actor_id,
+                "actor_run_id": str(raw.get("run_id") or batch.get("run_id") or ""),
+                "actor_batch_id": int(batch["id"]),
+                "actor_evidence": parsed.evidence,
+                "actor_inventory_completed": actor_inventory_completed,
+                "actor_next_cursor": parsed.next_cursor or "",
+                "actor_seen_cursors": sorted(seen_actor_cursors),
+                "actor_processed_item_ids": sorted(processed_actor_item_ids),
+                "actor_collected_items": merged_actor_items,
+                "actor_discovered_urls": actor_discovered_urls,
+                "actor_discovered_count": len(actor_discovered_urls),
+                "completed": completed,
+                "terminal_reason": terminal_reason,
+                "stalled_reason": stalled_reason,
+                "actor_declared_total": parsed.declared_total,
+            }
+        )
+        # This value is a crash-safe handoff: it disappears only in the
+        # checkpoint returned after the browser items have been ingested.
+        if fallback_browser_remaining:
+            updated_progress["fallback_browser_batch_items"] = [
+                {
+                    key: value
+                    for key, value in item.items()
+                    if not key.startswith("_capture_")
+                }
+                for item in fallback_browser_remaining
+            ]
+        else:
+            updated_progress.pop("fallback_browser_batch_items", None)
+        return {
+            "items": combined_items,
+            "batch_items": [*fallback_browser_batch, *actor_batch_items],
+            "progress": updated_progress,
+            "completed": completed,
+            "resumable": resumable,
+            "terminal_reason": terminal_reason,
+            "stalled_reason": stalled_reason,
+            "access_scope": "mixed" if browser_items else "actor_visible",
+            "collector": "apify_profile_photo_actor",
+            "actor_batch_id": int(batch["id"]),
+            "actor_batch_ready_to_commit": not actor_raw_items_pending,
+            "actor_page_item_ids": sorted(page_item_ids),
+            "actor_batch_candidate_ids": sorted(actor_batch_item_ids),
+            "actor_provider_resumable": provider_resumable,
+            "actor_provider_inventory_completed": bool(
+                parsed.completed and not parsed.has_next_page
+            ),
+            "actor_provider_stalled_reason": (
+                "照片 Actor 回傳重複游標，已停止以避免無限迴圈"
+                if repeated_cursor
+                else (
+                    "照片 Actor 回傳後續游標，但 profile_photos_input 未映射 {cursor}"
+                    if parsed.next_cursor and not cursor_supported
+                    else "照片 Actor 未提供可驗證的完整終點"
+                )
+            ),
+        }
+
     async def capture_profile_photos(
         self, profile_id: int, payload: dict[str, Any]
     ) -> str | None:
-        """Resume one bounded anonymous pass over a profile's public Photos page."""
+        """Resume one bounded signed-in photo pass with a paid Actor fallback."""
         profile = self.db.row(
-            "SELECT * FROM profiles WHERE id=? AND enabled=1", (profile_id,)
+            "SELECT * FROM profiles WHERE id=?", (profile_id,)
         )
         if not profile:
             return
-        if not self.settings.facebook_browser_enabled:
-            raise FacebookBrowserError("Facebook 公開照片瀏覽器尚未啟用")
         capture_id = int(payload.get("photo_capture_id") or 0)
         iteration = max(0, int(payload.get("iteration") or 0))
         capture = self.db.row(
@@ -4579,9 +5357,24 @@ class MonitorService:
             (capture_id, profile_id),
         )
         if not capture:
-            raise ValueError("公開照片回溯工作與帳號不相符")
+            raise ValueError("帳號可見照片回溯工作與帳號不相符")
         if str(capture.get("status") or "") == "complete":
             return
+        active_actor_batch = self.db.row(
+            """SELECT * FROM paid_photo_batches
+            WHERE photo_capture_id=? AND status IN(
+              'prepared','launching','run_started','needs_reconcile',
+              'raw_saved','import_failed','imported'
+            ) ORDER BY id DESC LIMIT 1""",
+            (capture_id,),
+        )
+        if not active_actor_batch:
+            if not bool(profile.get("enabled")):
+                return
+            if not self.settings.facebook_browser_enabled:
+                raise FacebookBrowserError(
+                    "Facebook 登入帳號照片瀏覽器尚未啟用"
+                )
         try:
             progress = json.loads(capture.get("checkpoint_json") or "{}")
         except (TypeError, json.JSONDecodeError):
@@ -4606,7 +5399,7 @@ class MonitorService:
         )
         # A CDN URL can expire between grid discovery and download.  Starting
         # with the first continuation (the second media attempt), ask the
-        # anonymous collector to reopen only those durable permalinks and
+        # signed-in collector to reopen only those durable permalinks and
         # refresh their image URLs.  The collector recognizes this checkpoint
         # field and deliberately skips the Photos-grid scan.
         refresh_pending_media = bool(
@@ -4622,6 +5415,8 @@ class MonitorService:
         )
 
         checkpoint_inventory_complete = bool(
+            progress.get("access_scope") == "account_visible"
+            and
             progress.get("completed")
             and progress.get("grid_complete")
             and not refresh_pending_media
@@ -4631,9 +5426,43 @@ class MonitorService:
                 or progress.get("grid_empty_confirmed")
             )
         )
-        browser_used = not checkpoint_inventory_complete
-        diagnostic_key = f"public-photos-{profile_id}"
-        if checkpoint_inventory_complete:
+        browser_used = False
+        actor_budget_deferred: BudgetExceeded | None = None
+        diagnostic_key = f"account-photos-{profile_id}"
+        if active_actor_batch:
+            # A paid run already crossed its durable launch boundary. Resume
+            # that exact batch before touching Chromium, otherwise a successful
+            # browser pass could strand the run and reserve budget forever.
+            try:
+                result = await self._capture_profile_photos_actor(
+                    profile, capture, progress
+                )
+            except BudgetExceeded as exc:
+                resume = exc.resume_at or self._next_month()
+                self.db.execute(
+                    """UPDATE profile_photo_captures SET status='budget_paused',
+                    checkpoint_json=?,limited_reason=?,next_job_at=?,
+                    completed_at=NULL,updated_at=? WHERE id=?""",
+                    (
+                        json.dumps(progress, ensure_ascii=False, sort_keys=True),
+                        str(exc), resume.isoformat(), utcnow(), capture_id,
+                    ),
+                )
+                raise
+            except (ApifyFrozen, RuntimeError) as actor_exc:
+                now = utcnow()
+                progress["actor_fallback_error"] = str(actor_exc)
+                self.db.execute(
+                    """UPDATE profile_photo_captures SET status='source_limited',
+                    checkpoint_json=?,limited_reason=?,next_job_at=NULL,
+                    completed_at=?,updated_at=? WHERE id=?""",
+                    (
+                        json.dumps(progress, ensure_ascii=False, sort_keys=True),
+                        f"Apify 照片後備：{actor_exc}", now, now, capture_id,
+                    ),
+                )
+                return "source_limited"
+        elif checkpoint_inventory_complete:
             result = {
                 "items": progress.get("collected_items") or [],
                 "batch_items": [],
@@ -4645,57 +5474,224 @@ class MonitorService:
         else:
             self._acquire_browser(
                 profile,
-                anonymous=True,
+                anonymous=False,
                 operation="capture_profile_photos",
                 defer_job=True,
             )
+            browser_error: FacebookBrowserError | None = None
             try:
-                result = await self.facebook_anonymous_browser.public_profile_photos(
+                result = await self.facebook_browser.account_profile_photos(
                     str(profile["url"]), progress, diagnostic_key
                 )
+                if isinstance(result, dict):
+                    result.setdefault("source", "logged_in_browser")
+                    result_progress = result.get("progress")
+                    if isinstance(result_progress, dict):
+                        result_progress.setdefault("source", "logged_in_browser")
+                browser_used = True
             except FacebookBrowserChallengeRequired as exc:
                 self._record_browser_challenge(
                     profile,
-                    anonymous=True,
+                    anonymous=False,
                     diagnostic_key=diagnostic_key,
                     error=exc,
                 )
-                now = utcnow()
-                self.db.execute(
-                    """UPDATE profile_photo_captures SET status='source_limited',
-                    checkpoint_json=?,limited_reason=?,next_job_at=NULL,
-                    completed_at=?,updated_at=? WHERE id=?""",
-                    (json.dumps(progress, ensure_ascii=False, sort_keys=True), str(exc), now, now, capture_id),
-                )
-                return "source_limited"
+                browser_error = exc
             except FacebookBrowserLoginRequired as exc:
-                # An anonymous login wall is an honest source limitation, not
-                # permission to switch to the operator's authenticated inventory.
-                now = utcnow()
-                self.db.execute(
-                    """UPDATE profile_photo_captures SET status='source_limited',
-                    checkpoint_json=?,limited_reason=?,next_job_at=NULL,
-                    completed_at=?,updated_at=? WHERE id=?""",
-                    (json.dumps(progress, ensure_ascii=False, sort_keys=True), str(exc), now, now, capture_id),
-                )
-                return "source_limited"
+                browser_error = exc
             except FacebookBrowserError as exc:
-                # This is an independent manual browser feature. Keep its
-                # failure in the dedicated ledger instead of contaminating the
-                # profile's normal monitoring health/failure counters.
-                now = utcnow()
-                self.db.execute(
-                    """UPDATE profile_photo_captures SET status='failed',
-                    checkpoint_json=?,limited_reason=?,next_job_at=NULL,
-                    completed_at=?,updated_at=? WHERE id=?""",
-                    (json.dumps(progress, ensure_ascii=False, sort_keys=True), str(exc), now, now, capture_id),
+                browser_error = exc
+
+            if browser_error is not None:
+                progress.update(
+                    {
+                        "access_scope": "account_visible",
+                        "source": "logged_in_browser",
+                        "browser_fallback_reason": str(browser_error),
+                    }
                 )
-                return "failed"
+                try:
+                    result = await self._capture_profile_photos_actor(
+                        profile, capture, progress
+                    )
+                except BudgetExceeded as exc:
+                    resume = exc.resume_at or self._next_month()
+                    self.db.execute(
+                        """UPDATE profile_photo_captures SET status='budget_paused',
+                        checkpoint_json=?,limited_reason=?,next_job_at=?,
+                        completed_at=NULL,updated_at=? WHERE id=?""",
+                        (
+                            json.dumps(progress, ensure_ascii=False, sort_keys=True),
+                            str(exc),
+                            resume.isoformat(),
+                            utcnow(),
+                            capture_id,
+                        ),
+                    )
+                    raise
+                except (ApifyFrozen, RuntimeError) as actor_exc:
+                    now = utcnow()
+                    reason = (
+                        f"登入瀏覽器：{browser_error}；"
+                        f"Apify 照片後備：{actor_exc}"
+                    )
+                    progress.update(
+                        {
+                            "source": "logged_in_browser+apify_actor",
+                            "actor_fallback_error": str(actor_exc),
+                        }
+                    )
+                    self.db.execute(
+                        """UPDATE profile_photo_captures SET status='source_limited',
+                        checkpoint_json=?,limited_reason=?,next_job_at=NULL,
+                        completed_at=?,updated_at=? WHERE id=?""",
+                        (
+                            json.dumps(progress, ensure_ascii=False, sort_keys=True),
+                            reason,
+                            now,
+                            now,
+                            capture_id,
+                        ),
+                    )
+                    return "source_limited"
 
         if browser_used:
-            self.anonymous_browser_guard.record_success(profile_id)
+            self.browser_guard.record_success(profile_id)
+            candidate_progress = (
+                result.get("progress") if isinstance(result, dict) else None
+            )
+            candidate_progress = (
+                candidate_progress if isinstance(candidate_progress, dict) else progress
+            )
+            browser_stalled = str(
+                result.get("stalled_reason")
+                or candidate_progress.get("stalled_reason")
+                or ""
+            ).strip()
+            browser_resumable = bool(
+                result.get("resumable")
+                or candidate_progress.get("resume_url")
+                or int(candidate_progress.get("pending_count") or 0) > 0
+            )
+            if not bool(result.get("completed")) and browser_stalled and not browser_resumable:
+                progress = candidate_progress
+                progress.update(
+                    {
+                        "access_scope": "account_visible",
+                        "source": "logged_in_browser",
+                        "browser_fallback_reason": browser_stalled,
+                        "fallback_browser_batch_items": [
+                            item
+                            for item in result.get("batch_items") or []
+                            if isinstance(item, dict)
+                        ],
+                    }
+                )
+                # Persist the browser-to-Actor handoff before awaiting any
+                # paid/network operation. Recovery can then replay the exact
+                # successful primary batch after a crash.
+                self.db.execute(
+                    """UPDATE profile_photo_captures SET status='in_progress',
+                    checkpoint_json=?,updated_at=? WHERE id=?""",
+                    (
+                        json.dumps(progress, ensure_ascii=False, sort_keys=True),
+                        utcnow(),
+                        capture_id,
+                    ),
+                )
+                try:
+                    result = await self._capture_profile_photos_actor(
+                        profile, capture, progress
+                    )
+                except BudgetExceeded as exc:
+                    actor_budget_deferred = exc
+                    reason = (
+                        f"登入瀏覽器：{browser_stalled}；"
+                        f"Apify 照片後備：{exc}"
+                    )
+                    progress["actor_fallback_error"] = str(exc)
+                    browser_partial_batch = [
+                        {**item, "_capture_access_scope": "account_visible",
+                         "_capture_collector": "authenticated_facebook_photo_viewer"}
+                        for item in result.get("batch_items") or []
+                        if isinstance(item, dict)
+                    ]
+                    progress.pop("fallback_browser_batch_items", None)
+                    result = {
+                        "items": [
+                            {**item, "_capture_access_scope": "account_visible",
+                             "_capture_collector": "authenticated_facebook_photo_viewer"}
+                            for item in candidate_progress.get("collected_items") or []
+                            if isinstance(item, dict)
+                        ],
+                        "batch_items": browser_partial_batch,
+                        "progress": progress,
+                        "completed": False,
+                        "resumable": False,
+                        "terminal_reason": "",
+                        "stalled_reason": reason,
+                        "access_scope": "account_visible",
+                        "collector": "authenticated_facebook_photo_viewer",
+                    }
+                except (ApifyFrozen, RuntimeError) as actor_exc:
+                    reason = (
+                        f"登入瀏覽器：{browser_stalled}；"
+                        f"Apify 照片後備：{actor_exc}"
+                    )
+                    progress["actor_fallback_error"] = str(actor_exc)
+                    # Preserve the successful surface immediately even when
+                    # the supplemental Actor is unavailable. Returning here
+                    # would discard this job's browser batch and force a risky
+                    # rescan on the next manual attempt.
+                    browser_partial_batch = [
+                        {**item, "_capture_access_scope": "account_visible",
+                         "_capture_collector": "authenticated_facebook_photo_viewer"}
+                        for item in result.get("batch_items") or []
+                        if isinstance(item, dict)
+                    ]
+                    progress.pop("fallback_browser_batch_items", None)
+                    result = {
+                        "items": [
+                            {**item, "_capture_access_scope": "account_visible",
+                             "_capture_collector": "authenticated_facebook_photo_viewer"}
+                            for item in candidate_progress.get("collected_items") or []
+                            if isinstance(item, dict)
+                        ],
+                        "batch_items": browser_partial_batch,
+                        "progress": progress,
+                        "completed": False,
+                        "resumable": False,
+                        "terminal_reason": "",
+                        "stalled_reason": reason,
+                        "access_scope": "account_visible",
+                        "collector": "authenticated_facebook_photo_viewer",
+                    }
         checkpoint = result.get("progress") if isinstance(result, dict) else None
         checkpoint = checkpoint if isinstance(checkpoint, dict) else progress
+        actor_batch_id = int(
+            (result.get("actor_batch_id") if isinstance(result, dict) else 0)
+            or checkpoint.get("actor_batch_id")
+            or 0
+        )
+        actor_batch_ready_to_commit = bool(
+            (result.get("actor_batch_ready_to_commit") if isinstance(result, dict) else True)
+        )
+
+        def commit_actor_batch() -> None:
+            if not actor_batch_id or not actor_batch_ready_to_commit:
+                return
+            current = self.db.row(
+                "SELECT status FROM paid_photo_batches WHERE id=?",
+                (actor_batch_id,),
+            )
+            if current and str(current["status"]) == "imported":
+                self.db.transition_paid_photo_batch(
+                    actor_batch_id,
+                    "committed",
+                    expected_status="imported",
+                    error=None,
+                )
+
         items = result.get("items") if isinstance(result, dict) else []
         items = [item for item in items if isinstance(item, dict)]
         if not items:
@@ -4720,18 +5716,83 @@ class MonitorService:
             photo_id = str(raw.get("id") or raw.get("photo_id") or "").strip()
             if not image_url:
                 return None
-            return {
+            item = {
                 "photoId": photo_id
                 or content_hash(source_url or normalize_url(image_url))[:24],
                 "url": source_url or str(profile["url"]),
                 "image": {"url": image_url},
             }
+            caption = str(raw.get("caption") or raw.get("text") or "").strip()
+            timestamp = raw.get("timestamp") or raw.get("publishedAt")
+            if caption:
+                item["caption"] = caption
+            if timestamp not in (None, ""):
+                item["timestamp"] = timestamp
+            return item
 
-        expected_external_ids = {
+        def capture_item_scope(raw: dict[str, Any]) -> tuple[str, str]:
+            scope = str(
+                raw.get("_capture_access_scope")
+                or result.get("access_scope")
+                or checkpoint.get("access_scope")
+                or "unknown"
+            )
+            collector = str(
+                raw.get("_capture_collector")
+                or result.get("collector")
+                or checkpoint.get("collector")
+                or ""
+            )
+            return scope, collector
+
+        # The same Facebook photo may be represented differently by the
+        # signed-in browser and the Actor.  De-duplicate on the actual entity
+        # external ID (not raw URL/shape), always retaining the browser row.
+        browser_batch_external_ids = {
             external_id(photo_item, "photo")
-            for raw in items
-            if (photo_item := photo_payload(raw)) is not None
+            for raw in batch_items
+            if capture_item_scope(raw)[0] == "account_visible"
+            and (photo_item := photo_payload(raw)) is not None
         }
+        batch_items = [
+            raw
+            for raw in batch_items
+            if not (
+                capture_item_scope(raw)[0] == "actor_visible"
+                and (photo_item := photo_payload(raw)) is not None
+                and external_id(photo_item, "photo") in browser_batch_external_ids
+            )
+        ]
+        bounded_batch: dict[str, dict[str, Any]] = {}
+        for raw in batch_items:
+            photo_item = photo_payload(raw)
+            if photo_item is None:
+                continue
+            item_id = external_id(photo_item, "photo")
+            if item_id not in bounded_batch:
+                bounded_batch[item_id] = raw
+            if len(bounded_batch) >= 20:
+                break
+        batch_items = list(bounded_batch.values())
+
+        account_expected_external_ids: set[str] = set()
+        actor_expected_external_ids: set[str] = set()
+        for raw in items:
+            photo_item = photo_payload(raw)
+            if photo_item is None:
+                continue
+            item_id = external_id(photo_item, "photo")
+            item_scope, item_collector = capture_item_scope(raw)
+            if (
+                item_scope == "actor_visible"
+                or item_collector == "apify_profile_photo_actor"
+            ):
+                actor_expected_external_ids.add(item_id)
+            else:
+                account_expected_external_ids.add(item_id)
+        expected_external_ids = (
+            account_expected_external_ids | actor_expected_external_ids
+        )
 
         def ready_photo_external_ids() -> set[str]:
             """Return photos whose current media is both ready and on disk."""
@@ -4801,31 +5862,52 @@ class MonitorService:
         # or low-disk failure.
         if bool(result.get("completed")):
             ready_before = ready_photo_external_ids()
-            queued_ids = {
-                external_id(photo_item, "photo")
-                for raw in batch_items
-                if (photo_item := photo_payload(raw)) is not None
-            }
-            for raw in items:
+            pending_batch: dict[str, dict[str, Any]] = {}
+            for raw in [*batch_items, *items]:
                 photo_item = photo_payload(raw)
                 if photo_item is None:
                     continue
                 item_id = external_id(photo_item, "photo")
-                if item_id in ready_before or item_id in queued_ids:
+                if item_id in ready_before or item_id in pending_batch:
                     continue
-                batch_items.append(raw)
-                queued_ids.add(item_id)
-                if len(batch_items) >= 20:
+                pending_batch[item_id] = raw
+                if len(pending_batch) >= 20:
                     break
+            batch_items = list(pending_batch.values())
 
-        had_prior_complete = bool(
-            self.db.row(
-                """SELECT 1 FROM profile_photo_captures
-                WHERE profile_id=? AND id<>? AND status='complete'
-                LIMIT 1""",
-                (profile_id, capture_id),
-            )
+        current_viewer_scope_hash = str(
+            checkpoint.get("viewer_scope_hash") or ""
         )
+        viewer_scope_changed = bool(checkpoint.get("viewer_scope_changed"))
+        prior_complete_rows = self.db.rows(
+            """SELECT terminal_evidence_json FROM profile_photo_captures
+            WHERE profile_id=? AND id<>? AND status='complete'
+            ORDER BY generation DESC,id DESC""",
+            (profile_id, capture_id),
+        )
+        if current_viewer_scope_hash:
+            had_prior_complete = False
+            for prior in prior_complete_rows:
+                try:
+                    prior_evidence = json.loads(
+                        prior.get("terminal_evidence_json") or "{}"
+                    )
+                except (TypeError, json.JSONDecodeError):
+                    prior_evidence = {}
+                if (
+                    isinstance(prior_evidence, dict)
+                    and prior_evidence.get("viewer_scope_hash")
+                    == current_viewer_scope_hash
+                ):
+                    had_prior_complete = True
+                    break
+        else:
+            # Compatibility for isolated test doubles and captures completed
+            # before viewer-scope hashing existed. Real signed-in runs always
+            # provide a hash.
+            had_prior_complete = bool(prior_complete_rows)
+        if viewer_scope_changed:
+            had_prior_complete = False
         raw_classifications = checkpoint.get("photo_classifications") or {}
         classifications: dict[str, str] = (
             {
@@ -4850,22 +5932,141 @@ class MonitorService:
             str(value)
             for value in checkpoint.get("notified_photo_external_ids") or []
         }
+
+        def observed_during_capture(value: Any) -> bool:
+            if not value or not capture.get("created_at"):
+                return False
+            try:
+                observed = datetime.fromisoformat(str(value))
+                started = datetime.fromisoformat(str(capture["created_at"]))
+            except ValueError:
+                return str(value) >= str(capture["created_at"])
+            if observed.tzinfo is None:
+                observed = observed.replace(tzinfo=UTC)
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=UTC)
+            return observed >= started
+
+        # A completed-inventory retry intentionally drops already-ready rows
+        # from ``batch_items``. Recover notification candidacy from the full
+        # durable inventory before that optimization can hide a row committed
+        # immediately before a crash.
+        for raw in items:
+            photo_item = photo_payload(raw)
+            if photo_item is None:
+                continue
+            ext_id = external_id(photo_item, "photo")
+            if (
+                ext_id in classifications
+                or ext_id in notification_candidates
+                or ext_id in notified_external_ids
+            ):
+                continue
+            persisted = self.db.row(
+                """SELECT e.first_seen_at,v.seen_at current_version_seen_at
+                FROM entities e LEFT JOIN versions v ON v.id=e.current_version_id
+                WHERE e.profile_id=? AND e.kind='photo' AND e.external_id=?""",
+                (profile_id, ext_id),
+            )
+            if not persisted:
+                continue
+            if observed_during_capture(persisted.get("first_seen_at")):
+                notification_candidates[ext_id] = "new"
+            elif observed_during_capture(
+                persisted.get("current_version_seen_at")
+            ):
+                notification_candidates[ext_id] = "updated"
+
         for raw in batch_items:
             photo_item = photo_payload(raw)
             if photo_item is None:
                 continue
             ext_id = external_id(photo_item, "photo")
+            item_scope, item_collector = capture_item_scope(raw)
             existing = self.db.row(
-                "SELECT id,current_hash FROM entities WHERE profile_id=? AND kind='photo' AND external_id=?",
+                """SELECT e.id,e.current_hash,e.source_scope,e.source_collector,
+                e.first_seen_at,v.seen_at current_version_seen_at
+                FROM entities e LEFT JOIN versions v ON v.id=e.current_version_id
+                WHERE e.profile_id=? AND e.kind='photo' AND e.external_id=?""",
                 (profile_id, ext_id),
             )
+            is_actor_item = bool(
+                item_scope == "actor_visible"
+                or item_collector == "apify_profile_photo_actor"
+            )
+            if is_actor_item:
+                actor_expected_external_ids.add(ext_id)
+            else:
+                account_expected_external_ids.add(ext_id)
+            expected_external_ids.add(ext_id)
+            if (
+                is_actor_item
+                and existing
+                and str(existing.get("source_scope") or "") == "account_visible"
+            ):
+                # Supplemental Actor data must never replace the current
+                # signed-in browser version or its provenance.
+                classifications.setdefault(ext_id, "duplicate")
+                continue
             entity_id, persisted_id, changed = await self.ingester.ingest(
                 profile_id, "photo", photo_item, notify=False
             )
+            item_run_id = str(
+                raw.get("_capture_run_id")
+                or checkpoint.get("actor_run_id")
+                or ""
+            )
+            self.db.execute(
+                """UPDATE entities SET
+                source_scope=CASE
+                  WHEN ?='account_visible' THEN 'account_visible'
+                  WHEN source_scope='account_visible' THEN source_scope
+                  ELSE ? END,
+                source_collector=CASE
+                  WHEN ?='account_visible' OR source_scope<>'account_visible'
+                    OR source_scope IS NULL THEN ? ELSE source_collector END,
+                source_run_id=CASE
+                  WHEN ?='account_visible' OR source_scope<>'account_visible'
+                    OR source_scope IS NULL THEN NULLIF(?,'') ELSE source_run_id END
+                WHERE id=?""",
+                (
+                    item_scope, item_scope,
+                    item_scope, item_collector,
+                    item_scope, item_run_id,
+                    entity_id,
+                ),
+            )
+            if item_scope == "account_visible" and current_viewer_scope_hash:
+                # Visibility provenance belongs to the authenticated browser
+                # account that produced this inventory. Supplemental Actor
+                # rows intentionally never write or replace this value.
+                self.db.execute(
+                    "UPDATE entities SET source_viewer_scope_hash=? WHERE id=?",
+                    (current_viewer_scope_hash, entity_id),
+                )
             expected_external_ids.add(persisted_id)
             change_class = (
                 "new" if not existing else "updated" if changed else None
             )
+            if (
+                change_class is None
+                and existing
+                and ext_id not in classifications
+                and ext_id not in notification_candidates
+                and ext_id not in notified_external_ids
+            ):
+                # Crash recovery: ingest(notify=False) commits the entity and
+                # version before this capture checkpoint is written. On replay
+                # an unchanged entity would otherwise lose its notification
+                # candidacy forever. Creation/version timestamps tie the row
+                # back to this generation; notify_persisted remains the final
+                # idempotency gate if the crash happened after notification.
+                if observed_during_capture(existing.get("first_seen_at")):
+                    change_class = "new"
+                elif observed_during_capture(
+                    existing.get("current_version_seen_at")
+                ):
+                    change_class = "updated"
             if change_class:
                 notification_candidates[ext_id] = change_class
             elif ext_id not in notification_candidates:
@@ -4930,6 +6131,59 @@ class MonitorService:
                 self.ingester.notify_persisted(entity_id)
                 notified_external_ids.add(ext_id)
 
+        if actor_batch_id:
+            processed_actor_ids = {
+                str(value)
+                for value in checkpoint.get("actor_processed_item_ids") or []
+                if str(value)
+            }
+            actor_candidate_ids = {
+                str(value)
+                for value in result.get("actor_batch_candidate_ids") or []
+                if str(value)
+            }
+            actor_page_ids = {
+                str(value)
+                for value in result.get("actor_page_item_ids") or []
+                if str(value)
+            }
+            ready_after_ingest = ready_photo_external_ids()
+            processed_actor_ids.update(actor_candidate_ids & ready_after_ingest)
+            checkpoint["actor_processed_item_ids"] = sorted(processed_actor_ids)
+            actor_page_pending_ids = actor_page_ids - processed_actor_ids
+            browser_handoff_pending = bool(
+                checkpoint.get("fallback_browser_batch_items")
+            )
+            actor_batch_ready_to_commit = not (
+                actor_page_pending_ids or browser_handoff_pending
+            )
+            provider_resumable = bool(result.get("actor_provider_resumable"))
+            provider_completed = bool(
+                result.get("actor_provider_inventory_completed")
+            )
+            if actor_page_pending_ids or browser_handoff_pending:
+                result["resumable"] = True
+                result["stalled_reason"] = ""
+                checkpoint["actor_inventory_completed"] = False
+            elif provider_resumable:
+                result["resumable"] = True
+                result["stalled_reason"] = ""
+                checkpoint["actor_inventory_completed"] = False
+            elif provider_completed:
+                result["resumable"] = False
+                result["stalled_reason"] = (
+                    "Apify 已完成 Actor 可見範圍的補抓，"
+                    "但無法證明登入帳號可見清冊完整"
+                )
+                checkpoint["actor_inventory_completed"] = True
+            else:
+                result["resumable"] = False
+                result["stalled_reason"] = str(
+                    result.get("actor_provider_stalled_reason")
+                    or "照片 Actor 未提供可驗證的完整終點"
+                )
+                checkpoint["actor_inventory_completed"] = False
+
         checkpoint["photo_classifications"] = classifications
         if notification_candidates:
             checkpoint["photo_notification_candidates"] = notification_candidates
@@ -4958,19 +6212,65 @@ class MonitorService:
             int(checkpoint.get("processed_count") or 0),
             len(processed_values) if isinstance(processed_values, list) else 0,
         )
-        seen_count = max(len(expected_external_ids), declared_total, discovered_count)
+        actor_discovered_values = checkpoint.get("actor_discovered_urls") or []
+        actor_discovered_count = max(
+            int(checkpoint.get("actor_discovered_count") or 0),
+            len(actor_discovered_values)
+            if isinstance(actor_discovered_values, list)
+            else 0,
+        )
+        account_seen_count = max(
+            0
+            if viewer_scope_changed
+            else int(checkpoint.get("account_seen_count") or 0),
+            len(account_expected_external_ids),
+            declared_total,
+            discovered_count,
+        )
+        actor_seen_count = max(
+            int(checkpoint.get("actor_seen_count") or 0),
+            len(actor_expected_external_ids),
+            int(checkpoint.get("actor_declared_total") or 0),
+            actor_discovered_count,
+        )
+        checkpoint["account_seen_count"] = account_seen_count
+        checkpoint["actor_seen_count"] = actor_seen_count
         ready_external_ids = ready_photo_external_ids()
-        # Completion is scoped to the identities listed by this Photos-page
-        # checkpoint. Other old ready photo entities must not mask a failed
-        # download in the current inventory.
-        ready_count = len(expected_external_ids & ready_external_ids)
-        previous_seen = int(capture.get("seen_count") or 0)
-        total_seen = max(previous_seen, seen_count)
+        # Completion is scoped only to the signed-in browser inventory. Actor
+        # rows remain archived as supplemental entities, but they cannot raise
+        # the account-visible completion threshold or participate in absence
+        # reconciliation.
+        ready_count = len(account_expected_external_ids & ready_external_ids)
+        # A different Facebook viewer account defines a different visibility
+        # scope.  The browser deliberately starts a fresh inventory in that
+        # case, so counts from the previous scope must not keep the new
+        # generation permanently below its completion threshold.
+        total_seen = account_seen_count
         # Classification is checkpoint-derived and replay safe; continuation
         # jobs must not add the same photo to the counters again.
         total_new = new_count
         total_updated = updated_count
         total_duplicates = duplicate_count
+        if actor_budget_deferred is not None:
+            resume = actor_budget_deferred.resume_at or self._next_month()
+            self.db.execute(
+                """UPDATE profile_photo_captures SET status='budget_paused',
+                checkpoint_json=?,seen_count=?,new_count=?,updated_count=?,
+                duplicate_count=?,limited_reason=?,next_job_at=?,
+                completed_at=NULL,updated_at=? WHERE id=?""",
+                (
+                    json.dumps(checkpoint, ensure_ascii=False, sort_keys=True),
+                    total_seen,
+                    total_new,
+                    total_updated,
+                    total_duplicates,
+                    str(actor_budget_deferred),
+                    resume.isoformat(),
+                    utcnow(),
+                    capture_id,
+                ),
+            )
+            raise actor_budget_deferred
         checkpoint_json = json.dumps(checkpoint, ensure_ascii=False, sort_keys=True)
         collector_completed = bool(result.get("completed"))
         grid_terminal = bool(checkpoint.get("grid_complete")) and (
@@ -4987,8 +6287,15 @@ class MonitorService:
             checkpoint.pop("media_retry_until", None)
             checkpoint_json = json.dumps(checkpoint, ensure_ascii=False, sort_keys=True)
             terminal_evidence = {
-                "collector": "anonymous_facebook_photo_viewer",
-                "auth_scope": AuthScope.ANONYMOUS.value,
+                "collector": checkpoint.get("collector")
+                or "authenticated_facebook_photo_viewer",
+                "auth_scope": checkpoint.get("access_scope") or "account_visible",
+                "access_scope": checkpoint.get("access_scope") or "account_visible",
+                "source": checkpoint.get("source") or "logged_in_browser",
+                "actor_id": checkpoint.get("actor_id"),
+                "actor_run_id": checkpoint.get("actor_run_id"),
+                "viewer_scope_hash": current_viewer_scope_hash or None,
+                "viewer_scope_changed": viewer_scope_changed,
                 "terminal_reason": terminal_reason,
                 "declared_total": checkpoint.get("declared_total"),
                 "seen_count": total_seen,
@@ -5008,24 +6315,28 @@ class MonitorService:
                     now, now, capture_id,
                 ),
             )
+            commit_actor_batch()
             # Persist the generation terminal marker before advancing absence
             # counters. If the process is interrupted during reconciliation,
             # this same successful inventory cannot be replayed as a second
             # missing observation and falsely remove an old photo.
-            self.ingester.reconcile(
-                profile_id,
-                "photo",
-                expected_external_ids,
-                None,
-                notify=had_prior_complete,
-            )
+            if current_viewer_scope_hash or not viewer_scope_changed:
+                self.ingester.reconcile(
+                    profile_id,
+                    "photo",
+                    account_expected_external_ids,
+                    None,
+                    notify=had_prior_complete,
+                    source_scope="account_visible",
+                    source_viewer_scope_hash=current_viewer_scope_hash or None,
+                )
             display = profile.get("display_name") or profile.get("name") or "Facebook"
             self.db.add_event(
-                f"public-photo-capture:{capture_id}:complete",
-                "public_photo_capture_complete",
+                f"account-photo-capture:{capture_id}:complete",
+                "account_photo_capture_complete",
                 {
-                    "title": f"{display} 公開照片回溯完成",
-                    "text": f"已辨識 {total_seen} 張公開照片；新增 {total_new} 張。",
+                    "title": f"{display} 帳號可見照片回溯完成",
+                    "text": f"已辨識 {total_seen} 張帳號可見照片；新增 {total_new} 張。",
                     "source_url": profile["url"],
                 },
                 profile_id,
@@ -5038,8 +6349,13 @@ class MonitorService:
         if collector_completed and not inventory_terminal:
             stalled_reason = "照片網格缺少完整終點證據"
         elif completed and ready_count < total_seen:
-            pending_media_ids = sorted(expected_external_ids - ready_external_ids)
-            if total_seen > len(expected_external_ids) and not pending_media_ids:
+            pending_media_ids = sorted(
+                account_expected_external_ids - ready_external_ids
+            )
+            if (
+                total_seen > len(account_expected_external_ids)
+                and not pending_media_ids
+            ):
                 # The grid declared/discovered more identities than the
                 # collector could resolve into photo items. Retrying media for
                 # 30 days cannot repair a missing permalink, so stop honestly
@@ -5099,12 +6415,13 @@ class MonitorService:
                     available.isoformat(), utcnow(), capture_id,
                 ),
             )
+            commit_actor_batch()
             self.db.queue_unique_job(
                 profile_id=profile_id,
                 job_type="capture_profile_photos",
                 priority=-120,
                 dedupe_key=(
-                    f"capture-public-photos:{capture_id}:{next_iteration}"
+                    f"capture-account-photos:{capture_id}:{next_iteration}"
                 ),
                 payload={
                     "photo_capture_id": capture_id,
@@ -5115,12 +6432,17 @@ class MonitorService:
             )
             return
 
-        reason = stalled_reason or "公開相片頁未提供可驗證的終點或續抓游標"
+        reason = stalled_reason or "帳號可見相片頁未提供可驗證的終點或續抓游標"
         now = utcnow()
         checkpoint_json = json.dumps(checkpoint, ensure_ascii=False, sort_keys=True)
         terminal_evidence = {
-            "collector": "anonymous_facebook_photo_viewer",
-            "auth_scope": AuthScope.ANONYMOUS.value,
+            "collector": checkpoint.get("collector")
+            or "authenticated_facebook_photo_viewer",
+            "auth_scope": checkpoint.get("access_scope") or "account_visible",
+            "access_scope": checkpoint.get("access_scope") or "account_visible",
+            "source": checkpoint.get("source") or "logged_in_browser",
+            "actor_id": checkpoint.get("actor_id"),
+            "actor_run_id": checkpoint.get("actor_run_id"),
             "terminal_reason": terminal_reason,
             "stalled_reason": reason,
             "seen_count": total_seen,
@@ -5138,6 +6460,7 @@ class MonitorService:
                 reason, now, now, capture_id,
             ),
         )
+        commit_actor_batch()
         return "source_limited"
 
     async def browser_visit_profile(self, profile_id: int) -> None:
