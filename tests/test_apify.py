@@ -113,6 +113,27 @@ def test_capture_gateway_persists_identifiers_before_waiting_and_keeps_charge_ca
     assert result.charged_usd == 0.0123
 
 
+def test_capture_gateway_preserves_full_decimal_charge_ceiling():
+    gateway = ApifyGateway("")
+    gateway.client = FakeCaptureClient()
+
+    gateway._start_sync(
+        "example/posts", {"maxPostsPerProfile": 5}, 5 * 0.00499
+    )
+
+    assert gateway.client.actor_client.kwargs["max_total_charge_usd"] == Decimal(
+        "0.02495"
+    )
+
+
+def test_capture_gateway_never_omits_an_explicit_zero_charge_ceiling():
+    gateway = ApifyGateway("")
+    gateway.client = FakeCaptureClient()
+
+    with pytest.raises(ValueError, match="正規化後為零"):
+        gateway._start_sync("example/posts", {}, 0)
+
+
 def test_finish_exposes_known_terminal_status_and_charge():
     gateway = ApifyGateway("")
 
@@ -135,3 +156,27 @@ def test_finish_exposes_known_terminal_status_and_charge():
     assert raised.value.run_id == "failed-run"
     assert raised.value.status == "FAILED"
     assert raised.value.charged_usd == pytest.approx(0.027)
+
+
+@pytest.mark.parametrize("status", ["FAILED", "TIMED-OUT"])
+def test_finish_preserves_explicit_zero_terminal_charge(status: str):
+    gateway = ApifyGateway("")
+
+    class ZeroChargeRun:
+        def wait_for_finish(self, wait_secs):
+            return {
+                "status": status,
+                "statusMessage": "terminal without charge",
+                "usageTotalUsd": 0.0,
+            }
+
+    class ZeroChargeClient:
+        def run(self, run_id):
+            return ZeroChargeRun()
+
+    gateway.client = ZeroChargeClient()
+    with pytest.raises(ActorRunTerminalError) as raised:
+        gateway._finish_sync(StartedActor("zero-run", "data", "store"), 10)
+
+    assert raised.value.status == status
+    assert raised.value.charged_usd == 0.0

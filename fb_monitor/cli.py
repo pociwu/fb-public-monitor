@@ -55,6 +55,33 @@ def main() -> None:
     )
     reconcile_photo.add_argument("--dataset-id", default="")
     reconcile_photo.add_argument("--key-value-store-id", default="")
+    reconcile_source = sub.add_parser(
+        "reconcile-source-batch",
+        help="人工對帳一筆 needs_reconcile Capture V2 貼文批次",
+    )
+    reconcile_source.add_argument("batch_id", type=int)
+    source_resolution = reconcile_source.add_mutually_exclusive_group(required=True)
+    source_resolution.add_argument("--run-id", help="Apify 已啟動的 run ID")
+    source_resolution.add_argument(
+        "--confirm-not-launched",
+        action="store_true",
+        help="確認 provider 未啟動；封存舊 identity 並建立安全重試批次",
+    )
+    reconcile_source.add_argument("--dataset-id", default="")
+    reconcile_source.add_argument("--key-value-store-id", default="")
+    reconcile_contract = sub.add_parser(
+        "reconcile-contract-run",
+        help="人工對帳一筆 needs_reconcile Capture V2 契約測試 run",
+    )
+    reconcile_contract.add_argument("run_row_id", type=int)
+    contract_resolution = reconcile_contract.add_mutually_exclusive_group(required=True)
+    contract_resolution.add_argument("--run-id", help="Apify 已啟動的 run ID")
+    contract_resolution.add_argument(
+        "--confirm-not-launched",
+        action="store_true",
+        help="確認 provider 未啟動；保留失敗稽核並在 grant 有效時安全重試",
+    )
+    reconcile_contract.add_argument("--dataset-id", default="")
     sub.add_parser("status")
     args = parser.parse_args()
     settings = load_settings(args.config)
@@ -109,43 +136,6 @@ def main() -> None:
             )
         except (RuntimeError, ValueError) as exc:
             raise SystemExit(str(exc)) from exc
-        capture = db.row(
-            "SELECT * FROM profile_photo_captures WHERE id=?",
-            (batch["photo_capture_id"],),
-        )
-        if not capture:
-            raise SystemExit("找不到照片回溯狀態")
-        try:
-            checkpoint = json.loads(capture.get("checkpoint_json") or "{}")
-        except (TypeError, json.JSONDecodeError):
-            checkpoint = {}
-        checkpoint = checkpoint if isinstance(checkpoint, dict) else {}
-        if batch["status"] == "failed":
-            checkpoint["actor_retry_nonce"] = int(
-                checkpoint.get("actor_retry_nonce") or 0
-            ) + 1
-        now = datetime.now(UTC).isoformat()
-        db.execute(
-            """UPDATE profile_photo_captures SET status='in_progress',
-            checkpoint_json=?,limited_reason=NULL,next_job_at=?,completed_at=NULL,
-            updated_at=? WHERE id=?""",
-            (
-                json.dumps(checkpoint, ensure_ascii=False, sort_keys=True),
-                now, now, capture["id"],
-            ),
-        )
-        db.queue_unique_job(
-            profile_id=int(batch["profile_id"]),
-            job_type="capture_profile_photos",
-            priority=-120,
-            dedupe_key=f"capture-account-photos:{capture['id']}:reconcile:{batch['id']}",
-            payload={
-                "photo_capture_id": int(capture["id"]),
-                "iteration": int(checkpoint.get("capture_iteration") or 0),
-                "manual": True,
-            },
-            available_at=now,
-        )
         print(
             json.dumps(
                 {
@@ -159,6 +149,72 @@ def main() -> None:
                             "已放棄無法匯入的舊 raw；稽核證據保留，已排入切換後的安全重試"
                             if args.abandon_import_failed
                             else "已確認未啟動；舊 request 保留，已排入新的安全重試 identity"
+                        )
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    elif args.command == "reconcile-source-batch":
+        try:
+            batch = db.reconcile_paid_source_batch(
+                args.batch_id,
+                run_id=args.run_id,
+                dataset_id=args.dataset_id,
+                key_value_store_id=args.key_value_store_id,
+                confirm_not_launched=args.confirm_not_launched,
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+        resume_batch_id = int(batch.get("resume_batch_id") or batch["id"])
+        resume_batch = db.row(
+            "SELECT * FROM paid_source_batches WHERE id=?", (resume_batch_id,)
+        )
+        if not resume_batch:
+            raise SystemExit("找不到可恢復的 Capture V2 貼文批次")
+        print(
+            json.dumps(
+                {
+                    "batch_id": batch["id"],
+                    "resume_batch_id": resume_batch_id,
+                    "status": batch["status"],
+                    "run_id": batch.get("run_id"),
+                    "message": (
+                        "已連回既有 Apify run；後續只會 finish 與匯入，不會重新購買"
+                        if batch["status"] == "run_started"
+                        else "已確認未啟動；舊 identity 已封存並排入新的安全重試"
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    elif args.command == "reconcile-contract-run":
+        try:
+            run = db.reconcile_contract_run(
+                args.run_row_id,
+                run_id=args.run_id,
+                dataset_id=args.dataset_id,
+                confirm_not_launched=args.confirm_not_launched,
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+        print(
+            json.dumps(
+                {
+                    "run_row_id": run["id"],
+                    "replacement_run_row_id": run.get("replacement_run_row_id"),
+                    "status": run["status"],
+                    "run_id": run.get("run_id"),
+                    "job_requeued": bool(run.get("job_requeued")),
+                    "message": (
+                        "已連回既有 Apify run；即使 grant 到期也只會完成該 run"
+                        if run["status"] == "run_started"
+                        else (
+                            "已確認未啟動；舊 identity 已封存並建立安全重試"
+                            if run.get("replacement_run_row_id")
+                            else "已確認未啟動；grant 已失效，請核准新輪次"
                         )
                     ),
                 },
@@ -213,6 +269,12 @@ def main() -> None:
             imported_at,committed_at,updated_at,error
             FROM paid_photo_batches ORDER BY id DESC LIMIT 20"""
         )
+        contract_runs = db.rows(
+            """SELECT cr.id,cr.contract_id,cr.test_case,cr.status,cr.run_id,
+            cr.dataset_id,cr.charged_usd,cr.authorized_max_usd,
+            cr.grant_allocation_id,cr.started_at,cr.finished_at,cr.error
+            FROM contract_runs cr ORDER BY cr.id DESC LIMIT 20"""
+        )
         print(json.dumps({
             "capture_v2": {
                 "enabled": settings.capture_v2_enabled,
@@ -223,6 +285,7 @@ def main() -> None:
                 "recent_paid_batches": batches,
                 "recent_paid_access_probes": access_probes,
                 "recent_paid_photo_batches": photo_batches,
+                "recent_contract_runs": contract_runs,
             },
             "profiles": profiles,
             "serpapi_usage": db.serpapi_usage_snapshot(),

@@ -21,7 +21,7 @@ def _capture_v2_test_app(tmp_path: Path, monkeypatch, *, enabled: bool = True):
 storage:
   data_dir: data
 actors:
-  posts_v2_primary: example/posts-primary
+  posts_v2_primary: spbotdel/facebook-profile-posts-all-photos-scraper
   posts_v2_fallback: example/posts-fallback
   posts_input:
     startUrls: "{urls}"
@@ -485,11 +485,12 @@ def test_dashboard_queues_one_public_photo_capture_and_rejects_cross_site(
     )
     monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
     monkeypatch.setenv("FACEBOOK_BROWSER_ENABLED", "1")
+    monkeypatch.setenv("APIFY_TOKEN", "test-token")
     app = create_app(load_settings(config))
-    calls: list[int] = []
+    calls: list[tuple[int, str]] = []
 
-    def queue_public_photo_capture(profile_id: int):
-        calls.append(profile_id)
+    def queue_public_photo_capture(profile_id: int, *, source_policy: str = "auto"):
+        calls.append((profile_id, source_policy))
         return len(calls) == 1, {"status": "pending"}
 
     monkeypatch.setattr(
@@ -507,21 +508,30 @@ def test_dashboard_queues_one_public_photo_capture_and_rejects_cross_site(
             follow_redirects=False,
         )
         missing = client.post("/profiles/999/capture-photos", follow_redirects=False)
-        queued = client.post("/profiles/1/capture-photos", follow_redirects=False)
-        repeated = client.post("/profiles/1/capture-photos", follow_redirects=False)
+        queued = client.post(
+            "/profiles/1/capture-photos",
+            data={"source_policy": "apify"},
+            follow_redirects=False,
+        )
+        repeated = client.post(
+            "/profiles/1/capture-photos",
+            data={"source_policy": "account"},
+            follow_redirects=False,
+        )
 
     assert dashboard.status_code == 200
     assert 'action="/profiles/1/capture-photos"' in dashboard.text
     assert "擷取全部照片" in dashboard.text
-    assert "登入帳號可見的所有照片" in dashboard.text
+    assert 'name="source_policy"' in dashboard.text
+    assert "僅 Apify 公開照片" in dashboard.text
     assert rejected.status_code == 403
     assert missing.status_code == 404
     assert queued.status_code == 303 and "notice=" in queued.headers["location"]
     assert repeated.status_code == 303 and "error=" in repeated.headers["location"]
-    assert calls == [1, 1]
+    assert calls == [(1, "apify"), (1, "account")]
 
 
-def test_public_photo_capture_requires_browser_and_photo_tab_previews_downloads(
+def test_account_photo_capture_requires_browser_but_apify_policy_and_previews_work(
     tmp_path: Path, monkeypatch
 ):
     config = tmp_path / "config.yaml"
@@ -531,6 +541,7 @@ def test_public_photo_capture_requires_browser_and_photo_tab_previews_downloads(
     )
     monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
     monkeypatch.setenv("FACEBOOK_BROWSER_ENABLED", "0")
+    monkeypatch.setenv("APIFY_TOKEN", "test-token")
     app = create_app(load_settings(config))
     db = app.state.db
     image_path = app.state.settings.data_dir / "media" / "public-photo.jpg"
@@ -569,23 +580,152 @@ def test_public_photo_capture_requires_browser_and_photo_tab_previews_downloads(
             now,
         ),
     )
+    queued_policies: list[str] = []
+
+    def queue_public_photo_capture(profile_id: int, *, source_policy: str = "auto"):
+        assert profile_id == 1
+        queued_policies.append(source_policy)
+        return True, {"status": "pending"}
+
+    monkeypatch.setattr(
+        app.state.service,
+        "queue_public_photo_capture",
+        queue_public_photo_capture,
+        raising=False,
+    )
 
     with TestClient(app) as client:
         dashboard = client.get("/")
-        disabled = client.post("/profiles/1/capture-photos", follow_redirects=False)
+        disabled = client.post(
+            "/profiles/1/capture-photos",
+            data={"source_policy": "account"},
+            follow_redirects=False,
+        )
+        apify = client.post(
+            "/profiles/1/capture-photos",
+            data={"source_policy": "apify"},
+            follow_redirects=False,
+        )
         photos = client.get("/profiles/1?kind=photo")
 
     assert dashboard.status_code == 200
     assert "1 張照片" in dashboard.text
     assert "範圍：登入帳號可見" in dashboard.text
     assert "來源：登入 Chromium" in dashboard.text
-    assert "照片擷取未啟用" in dashboard.text
+    assert "僅 Apify 公開照片" in dashboard.text
     assert f'data-lightbox-src="/media/{media_id}"' in dashboard.text
     assert disabled.status_code == 303 and "error=" in disabled.headers["location"]
+    assert apify.status_code == 303 and "notice=" in apify.headers["location"]
+    assert queued_policies == ["apify"]
     assert photos.status_code == 200
     assert "公開相片一" in photos.text
     assert f'data-lightbox-src="/media/{media_id}"' in photos.text
     assert f'data-download="/media/{media_id}?download=true"' in photos.text
+
+
+def test_photo_capture_sources_respect_token_freeze_and_available_auto_source(
+    tmp_path: Path, monkeypatch
+):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("FACEBOOK_BROWSER_ENABLED", "1")
+    monkeypatch.delenv("APIFY_TOKEN", raising=False)
+    app = create_app(load_settings(config))
+    calls: list[tuple[int, str]] = []
+
+    def queue_public_photo_capture(profile_id: int, *, source_policy: str = "auto"):
+        calls.append((profile_id, source_policy))
+        return True, {"status": "pending"}
+
+    monkeypatch.setattr(
+        app.state.service,
+        "queue_public_photo_capture",
+        queue_public_photo_capture,
+        raising=False,
+    )
+
+    with TestClient(app) as client:
+        token_missing = client.get("/")
+        blocked_apify = client.post(
+            "/profiles/1/capture-photos",
+            data={"source_policy": "apify"},
+            follow_redirects=False,
+        )
+        browser_auto = client.post(
+            "/profiles/1/capture-photos",
+            data={"source_policy": "auto"},
+            follow_redirects=False,
+        )
+
+        app.state.db.set_profile_source_control(1, "apify", frozen=True, reason="test")
+        app.state.settings.facebook_browser_enabled = False
+        no_sources = client.get("/")
+        no_sources_profile = client.get("/profiles/1")
+        blocked_auto = client.post(
+            "/profiles/1/capture-photos",
+            data={"source_policy": "auto"},
+            follow_redirects=False,
+        )
+        blocked_frozen_apify = client.post(
+            "/profiles/1/capture-photos",
+            data={"source_policy": "apify"},
+            follow_redirects=False,
+        )
+
+    assert "自動：僅登入可用" in token_missing.text
+    assert "僅 Apify 公開照片（APIFY_TOKEN 未設定）" in token_missing.text
+    assert blocked_apify.status_code == 303 and "error=" in blocked_apify.headers["location"]
+    assert browser_auto.status_code == 303 and "notice=" in browser_auto.headers["location"]
+    assert "自動：無可用來源" in no_sources.text
+    assert "僅 Apify 公開照片（Apify 已凍結）" in no_sources.text
+    assert "自動：無可用來源" in no_sources_profile.text
+    assert "僅 Apify 公開照片（Apify 已凍結）" in no_sources_profile.text
+    assert blocked_auto.status_code == 303 and "error=" in blocked_auto.headers["location"]
+    assert blocked_frozen_apify.status_code == 303 and "error=" in blocked_frozen_apify.headers["location"]
+    assert calls == [(1, "auto")]
+
+
+def test_pending_photo_capture_displays_requested_source_policy(
+    tmp_path: Path, monkeypatch
+):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("APIFY_TOKEN", "test-token")
+    app = create_app(load_settings(config))
+    now = "2026-09-04T00:00:00+00:00"
+    capture_id = app.state.db.execute(
+        """INSERT INTO profile_photo_captures(
+        profile_id,generation,status,checkpoint_json,terminal_evidence_json,
+        created_at,updated_at
+        ) VALUES(1,1,'pending',?,'{}',?,?)""",
+        ('{"source_policy":"auto"}', now, now),
+    )
+    app.state.db.queue_unique_job(
+        profile_id=1,
+        job_type="capture_profile_photos",
+        priority=-120,
+        dedupe_key=f"capture-account-photos:{capture_id}:0",
+        payload={
+            "photo_capture_id": capture_id,
+            "iteration": 0,
+            "source_policy": "apify",
+        },
+    )
+
+    with TestClient(app) as client:
+        dashboard = client.get("/")
+        profile = client.get("/profiles/1")
+
+    assert "預定策略：僅 Apify 公開照片" in dashboard.text
+    assert "預定策略：僅 Apify 公開照片" in profile.text
 
 
 def test_photo_count_and_list_keep_one_canonical_ready_file_but_all_pending_ids(
@@ -929,6 +1069,8 @@ def test_capture_v2_contract_test_only_queues_one_job_and_obeys_freeze(tmp_path:
 
     assert page.status_code == 200
     assert "全域共用上限 $0.20" in page.text
+    assert primary in page.text
+    assert fallback not in page.text
     assert granted.status_code == 303 and "notice=" in granted.headers["location"]
     assert grant and grant["status"] == "active"
     assert first.status_code == repeated.status_code == frozen.status_code == 303
@@ -944,6 +1086,119 @@ def test_capture_v2_contract_test_only_queues_one_job_and_obeys_freeze(tmp_path:
     assert payload["contract_test_id"].startswith(f"grant:{grant['id']}:")
     assert jobs[0]["dedupe_key"].startswith(f"contract-grant:{grant['id']}:{primary}:")
     assert db.row("SELECT COUNT(*) count FROM actor_runs")["count"] == 0
+
+
+def test_capture_v2_manual_numeric_fixture_bootstraps_contract_only(
+    tmp_path: Path, monkeypatch
+):
+    app = _capture_v2_test_app(tmp_path, monkeypatch)
+    db = app.state.db
+    db.execute("DELETE FROM jobs")
+    primary = app.state.settings.actors.posts_v2_primary
+
+    with TestClient(app) as client:
+        page = client.get("/capture-v2?profile_id=1")
+        grant_response = client.post(
+            "/capture-v2/contract-grants", follow_redirects=False
+        )
+        missing_ack = client.post(
+            "/profiles/1/capture-v2/contract-test",
+            data={"actor_id": primary, "fixture_ack": "1"},
+            follow_redirects=False,
+        )
+        bootstrapped = client.post(
+            "/profiles/1/capture-v2/contract-test",
+            data={
+                "actor_id": primary,
+                "fixture_ack": "1",
+                "bootstrap_ack": "1",
+            },
+            follow_redirects=False,
+        )
+        fingerprint = app.state.service._posts_v2_fingerprint(primary)
+        db.upsert_actor_contract(
+            provider="apify",
+            actor_id=primary,
+            purpose="posts_backfill",
+            schema_fingerprint=fingerprint,
+            status="passed",
+        )
+        production = client.post(
+            "/profiles/1/capture-v2/continue", follow_redirects=False
+        )
+
+    assert page.status_code == 200
+    assert "人工確認數字 ID 100027675104517" in page.text
+    assert "正式回溯仍必須有強公開證據" in page.text
+    assert grant_response.status_code == 303
+    assert missing_ack.status_code == 303 and "error=" in missing_ack.headers["location"]
+    assert bootstrapped.status_code == 303 and "notice=" in bootstrapped.headers["location"]
+    assert production.status_code == 303 and "error=" in production.headers["location"]
+    assert db.row("SELECT COUNT(*) count FROM jobs WHERE job_type='contract_test_posts_v2'")[
+        "count"
+    ] == 1
+    assert db.row("SELECT COUNT(*) count FROM capture_epochs")["count"] == 0
+    assert db.row("SELECT COUNT(*) count FROM access_observations")["count"] == 0
+
+
+def test_capture_v2_gate_explains_profile_lifecycle(tmp_path: Path, monkeypatch):
+    app = _capture_v2_test_app(tmp_path, monkeypatch)
+    db = app.state.db
+    actor_id = app.state.settings.actors.posts_v2_primary
+
+    with TestClient(app) as client:
+        waiting_public = client.get("/")
+        db.record_access_observation(
+            1,
+            source="anonymous_browser",
+            auth_scope="anonymous",
+            verdict="confirmed_public",
+            target_fb_id="100027675104517",
+            observed_fb_id="100027675104517",
+            identity_match=True,
+        )
+        waiting_grant = client.get("/profiles/1")
+        db.create_contract_test_grant(
+            max_usd=0.20,
+            valid_hours=24,
+            authorized_by="test",
+        )
+        waiting_contract = client.get("/capture-v2?profile_id=1")
+        fingerprint = app.state.service._posts_v2_fingerprint(actor_id)
+        db.upsert_actor_contract(
+            provider="apify",
+            actor_id=actor_id,
+            purpose="posts_backfill",
+            schema_fingerprint=fingerprint,
+            status="passed",
+        )
+        ready = client.get("/profiles/1")
+        epoch, _ = db.get_or_create_capture_epoch(
+            1,
+            "test",
+            status="running",
+            scope={"all_public_history": True},
+        )
+        running = client.get("/profiles/1")
+        db.execute(
+            "UPDATE capture_epochs SET status='budget_paused' WHERE id=?",
+            (epoch["id"],),
+        )
+        budget = client.get("/profiles/1")
+        db.finish_capture_epoch(int(epoch["id"]), status="complete")
+        complete = client.get("/profiles/1")
+        db.set_profile_source_control(1, "apify", frozen=True, reason="test")
+        frozen = client.get("/")
+
+    assert "Capture V2：" in waiting_public.text
+    assert "等待公開確認" in waiting_public.text
+    assert "等待 Grant" in waiting_grant.text
+    assert "等待契約測試" in waiting_contract.text
+    assert "可開始回溯" in ready.text
+    assert "回溯中" in running.text
+    assert "預算暫停" in budget.text
+    assert "已完成" in complete.text
+    assert "Apify 已凍結" in frozen.text
 
 
 def test_capture_v2_paid_mutations_reject_cross_site_browser_forms(tmp_path: Path, monkeypatch):

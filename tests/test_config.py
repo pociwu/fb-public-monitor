@@ -36,8 +36,12 @@ def test_browser_canary_defaults_are_conservative(tmp_path: Path):
     assert settings.actors.profile_photos == "vulnv/facebook-profile-scraper"
     assert settings.actors.profile_photos_input == {"urls": "{urls}"}
     assert settings.photo_actor_fallback_enabled is True
+    assert settings.photo_actor_fallback_on_browser_guard_long_deferral is True
     assert settings.photo_actor_max_charge_usd == pytest.approx(0.50)
     assert settings.photo_actor_result_price_usd == pytest.approx(0.0029)
+    assert settings.capture_v2_posts_batch_size == 20
+    assert settings.capture_v2_posts_batch_spacing_min_minutes == pytest.approx(5)
+    assert settings.capture_v2_posts_batch_spacing_max_minutes == pytest.approx(10)
 
 
 def test_deploy_maintenance_flag_can_live_on_a_dedicated_container_mount(
@@ -66,6 +70,9 @@ capture_v2:
   special_profile_id: "123"
   contract_test_budget_usd: 0.19
   contract_test_grant_hours: 12
+  posts_batch_size: 25
+  posts_batch_spacing_min_minutes: 7
+  posts_batch_spacing_max_minutes: 11
 browser_guard:
   account_min_minutes: 40
   account_max_minutes: 70
@@ -91,6 +98,9 @@ actors:
     assert settings.special_profile_id == "123"
     assert settings.actor_contract_test_budget_usd == pytest.approx(0.19)
     assert settings.actor_contract_test_grant_hours == pytest.approx(12)
+    assert settings.capture_v2_posts_batch_size == 25
+    assert settings.capture_v2_posts_batch_spacing_min_minutes == pytest.approx(7)
+    assert settings.capture_v2_posts_batch_spacing_max_minutes == pytest.approx(11)
     assert settings.browser_account_min_minutes == 40
     assert settings.browser_account_max_minutes == 70
     assert settings.browser_album_operations == 20
@@ -101,6 +111,58 @@ actors:
     assert settings.actors.posts_v2_fallback == "example/fallback"
     assert settings.actors.profile_photos == "example/photos"
     assert settings.actors.profile_photos_input == {"startUrls": "{urls}"}
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [(0, 1), (1, 1), (50, 50), (999, 50)],
+)
+def test_capture_v2_posts_batch_size_has_hard_bounds(
+    tmp_path: Path, configured: int, expected: int
+):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        f"profiles: []\ncapture_v2:\n  posts_batch_size: {configured}\n",
+        encoding="utf-8",
+    )
+
+    assert load_settings(config).capture_v2_posts_batch_size == expected
+
+
+def test_capture_v2_posts_batch_spacing_rejects_reversed_range(tmp_path: Path):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """profiles: []
+capture_v2:
+  posts_batch_spacing_min_minutes: 10
+  posts_batch_spacing_max_minutes: 5
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="max_minutes.*不可小於"):
+        load_settings(config)
+
+
+def test_photo_actor_long_browser_guard_deferral_fallback_can_be_disabled(
+    tmp_path: Path, monkeypatch
+):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """profiles: []
+photo_capture:
+  actor_fallback_on_browser_guard_long_deferral: true
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "PHOTO_ACTOR_FALLBACK_ON_BROWSER_GUARD_LONG_DEFERRAL",
+        "0",
+    )
+
+    settings = load_settings(config)
+
+    assert settings.photo_actor_fallback_on_browser_guard_long_deferral is False
 
 
 def test_posts_cursor_contract_round_has_hard_twenty_cent_cap(tmp_path: Path):

@@ -34,6 +34,8 @@ browser_guard:
   account_max_minutes: 9
   cross_account_min_minutes: 2
   cross_account_max_minutes: 4
+  album_operations: 7
+  batch_seconds: 75
   breaker_hours: 12
   breaker_repeat_hours: 36
 evidence:
@@ -69,6 +71,11 @@ def test_service_builds_shared_configured_browser_guard(tmp_path: Path, monkeypa
     assert service.browser_guard.repeated_challenge_duration == timedelta(hours=36)
     assert service.browser_guard.evidence_retention == timedelta(days=90)
     assert service.browser_guard.evidence_max_bytes == 12 * 1024 * 1024
+    for browser in (service.facebook_browser, service.facebook_anonymous_browser):
+        assert browser.album_batch_max_operations == 7
+        assert browser.album_batch_max_new_photos == 7
+        assert browser.profile_photo_grid_batch_max_scrolls == 7
+        assert browser.album_batch_max_seconds == 75
 
 
 @pytest.mark.asyncio

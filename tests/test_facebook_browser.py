@@ -19,6 +19,25 @@ from fb_monitor.facebook_browser import (
 from fb_monitor.normalize import normalize_url
 
 
+def test_browser_gateway_batch_limit_constructor_defaults_and_overrides(tmp_path: Path):
+    default_gateway = FacebookBrowserGateway(True, tmp_path)
+    configured_gateway = FacebookBrowserGateway(
+        True,
+        tmp_path,
+        album_batch_max_operations=7,
+        album_batch_max_seconds=75,
+    )
+
+    assert default_gateway.album_batch_max_operations == 20
+    assert default_gateway.album_batch_max_new_photos == 20
+    assert default_gateway.profile_photo_grid_batch_max_scrolls == 20
+    assert default_gateway.album_batch_max_seconds == 180
+    assert configured_gateway.album_batch_max_operations == 7
+    assert configured_gateway.album_batch_max_new_photos == 7
+    assert configured_gateway.profile_photo_grid_batch_max_scrolls == 7
+    assert configured_gateway.album_batch_max_seconds == 75
+
+
 class EmptyCookieBrowser:
     class Response:
         status = 200

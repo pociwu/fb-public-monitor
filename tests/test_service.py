@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -29,6 +30,161 @@ async def allow_official_usage(service: MonitorService) -> None:
         )
 
     service.serpapi.profile = fake_serpapi_profile
+
+
+def make_legacy_budget_service(tmp_path: Path, monkeypatch) -> MonitorService:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    config = tmp_path / "legacy-budget.yaml"
+    config.write_text(
+        f"""storage:
+  data_dir: {(tmp_path / 'data').as_posix()}
+budget:
+  monthly_usd: 0.02
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("APIFY_V1_BACKFILL_ENABLED", "1")
+    service = MonitorService(load_settings(config))
+    service._available_for = lambda category: 0.02
+    return service
+
+
+@pytest.mark.asyncio
+async def test_official_available_uses_local_settled_floor_until_provider_catches_up(
+    tmp_path: Path, monkeypatch
+):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "storage:\n  data_dir: data\nbudget:\n  monthly_usd: 5\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    service = MonitorService(load_settings(config))
+
+    async def provider_usage():
+        return MonthlyUsage(
+            0.10,
+            "2026-09-01T00:00:00+00:00",
+            "2026-09-30T23:59:59+00:00",
+        )
+
+    service.apify.monthly_usage = provider_usage
+    monkeypatch.setattr(
+        service.db,
+        "apify_settled_charge_floor",
+        lambda cycle_start_at, *, posts_result_price_usd: 1.25,
+    )
+
+    remaining, effective = await service._official_available()
+
+    assert remaining == pytest.approx(3.75)
+    assert effective.used_usd == pytest.approx(1.25)
+    # The diagnostic snapshot remains the provider's raw value; callers use
+    # the returned effective usage for every atomic launch decision.
+    assert service.db.apify_usage_snapshot()["used_usd"] == pytest.approx(0.10)
+
+
+@pytest.mark.asyncio
+async def test_two_legacy_services_atomically_allow_only_one_paid_call(
+    tmp_path: Path, monkeypatch
+):
+    left = make_legacy_budget_service(tmp_path, monkeypatch)
+    right = MonitorService(load_settings(tmp_path / "legacy-budget.yaml"))
+    right._available_for = lambda category: 0.02
+    arrivals = 0
+    both_usage_reads = asyncio.Event()
+    paid_call_entered = asyncio.Event()
+    release_paid_call = asyncio.Event()
+    paid_calls: list[str] = []
+
+    async def same_lagging_usage():
+        nonlocal arrivals
+        arrivals += 1
+        if arrivals == 2:
+            both_usage_reads.set()
+        await both_usage_reads.wait()
+        return MonthlyUsage(
+            0.0,
+            "2026-09-01T00:00:00+00:00",
+            "2026-09-30T23:59:59+00:00",
+        )
+
+    async def paid_call(actor_id, payload, max_charge_usd=None):
+        paid_calls.append(actor_id)
+        paid_call_entered.set()
+        await release_paid_call.wait()
+        return ActorResult(
+            [{"postId": "one"}], None, "legacy-provider-run", charged_usd=0.005
+        )
+
+    for service in (left, right):
+        service.apify.monthly_usage = same_lagging_usage
+        service.apify.call = paid_call
+
+    tasks = [
+        asyncio.create_task(
+            service._actor(
+                "posts", "legacy/posts", {"startUrls": ["https://facebook.com/1"]}
+            )
+        )
+        for service in (left, right)
+    ]
+    await asyncio.wait_for(paid_call_entered.wait(), timeout=2)
+    done, _ = await asyncio.wait(
+        tasks, timeout=2, return_when=asyncio.FIRST_COMPLETED
+    )
+    release_paid_call.set()
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert len(done) == 1
+    assert paid_calls == ["legacy/posts"]
+    assert sum(isinstance(result, ActorResult) for result in results) == 1
+    assert sum(isinstance(result, BudgetExceeded) for result in results) == 1
+    assert left.db.row("SELECT COUNT(*) count FROM actor_runs")["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_call_failure_keeps_ceiling_and_blocks_repurchase(
+    tmp_path: Path, monkeypatch
+):
+    service = make_legacy_budget_service(tmp_path, monkeypatch)
+    calls = 0
+
+    async def same_lagging_usage():
+        return MonthlyUsage(
+            0.0,
+            "2026-09-01T00:00:00+00:00",
+            "2026-09-30T23:59:59+00:00",
+        )
+
+    async def lost_response(actor_id, payload, max_charge_usd=None):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("provider response lost after launch boundary")
+
+    service.apify.monthly_usage = same_lagging_usage
+    service.apify.call = lost_response
+
+    with pytest.raises(RuntimeError, match="response lost"):
+        await service._actor(
+            "posts", "legacy/posts", {"startUrls": ["https://facebook.com/1"]}
+        )
+
+    durable = service.db.row("SELECT * FROM actor_runs ORDER BY id DESC LIMIT 1")
+    assert durable["status"] == "needs_reconcile"
+    assert durable["max_charge_usd"] == pytest.approx(0.02)
+    reservations = service.db.paid_budget_reservations(
+        posts_result_price_usd=0.005
+    )
+    assert reservations["legacy_actor_unsettled_usd"] == pytest.approx(0.02)
+
+    with pytest.raises(BudgetExceeded, match="\u539f\u5b50\u9810\u7b97"):
+        await service._actor(
+            "posts", "legacy/posts", {"startUrls": ["https://facebook.com/1"]}
+        )
+    assert calls == 1
+    assert service.db.row("SELECT COUNT(*) count FROM actor_runs")["count"] == 1
 
 
 @pytest.mark.asyncio

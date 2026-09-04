@@ -28,7 +28,7 @@ capture_v2:
   special_profile_id: "100"
   special_capture_reserve_usd: 4
 actors:
-  posts_v2_primary: test/posts-v2
+  posts_v2_primary: spbotdel/facebook-profile-posts-all-photos-scraper
   posts_v2_fallback: test/posts-v2-fallback
   posts_input:
     profileUrls: "{{profile_url}}"

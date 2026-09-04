@@ -1,4 +1,5 @@
 import json
+import json
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -10,6 +11,7 @@ from fb_monitor.db import (
     CAPTURE_V2_SCHEMA_MIGRATION,
     CONTRACT_TEST_GRANT_MIGRATION,
     Database,
+    ProviderRunOwnershipConflict,
     canonical_request_hash,
 )
 
@@ -58,6 +60,7 @@ def test_paid_photo_batch_is_idempotent_and_reserves_global_budget(tmp_path: Pat
         first["id"],
         global_capacity_usd=0.20,
         minimum_charge_usd=0.0029,
+        posts_result_price_usd=0.005,
     )
     assert won is True
     assert claimed["status"] == "launching"
@@ -83,6 +86,7 @@ def test_paid_photo_batch_claim_rejects_insufficient_atomic_budget(tmp_path: Pat
         batch["id"],
         global_capacity_usd=0.001,
         minimum_charge_usd=0.0029,
+        posts_result_price_usd=0.005,
     )
 
     assert claimed is False
@@ -111,6 +115,12 @@ def test_paid_photo_batch_reconcile_attaches_run_or_closes_unlaunched(tmp_path: 
     assert attached["status"] == "run_started"
     assert attached["run_id"] == "existing-run"
     assert attached["dataset_id"] == "existing-dataset"
+    assert db.row(
+        """SELECT COUNT(*) count FROM jobs
+        WHERE job_type='capture_profile_photos' AND status='pending'
+          AND dedupe_key=?""",
+        (f"capture-account-photos:{first_capture}:reconcile:{first['id']}",),
+    )["count"] == 1
 
     second_capture = add_photo_capture(db, generation=2)
     second, _ = db.prepare_paid_photo_batch(
@@ -129,6 +139,10 @@ def test_paid_photo_batch_reconcile_attaches_run_or_closes_unlaunched(tmp_path: 
 
     assert closed["status"] == "failed"
     assert "not launched" in closed["error"]
+    assert db.row(
+        """SELECT COUNT(*) count FROM jobs
+        WHERE job_type='capture_profile_photos' AND status='pending'"""
+    )["count"] == 2
 
     third_capture = add_photo_capture(db, generation=3)
     third, _ = db.prepare_paid_photo_batch(
@@ -157,6 +171,829 @@ def test_paid_photo_batch_reconcile_attaches_run_or_closes_unlaunched(tmp_path: 
 
     assert abandoned["status"] == "failed"
     assert "abandoned import_failed" in abandoned["error"]
+
+
+def test_photo_reconcile_batch_checkpoint_and_resume_job_are_atomic(tmp_path: Path):
+    db = Database(tmp_path / "paid-photo-reconcile-atomic.sqlite3")
+    add_profile(db)
+    capture_id = add_photo_capture(db)
+    checkpoint = {"actor_retry_nonce": 4, "capture_iteration": 2}
+    db.execute(
+        "UPDATE profile_photo_captures SET checkpoint_json=? WHERE id=?",
+        (json.dumps(checkpoint), capture_id),
+    )
+    batch, _ = db.prepare_paid_photo_batch(
+        profile_id=1,
+        photo_capture_id=capture_id,
+        actor_id="example/photos",
+        normalized_input={"urls": ["https://facebook.com/1"]},
+        max_charge_usd=0.1,
+    )
+    db.transition_paid_photo_batch(batch["id"], "launching")
+    db.transition_paid_photo_batch(batch["id"], "needs_reconcile")
+    db.execute(
+        """CREATE TRIGGER reject_photo_reconcile_job
+        BEFORE INSERT ON jobs
+        WHEN NEW.dedupe_key LIKE 'capture-account-photos:%:reconcile:%'
+        BEGIN SELECT RAISE(ABORT, 'simulated resume job failure'); END"""
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="simulated resume job failure"):
+        db.reconcile_paid_photo_batch(batch["id"], confirm_not_launched=True)
+
+    stored = db.row(
+        "SELECT status FROM paid_photo_batches WHERE id=?", (batch["id"],)
+    )
+    capture = db.row(
+        "SELECT status,checkpoint_json FROM profile_photo_captures WHERE id=?",
+        (capture_id,),
+    )
+    assert stored["status"] == "needs_reconcile"
+    assert capture["status"] == "pending"
+    assert json.loads(capture["checkpoint_json"])["actor_retry_nonce"] == 4
+    assert db.row("SELECT COUNT(*) count FROM jobs")["count"] == 0
+
+    db.execute("DROP TRIGGER reject_photo_reconcile_job")
+    reconciled = db.reconcile_paid_photo_batch(
+        batch["id"], confirm_not_launched=True
+    )
+
+    assert reconciled["status"] == "failed"
+    capture = db.row(
+        "SELECT status,checkpoint_json FROM profile_photo_captures WHERE id=?",
+        (capture_id,),
+    )
+    assert capture["status"] == "in_progress"
+    assert json.loads(capture["checkpoint_json"])["actor_retry_nonce"] == 5
+    assert db.row(
+        """SELECT COUNT(*) count FROM jobs
+        WHERE job_type='capture_profile_photos' AND status='pending'"""
+    )["count"] == 1
+
+
+def test_paid_source_batch_reconcile_attaches_run_or_rotates_unlaunched_identity(
+    tmp_path: Path,
+):
+    db = Database(tmp_path / "paid-source-reconcile.sqlite3")
+    add_profile(db)
+    epoch, _ = db.get_or_create_capture_epoch(1, "test", status="ready")
+    coverage = db.upsert_coverage_stream(
+        epoch["id"], stream="posts", surface="timeline_posts", provider="apify"
+    )
+
+    def prepare(window: str) -> dict:
+        batch, _ = db.prepare_paid_source_batch(
+            profile_id=1,
+            epoch_id=epoch["id"],
+            coverage_stream_id=coverage["id"],
+            contract_id=None,
+            provider="apify",
+            actor_id="example/posts",
+            intent="initial_public_capture",
+            observation_window=window,
+            normalized_input={"maxPostsPerProfile": 10},
+        )
+        db.transition_paid_source_batch(batch["id"], "launching")
+        return db.transition_paid_source_batch(batch["id"], "needs_reconcile")
+
+    first = prepare("window-1")
+    attached = db.reconcile_paid_source_batch(
+        first["id"],
+        run_id="existing-source-run",
+        dataset_id="existing-source-dataset",
+        key_value_store_id="existing-source-store",
+    )
+
+    assert attached["status"] == "run_started"
+    assert attached["run_id"] == "existing-source-run"
+    assert attached["dataset_id"] == "existing-source-dataset"
+    assert attached["key_value_store_id"] == "existing-source-store"
+    assert attached["resume_batch_id"] == first["id"]
+    assert attached["replacement_batch_id"] is None
+    assert db.row(
+        """SELECT COUNT(*) count FROM jobs
+        WHERE job_type='capture_posts_v2' AND status='pending'
+          AND batch_id=?""",
+        (first["id"],),
+    )["count"] == 1
+
+    second = prepare("window-2")
+    closed = db.reconcile_paid_source_batch(
+        second["id"], confirm_not_launched=True
+    )
+    replacement = db.row(
+        "SELECT * FROM paid_source_batches WHERE id=?",
+        (closed["replacement_batch_id"],),
+    )
+
+    assert closed["status"] == "failed"
+    assert "not launched" in closed["error"]
+    assert closed["resume_batch_id"] == replacement["id"]
+    assert replacement["status"] == "prepared"
+    assert replacement["request_hash"] != second["request_hash"]
+    assert replacement["normalized_input_json"] == second["normalized_input_json"]
+    assert replacement["epoch_id"] == second["epoch_id"]
+    assert db.row(
+        """SELECT COUNT(*) count FROM jobs
+        WHERE job_type='capture_posts_v2' AND status='pending'"""
+    )["count"] == 2
+
+
+def test_provider_run_cannot_be_reconciled_to_two_source_batches(tmp_path: Path):
+    db = Database(tmp_path / "provider-run-same-ledger.sqlite3")
+    add_profile(db)
+    epoch, _ = db.get_or_create_capture_epoch(1, "test", status="ready")
+    coverage = db.upsert_coverage_stream(
+        epoch["id"], stream="posts", surface="timeline_posts", provider="apify"
+    )
+
+    def ambiguous(window: str) -> dict:
+        batch, _ = db.prepare_paid_source_batch(
+            profile_id=1,
+            epoch_id=epoch["id"],
+            coverage_stream_id=coverage["id"],
+            contract_id=None,
+            provider="apify",
+            actor_id="example/posts",
+            intent="initial_public_capture",
+            observation_window=window,
+            normalized_input={"maxPostsPerProfile": 10},
+        )
+        db.transition_paid_source_batch(batch["id"], "launching")
+        return db.transition_paid_source_batch(batch["id"], "needs_reconcile")
+
+    first = ambiguous("window-one")
+    second = ambiguous("window-two")
+    db.reconcile_paid_source_batch(
+        first["id"], run_id="shared-provider-run", dataset_id="shared-dataset"
+    )
+
+    with pytest.raises(RuntimeError, match="already belongs to paid_source_batch"):
+        db.reconcile_paid_source_batch(
+            second["id"], run_id="shared-provider-run", dataset_id="shared-dataset"
+        )
+
+    assert db.row(
+        "SELECT status,run_id FROM paid_source_batches WHERE id=?", (second["id"],)
+    ) == {"status": "needs_reconcile", "run_id": None}
+    owner = db.row(
+        "SELECT owner_type,owner_id FROM provider_run_registry WHERE provider=? AND run_id=?",
+        ("apify", "shared-provider-run"),
+    )
+    assert owner == {"owner_type": "paid_source_batch", "owner_id": first["id"]}
+
+
+def test_provider_run_cannot_cross_paid_ledger_owners(tmp_path: Path):
+    db = Database(tmp_path / "provider-run-cross-ledger.sqlite3")
+    add_profile(db)
+    epoch, _ = db.get_or_create_capture_epoch(1, "test", status="ready")
+    coverage = db.upsert_coverage_stream(
+        epoch["id"], stream="posts", surface="timeline_posts", provider="apify"
+    )
+    source, _ = db.prepare_paid_source_batch(
+        profile_id=1,
+        epoch_id=epoch["id"],
+        coverage_stream_id=coverage["id"],
+        contract_id=None,
+        provider="apify",
+        actor_id="example/posts",
+        intent="initial_public_capture",
+        observation_window="source-window",
+        normalized_input={"maxPostsPerProfile": 10},
+    )
+    db.transition_paid_source_batch(source["id"], "launching")
+    db.transition_paid_source_batch(
+        source["id"],
+        "run_started",
+        run_id="cross-ledger-run",
+        dataset_id="cross-ledger-dataset",
+    )
+
+    capture_id = add_photo_capture(db)
+    photo, _ = db.prepare_paid_photo_batch(
+        profile_id=1,
+        photo_capture_id=capture_id,
+        actor_id="example/photos",
+        normalized_input={"urls": ["https://facebook.com/1"]},
+        max_charge_usd=0.1,
+    )
+    db.transition_paid_photo_batch(photo["id"], "launching")
+    db.transition_paid_photo_batch(photo["id"], "needs_reconcile")
+
+    with pytest.raises(RuntimeError, match="already belongs to paid_source_batch"):
+        db.reconcile_paid_photo_batch(
+            photo["id"],
+            run_id="cross-ledger-run",
+            dataset_id="cross-ledger-dataset",
+        )
+
+    assert db.row(
+        "SELECT status,run_id FROM paid_photo_batches WHERE id=?", (photo["id"],)
+    ) == {"status": "needs_reconcile", "run_id": None}
+
+
+@pytest.mark.parametrize("kind", ["source", "photo", "access", "contract"])
+def test_started_provider_run_conflict_quarantines_every_paid_owner(
+    tmp_path: Path, kind: str
+):
+    db = Database(tmp_path / f"provider-run-conflict-{kind}.sqlite3")
+    add_profile(db)
+    contract = db.upsert_actor_contract(
+        provider="apify",
+        actor_id="example/posts",
+        purpose="posts_backfill",
+        schema_fingerprint="schema-1",
+        status="passed",
+    )
+    db.execute(
+        """INSERT INTO provider_run_registry(
+          provider,run_id,owner_type,owner_id,actor_id,request_fingerprint,
+          metadata_json,created_at,updated_at
+        ) VALUES('apify','already-owned-run','paid_source_batch',999,
+                 'other/actor','other-request','{}','now','now')"""
+    )
+    diagnostic_id = 0
+
+    if kind == "source":
+        epoch, _ = db.get_or_create_capture_epoch(1, "test", status="ready")
+        coverage = db.upsert_coverage_stream(
+            epoch["id"], stream="posts", surface="timeline_posts", provider="apify"
+        )
+        record, _ = db.prepare_paid_source_batch(
+            profile_id=1,
+            epoch_id=epoch["id"],
+            coverage_stream_id=coverage["id"],
+            contract_id=contract["id"],
+            provider="apify",
+            actor_id=contract["actor_id"],
+            intent="initial_public_capture",
+            observation_window="conflict-window",
+            normalized_input={"maxPostsPerProfile": 1},
+        )
+        db.transition_paid_source_batch(record["id"], "launching")
+        attach = lambda: db.transition_paid_source_batch(
+            record["id"], "run_started", run_id="already-owned-run"
+        )
+        reconcile = db.reconcile_paid_source_batch
+        table = "paid_source_batches"
+        owner_type = "paid_source_batch"
+    elif kind == "photo":
+        capture_id = add_photo_capture(db)
+        record, _ = db.prepare_paid_photo_batch(
+            profile_id=1,
+            photo_capture_id=capture_id,
+            actor_id="example/photos",
+            normalized_input={"urls": ["https://facebook.com/1"]},
+            max_charge_usd=0.1,
+        )
+        diagnostic_id = db.start_actor_run(
+            1, "profile_photos", "example/photos", "test", {}
+        )
+        db.transition_paid_photo_batch(
+            record["id"], "launching", actor_run_id=diagnostic_id
+        )
+        attach = lambda: db.transition_paid_photo_batch(
+            record["id"], "run_started", run_id="already-owned-run"
+        )
+        reconcile = db.reconcile_paid_photo_batch
+        table = "paid_photo_batches"
+        owner_type = "paid_photo_batch"
+    elif kind == "access":
+        record, _ = db.prepare_paid_access_probe_batch(
+            profile_id=1,
+            contract_id=contract["id"],
+            provider="apify",
+            actor_id=contract["actor_id"],
+            observation_window="conflict-window",
+            normalized_input={"maxPostsPerProfile": 1},
+            max_charge_usd=0.01,
+        )
+        diagnostic_id = db.start_actor_run(
+            1, "access_probe_v2", contract["actor_id"], "test", {}
+        )
+        db.transition_paid_access_probe_batch(
+            record["id"], "launching", actor_run_id=diagnostic_id
+        )
+        attach = lambda: db.transition_paid_access_probe_batch(
+            record["id"], "run_started", run_id="already-owned-run"
+        )
+        reconcile = db.reconcile_paid_access_probe_batch
+        table = "paid_access_probe_batches"
+        owner_type = "paid_access_probe_batch"
+    else:
+        record, _ = db.record_contract_run(
+            contract["id"],
+            test_case="page_1",
+            normalized_input={"maxPostsPerProfile": 1},
+        )
+        db.execute(
+            "UPDATE contract_runs SET status='launching',lease_owner='worker' WHERE id=?",
+            (record["id"],),
+        )
+        attach = lambda: db.attach_contract_run_provider_identity(
+            record["id"],
+            run_id="already-owned-run",
+            dataset_id="dataset",
+            lease_owner="worker",
+        )
+        reconcile = db.reconcile_contract_run
+        table = "contract_runs"
+        owner_type = "contract_run"
+
+    with pytest.raises(ProviderRunOwnershipConflict) as caught:
+        attach()
+    db.record_provider_run_ownership_conflict(
+        caught.value,
+        actor_id=(
+            str(record.get("actor_id") or "")
+            if kind != "contract"
+            else str(contract["actor_id"])
+        ),
+        request_fingerprint=str(record["request_hash"]),
+        dataset_id="dataset",
+    )
+
+    assert db.row(
+        f"SELECT status,run_id FROM {table} WHERE id=?", (record["id"],)
+    ) == {"status": "needs_reconcile", "run_id": None}
+    conflict = db.row(
+        """SELECT attempted_owner_type,attempted_owner_id,run_id
+        FROM provider_run_conflicts WHERE attempted_owner_type=? AND attempted_owner_id=?""",
+        (owner_type, record["id"]),
+    )
+    assert conflict == {
+        "attempted_owner_type": owner_type,
+        "attempted_owner_id": record["id"],
+        "run_id": "already-owned-run",
+    }
+    if diagnostic_id:
+        assert db.row(
+            "SELECT status,run_id FROM actor_runs WHERE id=?", (diagnostic_id,)
+        ) == {"status": "needs_reconcile", "run_id": "already-owned-run"}
+    with pytest.raises(RuntimeError, match="provider"):
+        reconcile(record["id"], confirm_not_launched=True)
+
+
+def test_provider_run_registry_backfill_is_idempotent(tmp_path: Path):
+    path = tmp_path / "provider-run-backfill.sqlite3"
+    db = Database(path)
+    add_profile(db)
+    capture_id = add_photo_capture(db)
+    photo, _ = db.prepare_paid_photo_batch(
+        profile_id=1,
+        photo_capture_id=capture_id,
+        actor_id="example/photos",
+        normalized_input={"urls": ["https://facebook.com/1"]},
+        max_charge_usd=0.1,
+    )
+    db.transition_paid_photo_batch(photo["id"], "launching")
+    db.transition_paid_photo_batch(
+        photo["id"], "run_started", run_id="persisted-photo-run"
+    )
+    # Simulate a paid row written before this registry existed.
+    db.execute(
+        "DELETE FROM provider_run_registry WHERE owner_type=? AND owner_id=?",
+        ("paid_photo_batch", photo["id"]),
+    )
+
+    reopened = Database(path)
+    owner = reopened.row(
+        "SELECT owner_type,owner_id FROM provider_run_registry WHERE provider=? AND run_id=?",
+        ("apify", "persisted-photo-run"),
+    )
+    assert owner == {"owner_type": "paid_photo_batch", "owner_id": photo["id"]}
+    assert Database(path).row("SELECT COUNT(*) count FROM provider_run_registry")[
+        "count"
+    ] == 1
+
+
+def test_paid_transition_cannot_clear_registered_run_identity(tmp_path: Path):
+    db = Database(tmp_path / "provider-run-cannot-clear.sqlite3")
+    add_profile(db)
+    capture_id = add_photo_capture(db)
+    photo, _ = db.prepare_paid_photo_batch(
+        profile_id=1,
+        photo_capture_id=capture_id,
+        actor_id="example/photos",
+        normalized_input={"urls": ["https://facebook.com/1"]},
+        max_charge_usd=0.1,
+    )
+    db.transition_paid_photo_batch(photo["id"], "launching")
+    db.transition_paid_photo_batch(
+        photo["id"], "run_started", run_id="durable-photo-run"
+    )
+
+    with pytest.raises(RuntimeError, match="cannot be cleared or replaced"):
+        db.transition_paid_photo_batch(photo["id"], "raw_saved", run_id=None)
+
+    stored = db.row(
+        "SELECT status,run_id FROM paid_photo_batches WHERE id=?", (photo["id"],)
+    )
+    assert stored == {"status": "run_started", "run_id": "durable-photo-run"}
+
+
+@pytest.mark.parametrize("kind", ["source", "photo", "access", "contract"])
+def test_reconcile_attach_preserves_existing_provider_identity(
+    tmp_path: Path, kind: str
+):
+    db = Database(tmp_path / f"reconcile-provider-identity-{kind}.sqlite3")
+    add_profile(db)
+    contract = db.upsert_actor_contract(
+        provider="apify",
+        actor_id="example/posts",
+        purpose="posts_backfill",
+        schema_fingerprint="schema-1",
+        status="passed",
+        evidence={"test": True},
+    )
+    has_store = kind != "contract"
+
+    if kind == "source":
+        epoch, _ = db.get_or_create_capture_epoch(1, "test", status="ready")
+        coverage = db.upsert_coverage_stream(
+            epoch["id"], stream="posts", surface="timeline_posts", provider="apify"
+        )
+        record, _ = db.prepare_paid_source_batch(
+            profile_id=1,
+            epoch_id=epoch["id"],
+            coverage_stream_id=coverage["id"],
+            contract_id=contract["id"],
+            provider="apify",
+            actor_id=contract["actor_id"],
+            intent="initial_public_capture",
+            observation_window="identity-window",
+            normalized_input={"maxPostsPerProfile": 1},
+        )
+        table = "paid_source_batches"
+        reconcile = db.reconcile_paid_source_batch
+    elif kind == "photo":
+        capture_id = add_photo_capture(db)
+        record, _ = db.prepare_paid_photo_batch(
+            profile_id=1,
+            photo_capture_id=capture_id,
+            actor_id="example/photos",
+            normalized_input={"urls": ["https://facebook.com/1"]},
+            max_charge_usd=0.1,
+        )
+        table = "paid_photo_batches"
+        reconcile = db.reconcile_paid_photo_batch
+    elif kind == "access":
+        record, _ = db.prepare_paid_access_probe_batch(
+            profile_id=1,
+            contract_id=contract["id"],
+            provider="apify",
+            actor_id=contract["actor_id"],
+            observation_window="identity-window",
+            normalized_input={"maxPostsPerProfile": 1},
+            max_charge_usd=0.01,
+        )
+        table = "paid_access_probe_batches"
+        reconcile = db.reconcile_paid_access_probe_batch
+    else:
+        record, _ = db.record_contract_run(
+            contract["id"],
+            test_case="page_1",
+            normalized_input={"maxPostsPerProfile": 1},
+        )
+        table = "contract_runs"
+        reconcile = db.reconcile_contract_run
+
+    store_assignment = ",key_value_store_id='store-existing'" if has_store else ""
+    db.execute(
+        f"""UPDATE {table} SET status='needs_reconcile',
+        run_id='run-existing',dataset_id='dataset-existing'{store_assignment}
+        WHERE id=?""",
+        (record["id"],),
+    )
+
+    with pytest.raises(RuntimeError, match="run_id"):
+        reconcile(record["id"], run_id="run-different")
+    with pytest.raises(RuntimeError, match="dataset_id"):
+        reconcile(
+            record["id"],
+            run_id="run-existing",
+            dataset_id="dataset-different",
+        )
+    if has_store:
+        with pytest.raises(RuntimeError, match="key_value_store_id"):
+            reconcile(
+                record["id"],
+                run_id="run-existing",
+                dataset_id="dataset-existing",
+                key_value_store_id="store-different",
+            )
+
+    attached = reconcile(record["id"], run_id="run-existing")
+
+    assert attached["status"] == "run_started"
+    assert attached["run_id"] == "run-existing"
+    assert attached["dataset_id"] == "dataset-existing"
+    if has_store:
+        assert attached["key_value_store_id"] == "store-existing"
+
+
+@pytest.mark.parametrize("kind", ["source", "photo", "access", "contract"])
+@pytest.mark.parametrize("evidence", ["run", "charge", "registry"])
+def test_reconcile_confirm_not_launched_rejects_any_provider_evidence(
+    tmp_path: Path, kind: str, evidence: str
+):
+    db = Database(tmp_path / f"reconcile-confirm-evidence-{kind}-{evidence}.sqlite3")
+    add_profile(db)
+    contract = db.upsert_actor_contract(
+        provider="apify",
+        actor_id="example/posts",
+        purpose="posts_backfill",
+        schema_fingerprint="schema-1",
+        status="passed",
+    )
+
+    if kind == "source":
+        epoch, _ = db.get_or_create_capture_epoch(1, "test", status="ready")
+        coverage = db.upsert_coverage_stream(
+            epoch["id"], stream="posts", surface="timeline_posts", provider="apify"
+        )
+        record, _ = db.prepare_paid_source_batch(
+            profile_id=1,
+            epoch_id=epoch["id"],
+            coverage_stream_id=coverage["id"],
+            contract_id=contract["id"],
+            provider="apify",
+            actor_id=contract["actor_id"],
+            intent="initial_public_capture",
+            observation_window="evidence-window",
+            normalized_input={"maxPostsPerProfile": 1},
+        )
+        table = "paid_source_batches"
+        reconcile = db.reconcile_paid_source_batch
+    elif kind == "photo":
+        capture_id = add_photo_capture(db)
+        record, _ = db.prepare_paid_photo_batch(
+            profile_id=1,
+            photo_capture_id=capture_id,
+            actor_id="example/photos",
+            normalized_input={"urls": ["https://facebook.com/1"]},
+            max_charge_usd=0.1,
+        )
+        table = "paid_photo_batches"
+        reconcile = db.reconcile_paid_photo_batch
+    elif kind == "access":
+        record, _ = db.prepare_paid_access_probe_batch(
+            profile_id=1,
+            contract_id=contract["id"],
+            provider="apify",
+            actor_id=contract["actor_id"],
+            observation_window="evidence-window",
+            normalized_input={"maxPostsPerProfile": 1},
+            max_charge_usd=0.01,
+        )
+        table = "paid_access_probe_batches"
+        reconcile = db.reconcile_paid_access_probe_batch
+    else:
+        record, _ = db.record_contract_run(
+            contract["id"],
+            test_case="page_1",
+            normalized_input={"maxPostsPerProfile": 1},
+        )
+        table = "contract_runs"
+        reconcile = db.reconcile_contract_run
+
+    db.execute(
+        f"UPDATE {table} SET status='needs_reconcile' WHERE id=?", (record["id"],)
+    )
+    if evidence == "registry":
+        owner_type = {
+            "source": "paid_source_batch",
+            "photo": "paid_photo_batch",
+            "access": "paid_access_probe_batch",
+            "contract": "contract_run",
+        }[kind]
+        actor_id = (
+            str(record.get("actor_id") or "")
+            if kind != "contract"
+            else str(contract["actor_id"])
+        )
+        db.execute(
+            """INSERT INTO provider_run_registry(
+              provider,run_id,owner_type,owner_id,actor_id,request_fingerprint,
+              metadata_json,created_at,updated_at
+            ) VALUES('apify','registry-only-run',?,?,?,?, '{}','now','now')""",
+            (owner_type, record["id"], actor_id, record["request_hash"]),
+        )
+    elif kind in {"photo", "access"}:
+        diagnostic_id = db.start_actor_run(
+            1, kind, "example/actor", "primary", {"test": True}
+        )
+        if evidence == "run":
+            db.execute(
+                "UPDATE actor_runs SET run_id='linked-provider-run' WHERE id=?",
+                (diagnostic_id,),
+            )
+        else:
+            db.execute(
+                "UPDATE actor_runs SET charged_usd=0.01 WHERE id=?", (diagnostic_id,)
+            )
+        db.execute(
+            f"UPDATE {table} SET actor_run_id=? WHERE id=?",
+            (diagnostic_id, record["id"]),
+        )
+    elif evidence == "run":
+        db.execute(
+            f"UPDATE {table} SET run_id='persisted-provider-run' WHERE id=?",
+            (record["id"],),
+        )
+    else:
+        db.execute(
+            f"UPDATE {table} SET charged_usd=0.01 WHERE id=?", (record["id"],)
+        )
+
+    with pytest.raises(RuntimeError, match="provider"):
+        reconcile(record["id"], confirm_not_launched=True)
+
+    stored = db.row(f"SELECT status FROM {table} WHERE id=?", (record["id"],))
+    assert stored["status"] == "needs_reconcile"
+
+
+def test_contract_reconcile_resumes_expired_grant_but_cannot_start_new_run(
+    tmp_path: Path,
+):
+    db = Database(tmp_path / "contract-reconcile-expired.sqlite3")
+    add_profile(db)
+    grant = db.create_contract_test_grant(max_usd=0.20, authorized_by="test")
+    job_id, _, allocation = db.queue_contract_test_job(
+        grant_id=grant["id"],
+        profile_id=1,
+        actor_id="example/posts",
+        schema_fingerprint="fp",
+        fixture_ack=True,
+    )
+    contract = db.upsert_actor_contract(
+        provider="apify",
+        actor_id="example/posts",
+        purpose="posts_backfill",
+        schema_fingerprint="fp",
+        status="pending",
+        evidence={"test_generation": allocation["test_generation"]},
+    )
+    existing, _ = db.record_contract_run(
+        contract["id"], test_case="page_1", normalized_input={"page": 1}
+    )
+    pending, _ = db.record_contract_run(
+        contract["id"], test_case="page_2", normalized_input={"page": 2}
+    )
+    db.execute(
+        "UPDATE contract_runs SET status='needs_reconcile' WHERE id=?",
+        (existing["id"],),
+    )
+    db.execute(
+        "UPDATE jobs SET status='failed',error='worker crashed' WHERE id=?",
+        (job_id,),
+    )
+    db.execute(
+        """UPDATE contract_test_grants
+        SET status='expired',expires_at='2000-01-01T00:00:00+00:00' WHERE id=?""",
+        (grant["id"],),
+    )
+
+    resumed = db.reconcile_contract_run(
+        existing["id"],
+        run_id="existing-contract-run",
+        dataset_id="existing-contract-dataset",
+    )
+
+    assert resumed["status"] == "run_started"
+    assert resumed["run_id"] == "existing-contract-run"
+    assert resumed["dataset_id"] == "existing-contract-dataset"
+    assert resumed["job_requeued"] is True
+    assert db.row("SELECT status FROM jobs WHERE id=?", (job_id,))["status"] == "pending"
+
+    denied, claimed = db.claim_contract_run_launch(
+        pending["id"],
+        lease_owner="worker",
+        claimed_at="2026-09-04T00:00:00+00:00",
+        monthly_limit_usd=5.0,
+        official_used_usd=0.0,
+        outstanding_reserve_usd=0.0,
+        posts_result_price_usd=0.005,
+    )
+    assert claimed is False
+    assert denied["status"] == "pending"
+    assert denied["claim_denied_reason"] == "contract_grant_not_active"
+
+
+def test_contract_reconcile_confirm_not_launched_does_not_requeue_expired_grant(
+    tmp_path: Path,
+):
+    db = Database(tmp_path / "contract-reconcile-no-launch.sqlite3")
+    add_profile(db)
+    grant = db.create_contract_test_grant(max_usd=0.20, authorized_by="test")
+    job_id, _, allocation = db.queue_contract_test_job(
+        grant_id=grant["id"],
+        profile_id=1,
+        actor_id="example/posts",
+        schema_fingerprint="fp",
+        fixture_ack=True,
+    )
+    contract = db.upsert_actor_contract(
+        provider="apify",
+        actor_id="example/posts",
+        purpose="posts_backfill",
+        schema_fingerprint="fp",
+        status="pending",
+        evidence={"test_generation": allocation["test_generation"]},
+    )
+    run, _ = db.record_contract_run(
+        contract["id"], test_case="page_1", normalized_input={"page": 1}
+    )
+    db.execute(
+        "UPDATE contract_runs SET status='needs_reconcile' WHERE id=?", (run["id"],)
+    )
+    db.execute("UPDATE jobs SET status='failed' WHERE id=?", (job_id,))
+    db.execute(
+        """UPDATE contract_test_grants
+        SET status='expired',expires_at='2000-01-01T00:00:00+00:00' WHERE id=?""",
+        (grant["id"],),
+    )
+
+    closed = db.reconcile_contract_run(run["id"], confirm_not_launched=True)
+
+    assert closed["status"] == "failed"
+    assert "not launched" in closed["error"]
+    assert closed["replacement_run_row_id"] is None
+    assert closed["job_requeued"] is False
+    assert db.row("SELECT status FROM jobs WHERE id=?", (job_id,))["status"] == "failed"
+
+
+def test_contract_confirm_not_launched_replacement_can_claim_full_allocation(
+    tmp_path: Path,
+):
+    db = Database(tmp_path / "contract-replacement-claim.sqlite3")
+    add_profile(db)
+    grant = db.create_contract_test_grant(max_usd=0.20, authorized_by="test")
+    job_id, _, allocation = db.queue_contract_test_job(
+        grant_id=grant["id"],
+        profile_id=1,
+        actor_id="example/posts",
+        schema_fingerprint="fp",
+        fixture_ack=True,
+    )
+    contract = db.upsert_actor_contract(
+        provider="apify",
+        actor_id="example/posts",
+        purpose="posts_backfill",
+        schema_fingerprint="fp",
+        status="pending",
+        evidence={"test_generation": allocation["test_generation"]},
+    )
+    runs: dict[str, dict] = {}
+    for test_case in ("page_1", "page_2", "page_2_replay", "known_boundary"):
+        run, _ = db.record_contract_run(
+            contract["id"],
+            test_case=test_case,
+            normalized_input={"test_case": test_case},
+        )
+        runs[test_case] = run
+    original = runs["page_1"]
+    db.execute(
+        "UPDATE contract_runs SET status='needs_reconcile' WHERE id=?",
+        (original["id"],),
+    )
+    db.execute("UPDATE jobs SET status='failed' WHERE id=?", (job_id,))
+
+    reconciled = db.reconcile_contract_run(
+        original["id"], confirm_not_launched=True
+    )
+    replacement_id = int(reconciled["replacement_run_row_id"])
+    old = db.row("SELECT * FROM contract_runs WHERE id=?", (original["id"],))
+    replacement = db.row(
+        "SELECT * FROM contract_runs WHERE id=?", (replacement_id,)
+    )
+    assert old["status"] == "failed"
+    assert old["run_id"] is None
+    assert old["charged_usd"] == 0
+    assert replacement["authorized_max_usd"] == pytest.approx(0.06)
+    db.execute("UPDATE jobs SET status='running' WHERE id=?", (job_id,))
+
+    claimed_row, claimed = db.claim_contract_run_launch(
+        replacement_id,
+        lease_owner="worker",
+        monthly_limit_usd=5.0,
+        official_used_usd=0.0,
+        outstanding_reserve_usd=0.0,
+        posts_result_price_usd=0.005,
+    )
+
+    assert claimed is True
+    assert claimed_row["status"] == "launching"
+    # 0.06 + 0.06 + 0.06 + 0.02 remains exactly the authorized $0.20;
+    # the archived no-launch row must not add another $0.06.
+    active_authorized = db.row(
+        """SELECT COALESCE(SUM(authorized_max_usd),0) total
+        FROM contract_runs WHERE grant_allocation_id=?
+        AND NOT(status='failed' AND COALESCE(run_id,'')=''
+                AND COALESCE(charged_usd,0)<=0)""",
+        (allocation["id"],),
+    )
+    assert active_authorized["total"] == pytest.approx(0.20)
 
 
 def _race_two(call_left, call_right):
@@ -373,8 +1210,12 @@ def test_paid_source_launch_claim_is_atomic_across_database_connections(tmp_path
     right = Database(path)
 
     results = _race_two(
-        lambda: left.claim_paid_source_batch_launch(batch["id"], lease_owner="left"),
-        lambda: right.claim_paid_source_batch_launch(batch["id"], lease_owner="right"),
+        lambda: left.claim_paid_source_batch_launch(
+            batch["id"], lease_owner="left", posts_result_price_usd=0.01
+        ),
+        lambda: right.claim_paid_source_batch_launch(
+            batch["id"], lease_owner="right", posts_result_price_usd=0.01
+        ),
     )
 
     assert sum(claimed for _, claimed in results) == 1
@@ -384,6 +1225,58 @@ def test_paid_source_launch_claim_is_atomic_across_database_connections(tmp_path
     assert row["status"] == "launching"
     assert row["run_id"] is None
     assert row["lease_owner"] in {"left", "right"}
+
+
+def test_paid_source_launch_persists_ceiling_across_later_price_decrease(
+    tmp_path: Path,
+):
+    db = Database(tmp_path / "paid-source-persistent-ceiling.sqlite3")
+    add_profile(db)
+    epoch, _ = db.get_or_create_capture_epoch(1, "test", status="ready")
+    coverage = db.upsert_coverage_stream(
+        epoch["id"], stream="posts", surface="timeline_posts", provider="apify"
+    )
+
+    def prepare(window: str) -> dict:
+        batch, _ = db.prepare_paid_source_batch(
+            profile_id=1,
+            epoch_id=epoch["id"],
+            coverage_stream_id=coverage["id"],
+            contract_id=None,
+            provider="apify",
+            actor_id="example/posts",
+            intent="initial_public_capture",
+            observation_window=window,
+            normalized_input={"maxPostsPerProfile": 20},
+        )
+        return batch
+
+    first = prepare("price-window-1")
+    first_row, first_claimed = db.claim_paid_source_batch_launch(
+        first["id"],
+        lease_owner="worker-1",
+        budget_capacity_usd=0.11,
+        posts_result_price_usd=0.005,
+    )
+    assert first_claimed is True
+    assert first_row["status"] == "launching"
+    assert first_row["max_charge_usd"] == pytest.approx(0.10)
+
+    second = prepare("price-window-2")
+    second_row, second_claimed = db.claim_paid_source_batch_launch(
+        second["id"],
+        lease_owner="worker-2",
+        budget_capacity_usd=0.11,
+        posts_result_price_usd=0.001,
+    )
+
+    # The active first batch reserved $0.10 when it crossed the launch
+    # boundary. Recomputing it at today's lower $0.001/result price would
+    # incorrectly reserve only $0.02 and allow this second purchase.
+    assert second_claimed is False
+    assert second_row["status"] == "prepared"
+    reservations = db.paid_budget_reservations(posts_result_price_usd=0.001)
+    assert reservations["source_unsettled_usd"] == pytest.approx(0.10)
 
 
 def test_capture_v2_migration_seeds_legacy_controls_and_names_once(tmp_path: Path):
@@ -1072,6 +1965,173 @@ def test_paid_budget_reservations_unify_source_and_access_probe_ledgers(tmp_path
     assert reservations["total_unsettled_usd"] == pytest.approx(0.055)
 
 
+def test_legacy_actor_running_and_reconcile_ceilings_share_paid_reservations(
+    tmp_path: Path,
+):
+    db = Database(tmp_path / "legacy-actor-reservations.sqlite3")
+    add_profile(db)
+    diagnostic_id, denial = db.claim_legacy_actor_run_launch(
+        1,
+        "posts",
+        "legacy/posts",
+        "default",
+        {"startUrls": ["https://facebook.com/1"]},
+        max_charge_usd=0.03,
+        cycle_start_at="2026-09-01T00:00:00+00:00",
+        monthly_limit_usd=5.0,
+        provider_used_usd=0.0,
+        baseline_local_settled_usd=0.0,
+        posts_result_price_usd=0.005,
+    )
+
+    assert denial is None
+    assert diagnostic_id is not None
+    running = db.paid_budget_reservations(posts_result_price_usd=0.005)
+    assert running["legacy_actor_unsettled_usd"] == pytest.approx(0.03)
+    assert running["total_unsettled_usd"] == pytest.approx(0.03)
+
+    db.finish_actor_run(
+        diagnostic_id,
+        status="needs_reconcile",
+        charged_usd=0.01,
+        error="provider accepted the request but response was lost",
+    )
+    ambiguous = db.paid_budget_reservations(posts_result_price_usd=0.005)
+    assert ambiguous["legacy_actor_unsettled_usd"] == pytest.approx(0.02)
+    assert ambiguous["total_unsettled_usd"] == pytest.approx(0.02)
+
+
+def test_apify_settled_charge_floor_is_cycle_scoped_and_uses_terminal_ceilings(
+    tmp_path: Path,
+):
+    db = Database(tmp_path / "settled-charge-floor.sqlite3")
+    add_profile(db)
+    contract = db.upsert_actor_contract(
+        provider="apify",
+        actor_id="example/posts",
+        purpose="posts_backfill",
+        schema_fingerprint="schema-1",
+        status="passed",
+        evidence={"test": True},
+    )
+    epoch, _ = db.get_or_create_capture_epoch(1, "test", status="ready")
+    coverage = db.upsert_coverage_stream(
+        epoch["id"],
+        stream="posts",
+        surface="timeline_posts",
+        provider="apify",
+        contract_id=contract["id"],
+    )
+
+    def source(window: str, maximum: int) -> dict:
+        batch, _ = db.prepare_paid_source_batch(
+            profile_id=1,
+            epoch_id=epoch["id"],
+            coverage_stream_id=coverage["id"],
+            contract_id=contract["id"],
+            provider="apify",
+            actor_id=contract["actor_id"],
+            intent="initial_public_capture",
+            observation_window=window,
+            normalized_input={"maxPostsPerProfile": maximum},
+        )
+        return batch
+
+    cycle_start = "2026-09-01T00:00:00+00:00"
+    current = "2026-09-02T00:00:00+00:00"
+    previous = "2026-08-31T23:59:59+00:00"
+
+    terminal_zero = source("terminal-zero", 20)
+    failed_without_run = source("failed-without-run", 50)
+    old_terminal = source("old-terminal", 50)
+    prepared = source("still-prepared", 50)
+    active_with_known_charge = source("active-known-charge", 50)
+
+    db.execute(
+        """UPDATE paid_source_batches
+        SET status='launching',launched_at=?,charged_usd=0.02,updated_at=? WHERE id=?""",
+        (current, current, active_with_known_charge["id"]),
+    )
+    db.execute(
+        """UPDATE paid_source_batches
+        SET status='failed',run_id=NULL,charged_usd=0,launched_at=?,updated_at=? WHERE id=?""",
+        (current, current, failed_without_run["id"]),
+    )
+    db.execute(
+        """UPDATE paid_source_batches
+        SET status='committed',run_id='old-run',charged_usd=0,
+            launched_at=?,committed_at=?,updated_at=? WHERE id=?""",
+        (previous, previous, previous, old_terminal["id"]),
+    )
+
+    # Merely preparing a request does not reserve a settled charge. An active
+    # launch contributes only a provider-reported charge; its remaining ceiling
+    # is represented by paid_budget_reservations instead.
+    assert db.apify_settled_charge_floor(
+        cycle_start, posts_result_price_usd=0.005
+    ) == pytest.approx(0.02)
+
+    db.execute(
+        """UPDATE paid_source_batches
+        SET status='committed',run_id='source-run',charged_usd=0,
+            launched_at=?,committed_at=?,updated_at=? WHERE id=?""",
+        (current, current, current, terminal_zero["id"]),
+    )
+
+    capture_id = add_photo_capture(db)
+    photo, _ = db.prepare_paid_photo_batch(
+        profile_id=1,
+        photo_capture_id=capture_id,
+        actor_id="example/photos",
+        normalized_input={"urls": ["https://facebook.com/1"]},
+        max_charge_usd=0.04,
+    )
+    db.execute(
+        """UPDATE paid_photo_batches
+        SET status='failed',run_id='photo-run',charged_usd=0,
+            launched_at=?,updated_at=? WHERE id=?""",
+        (current, current, photo["id"]),
+    )
+
+    probe, _ = db.prepare_paid_access_probe_batch(
+        profile_id=1,
+        contract_id=contract["id"],
+        provider="apify",
+        actor_id=contract["actor_id"],
+        observation_window="probe-terminal-zero",
+        normalized_input={"maxPostsPerProfile": 1},
+        max_charge_usd=0.03,
+    )
+    db.execute(
+        """UPDATE paid_access_probe_batches
+        SET status='failed',run_id='probe-run',charged_usd=0,
+            launched_at=?,updated_at=? WHERE id=?""",
+        (current, current, probe["id"]),
+    )
+
+    contract_run, _ = db.record_contract_run(
+        contract["id"],
+        test_case="terminal-zero",
+        normalized_input={"maxPostsPerProfile": 1},
+    )
+    db.execute(
+        """UPDATE contract_runs
+        SET status='failed',run_id='contract-run',charged_usd=0,
+            authorized_max_usd=0.06,started_at=?,finished_at=? WHERE id=?""",
+        (current, current, contract_run["id"]),
+    )
+
+    # Current-cycle terminal rows with an unknown/zero provider charge retain
+    # their authorized ceiling. Previous-cycle terminal, current prepared, and
+    # a failed request proven not to have launched are excluded.
+    assert db.apify_settled_charge_floor(
+        cycle_start, posts_result_price_usd=0.005
+    ) == pytest.approx(0.25)
+    assert db.row(
+        "SELECT status FROM paid_source_batches WHERE id=?", (prepared["id"],)
+    )["status"] == "prepared"
+
+
 def test_access_probe_launch_claim_atomically_accounts_for_other_probe(tmp_path: Path):
     db = Database(tmp_path / "probe-atomic-budget.sqlite3")
     add_profile(db)
@@ -1114,7 +2174,94 @@ def test_access_probe_launch_claim_atomically_accounts_for_other_probe(tmp_path:
     assert first_claim["status"] == "launching"
     assert second_won is False
     assert second_claim["status"] == "prepared"
-    assert second_claim["max_charge_usd"] == pytest.approx(0.004)
+    assert second_claim["max_charge_usd"] == pytest.approx(0.01)
+
+    recovered, recovered_won = db.claim_paid_access_probe_launch(
+        second["id"],
+        global_capacity_usd=0.02,
+        detection_capacity_usd=0.02,
+        posts_result_price_usd=0.005,
+    )
+    assert recovered_won is True
+    assert recovered["status"] == "launching"
+    assert recovered["max_charge_usd"] == pytest.approx(0.01)
+
+
+def test_access_probe_cycle_detection_budget_counts_each_reservation_once(
+    tmp_path: Path,
+):
+    db = Database(tmp_path / "probe-cycle-detection-budget.sqlite3")
+    add_profile(db)
+    contract = db.upsert_actor_contract(
+        provider="apify",
+        actor_id="example/posts",
+        purpose="posts_backfill",
+        schema_fingerprint="schema-1",
+        status="passed",
+        evidence={"test": True},
+    )
+
+    def prepare(window: str) -> dict:
+        batch, _ = db.prepare_paid_access_probe_batch(
+            profile_id=1,
+            contract_id=contract["id"],
+            provider="apify",
+            actor_id=contract["actor_id"],
+            observation_window=window,
+            normalized_input={"maxPostsPerProfile": 1},
+            max_charge_usd=0.01,
+        )
+        return batch
+
+    first, second, third = (
+        prepare("cycle-window-1"),
+        prepare("cycle-window-2"),
+        prepare("cycle-window-3"),
+    )
+    claim_args = {
+        "global_capacity_usd": 5.0,
+        "detection_capacity_usd": 0.02,
+        "posts_result_price_usd": 0.005,
+        "cycle_start_at": "2000-01-01T00:00:00+00:00",
+        "monthly_limit_usd": 5.0,
+        "provider_used_usd": 0.0,
+        "baseline_local_settled_usd": 0.0,
+        "outstanding_reserve_usd": 0.0,
+        "detection_limit_usd": 0.02,
+        "detection_historical_used_usd": 0.0,
+    }
+
+    first_row, first_won = db.claim_paid_access_probe_launch(
+        first["id"], **claim_args
+    )
+    second_row, second_won = db.claim_paid_access_probe_launch(
+        second["id"], **claim_args
+    )
+    third_row, third_won = db.claim_paid_access_probe_launch(
+        third["id"], **claim_args
+    )
+
+    assert first_won is True
+    assert first_row["max_charge_usd"] == pytest.approx(0.01)
+    # The second request exactly fills $0.02. Its predecessor is counted by
+    # the cycle-aware ledger, so it must not be subtracted a second time.
+    assert second_won is True
+    assert second_row["max_charge_usd"] == pytest.approx(0.01)
+    assert third_won is False
+    assert third_row["status"] == "prepared"
+    assert third_row["max_charge_usd"] == pytest.approx(0.01)
+
+    recovered_args = {
+        **claim_args,
+        "detection_capacity_usd": 0.03,
+        "detection_limit_usd": 0.03,
+    }
+    recovered, recovered_won = db.claim_paid_access_probe_launch(
+        third["id"], **recovered_args
+    )
+    assert recovered_won is True
+    assert recovered["status"] == "launching"
+    assert recovered["max_charge_usd"] == pytest.approx(0.01)
 
 
 def test_source_launch_claim_atomically_accounts_for_access_probe_ledger(tmp_path: Path):

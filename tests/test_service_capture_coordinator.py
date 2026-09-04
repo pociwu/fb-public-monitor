@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from fb_monitor.config import load_settings
 from fb_monitor.service import MonitorService
+from fb_monitor.service import CAPTURE_V2_COMMENT_NOOP_RETIREMENT_MIGRATION
 
 
 def _service(tmp_path: Path, monkeypatch) -> MonitorService:
@@ -72,7 +73,7 @@ def _post_with_ready_media(service: MonitorService) -> tuple[int, dict]:
 
 
 @pytest.mark.asyncio
-async def test_terminal_posts_seed_one_comment_job_and_missing_contract_is_source_limited(
+async def test_terminal_posts_without_comments_executor_create_no_comment_jobs(
     tmp_path: Path, monkeypatch
 ):
     service = _service(tmp_path, monkeypatch)
@@ -110,23 +111,10 @@ async def test_terminal_posts_seed_one_comment_job_and_missing_contract_is_sourc
     )
     service._seed_capture_v2_comments_after_posts(profile=profile, epoch=epoch)
     service._seed_capture_v2_comments_after_posts(profile=profile, epoch=epoch)
-    job = service.db.row(
-        "SELECT * FROM jobs WHERE job_type='capture_comments_v2' ORDER BY id LIMIT 1"
-    )
-    assert job is not None
     assert service.db.row(
         "SELECT COUNT(*) total FROM jobs WHERE job_type='capture_comments_v2'"
-    )["total"] == 1
-
-    async def must_not_launch(*args, **kwargs):
-        raise AssertionError("comments without an exact executor must not launch a paid Actor")
-
-    service.apify.start = must_not_launch
-    await service.capture_comments_v2(1, json.loads(job["payload_json"]))
-
-    assert service.db.row(
-        "SELECT status FROM coverage_streams WHERE stream='comments'"
-    )["status"] == "source_limited"
+    )["total"] == 0
+    service._refresh_capture_v2_epoch(int(epoch["id"]))
     assert service.db.row(
         "SELECT status,is_active FROM capture_epochs WHERE id=?", (epoch["id"],)
     ) == {"status": "source_limited", "is_active": 0}
@@ -149,9 +137,20 @@ async def test_comment_job_cannot_mutate_another_post_checkpoint(tmp_path: Path,
         status="complete",
         terminal_evidence_json={"kind": "feed_exhausted"},
     )
-    service._seed_capture_v2_comments_after_posts(profile=profile, epoch=epoch)
-    job = service.db.row("SELECT * FROM jobs WHERE job_type='capture_comments_v2'")
-    payload = json.loads(job["payload_json"])
+    comments = service.db.upsert_coverage_stream(
+        int(epoch["id"]),
+        stream="comments",
+        surface="post_comments",
+        scope_type="post",
+        scope_id=str(entity_id),
+    )
+    payload = {
+        "epoch_id": int(epoch["id"]),
+        "coverage_stream_id": int(comments["id"]),
+        "post_entity_id": entity_id,
+        "post_external_id": "p1",
+        "post_url": item["postUrl"],
+    }
     payload["post_entity_id"] = entity_id + 999
 
     with pytest.raises(ValueError, match="不屬於此帳號"):
@@ -213,3 +212,50 @@ def test_zero_post_terminal_epoch_completes_without_comment_jobs(tmp_path: Path,
     assert service.db.row(
         "SELECT status,is_active FROM capture_epochs WHERE id=?", (epoch["id"],)
     ) == {"status": "complete", "is_active": 0}
+
+
+def test_upgrade_retires_pending_legacy_comment_jobs_but_leaves_running_job(
+    tmp_path: Path, monkeypatch
+):
+    service = _service(tmp_path, monkeypatch)
+    _, epoch, posts = _scope(service)
+    entity_id, _ = _post_with_ready_media(service)
+    service.db.update_coverage_stream(int(posts["id"]), status="in_progress")
+    service.db.update_coverage_stream(
+        int(posts["id"]),
+        status="complete",
+        terminal_evidence_json={"kind": "feed_exhausted"},
+    )
+    comments = service.db.upsert_coverage_stream(
+        int(epoch["id"]),
+        stream="comments",
+        surface="post_comments",
+        scope_type="post",
+        scope_id=str(entity_id),
+    )
+    payload = {
+        "epoch_id": int(epoch["id"]),
+        "coverage_stream_id": int(comments["id"]),
+        "post_entity_id": entity_id,
+    }
+    pending_id = service._enqueue(
+        1, "capture_comments_v2", 20, datetime.now(UTC), payload
+    )
+    running_id = service._enqueue(
+        1, "capture_comments_v2", 20, datetime.now(UTC), payload
+    )
+    service.db.execute(
+        "UPDATE jobs SET status='running',started_at='now' WHERE id=?", (running_id,)
+    )
+
+    counts = service._retire_legacy_capture_v2_comment_jobs()
+
+    assert counts == {"jobs_superseded": 1, "coverage_source_limited": 1}
+    assert service.db.row("SELECT status FROM jobs WHERE id=?", (pending_id,))["status"] == "superseded"
+    assert service.db.row("SELECT status FROM jobs WHERE id=?", (running_id,))["status"] == "running"
+    assert service.db.row("SELECT status,limited_reason FROM coverage_streams WHERE id=?", (comments["id"],))["status"] == "source_limited"
+    assert service.db.migration_applied(CAPTURE_V2_COMMENT_NOOP_RETIREMENT_MIGRATION)
+    assert service._retire_legacy_capture_v2_comment_jobs() == {
+        "jobs_superseded": 0,
+        "coverage_source_limited": 0,
+    }

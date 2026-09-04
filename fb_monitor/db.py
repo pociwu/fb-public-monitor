@@ -9,9 +9,15 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 
+from .apify import provider_charge_ceiling
+
 
 CAPTURE_V2_SCHEMA_MIGRATION = "capture_v2_additive_schema_v1"
 CONTRACT_TEST_GRANT_MIGRATION = "capture_v2_contract_test_grants_v1"
+# Release-known unit price used by every pre-V2.1 paid posts launch.  It is
+# intentionally immutable: future configuration changes must not shrink an
+# in-flight legacy reservation during schema migration.
+LEGACY_SOURCE_RESULT_PRICE_USD = 4.99 / 1000
 
 CAPTURE_EPOCH_ACTIVE_STATUSES = frozenset(
     {
@@ -157,6 +163,7 @@ CREATE TABLE IF NOT EXISTS actor_runs (
   id INTEGER PRIMARY KEY, profile_id INTEGER REFERENCES profiles(id), category TEXT NOT NULL,
   actor_id TEXT NOT NULL, run_id TEXT, input_variant TEXT, input_json TEXT NOT NULL,
   status TEXT NOT NULL, result_count INTEGER NOT NULL DEFAULT 0, charged_usd REAL NOT NULL DEFAULT 0,
+  max_charge_usd REAL NOT NULL DEFAULT 0,
   raw_result_count INTEGER NOT NULL DEFAULT 0, parsed_result_count INTEGER NOT NULL DEFAULT 0,
   new_result_count INTEGER NOT NULL DEFAULT 0, updated_result_count INTEGER NOT NULL DEFAULT 0,
   duplicate_result_count INTEGER NOT NULL DEFAULT 0,
@@ -349,6 +356,7 @@ CREATE TABLE IF NOT EXISTS paid_source_batches (
   observation_window TEXT NOT NULL DEFAULT '',
   normalized_input_json TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'prepared',
+  max_charge_usd REAL NOT NULL DEFAULT 0,
   run_id TEXT,
   dataset_id TEXT,
   key_value_store_id TEXT,
@@ -401,6 +409,38 @@ CREATE TABLE IF NOT EXISTS paid_access_probe_batches (
   imported_at TEXT,
   committed_at TEXT,
   updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS provider_run_registry (
+  provider TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  owner_type TEXT NOT NULL CHECK(owner_type IN (
+    'paid_source_batch','paid_photo_batch','paid_access_probe_batch','contract_run'
+  )),
+  owner_id INTEGER NOT NULL,
+  actor_id TEXT NOT NULL DEFAULT '',
+  request_fingerprint TEXT NOT NULL DEFAULT '',
+  provider_started_at TEXT,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(provider,run_id),
+  UNIQUE(owner_type,owner_id)
+);
+CREATE TABLE IF NOT EXISTS provider_run_conflicts (
+  id INTEGER PRIMARY KEY,
+  provider TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  attempted_owner_type TEXT NOT NULL,
+  attempted_owner_id INTEGER NOT NULL,
+  existing_provider TEXT NOT NULL,
+  existing_run_id TEXT NOT NULL,
+  existing_owner_type TEXT NOT NULL,
+  existing_owner_id INTEGER NOT NULL,
+  actor_id TEXT NOT NULL DEFAULT '',
+  request_fingerprint TEXT NOT NULL DEFAULT '',
+  evidence_json TEXT NOT NULL DEFAULT '{}',
+  observed_at TEXT NOT NULL,
+  UNIQUE(provider,run_id,attempted_owner_type,attempted_owner_id)
 );
 CREATE TABLE IF NOT EXISTS post_aliases (
   id INTEGER PRIMARY KEY,
@@ -591,6 +631,277 @@ def canonical_request_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
+def _provider_evidence_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _provider_evidence_present(*records: dict[str, Any]) -> bool:
+    """Whether any durable row proves that a provider launch may exist."""
+
+    for record in records:
+        if any(
+            _provider_evidence_text(record.get(field))
+            for field in ("run_id", "dataset_id", "key_value_store_id")
+        ):
+            return True
+        if float(record.get("charged_usd") or 0) > 0:
+            return True
+    return False
+
+
+def _resolve_provider_attach(
+    *records: dict[str, Any],
+    run_id: str,
+    dataset_id: str | None = None,
+    key_value_store_id: str | None = None,
+) -> tuple[str, str | None, str | None]:
+    """Merge operator evidence without overwriting persisted identities."""
+
+    supplied = {
+        "run_id": _provider_evidence_text(run_id),
+        "dataset_id": _provider_evidence_text(dataset_id),
+        "key_value_store_id": _provider_evidence_text(key_value_store_id),
+    }
+    if not supplied["run_id"]:
+        raise ValueError("provider run_id is required")
+    resolved: dict[str, str | None] = {}
+    for field in ("run_id", "dataset_id", "key_value_store_id"):
+        existing = {
+            _provider_evidence_text(record.get(field))
+            for record in records
+            if _provider_evidence_text(record.get(field))
+        }
+        if len(existing) > 1:
+            raise RuntimeError(f"既有 provider {field} 證據彼此衝突；禁止覆寫")
+        current = next(iter(existing), "")
+        incoming = supplied[field]
+        if current and incoming and current != incoming:
+            raise RuntimeError(f"既有 provider {field} 與輸入不符；禁止覆寫")
+        resolved[field] = current or incoming or None
+    return (
+        str(resolved["run_id"]),
+        resolved["dataset_id"],
+        resolved["key_value_store_id"],
+    )
+
+
+class ProviderRunOwnershipConflict(RuntimeError):
+    """A provider run is already bound to another durable paid identity."""
+
+    def __init__(
+        self,
+        *,
+        provider: str,
+        run_id: str,
+        attempted_owner_type: str,
+        attempted_owner_id: int,
+        existing_provider: str,
+        existing_run_id: str,
+        existing_owner_type: str,
+        existing_owner_id: int,
+        reason: str,
+    ) -> None:
+        self.provider = provider
+        self.run_id = run_id
+        self.attempted_owner_type = attempted_owner_type
+        self.attempted_owner_id = attempted_owner_id
+        self.existing_provider = existing_provider
+        self.existing_run_id = existing_run_id
+        self.existing_owner_type = existing_owner_type
+        self.existing_owner_id = existing_owner_id
+        super().__init__(reason)
+
+
+def _claim_provider_run_ownership(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    run_id: str,
+    owner_type: str,
+    owner_id: int,
+    actor_id: str = "",
+    request_fingerprint: str = "",
+    provider_started_at: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """Atomically bind one provider run to exactly one durable paid owner.
+
+    The registry deliberately stores the Actor, request fingerprint and start
+    time even though manual reconciliation cannot validate those fields yet.
+    A future provider-metadata verifier can therefore extend this boundary
+    without changing ownership semantics.
+    """
+
+    normalized_provider = str(provider or "").strip().casefold()
+    normalized_run_id = str(run_id or "").strip()
+    normalized_owner_type = str(owner_type or "").strip()
+    normalized_owner_id = int(owner_id)
+    allowed_owner_types = {
+        "paid_source_batch",
+        "paid_photo_batch",
+        "paid_access_probe_batch",
+        "contract_run",
+    }
+    if not normalized_provider or not normalized_run_id:
+        raise ValueError("provider and run_id are required for ownership")
+    if normalized_owner_type not in allowed_owner_types:
+        raise ValueError(f"unsupported provider run owner: {normalized_owner_type}")
+
+    run_owner = conn.execute(
+        "SELECT * FROM provider_run_registry WHERE provider=? AND run_id=?",
+        (normalized_provider, normalized_run_id),
+    ).fetchone()
+    if run_owner is not None and (
+        str(run_owner["owner_type"]) != normalized_owner_type
+        or int(run_owner["owner_id"]) != normalized_owner_id
+    ):
+        raise ProviderRunOwnershipConflict(
+            provider=normalized_provider,
+            run_id=normalized_run_id,
+            attempted_owner_type=normalized_owner_type,
+            attempted_owner_id=normalized_owner_id,
+            existing_provider=str(run_owner["provider"]),
+            existing_run_id=str(run_owner["run_id"]),
+            existing_owner_type=str(run_owner["owner_type"]),
+            existing_owner_id=int(run_owner["owner_id"]),
+            reason=(
+                f"provider run {normalized_provider}/{normalized_run_id} already belongs to "
+                f"{run_owner['owner_type']} {run_owner['owner_id']}"
+            ),
+        )
+
+    owner_run = conn.execute(
+        "SELECT * FROM provider_run_registry WHERE owner_type=? AND owner_id=?",
+        (normalized_owner_type, normalized_owner_id),
+    ).fetchone()
+    if owner_run is not None and (
+        str(owner_run["provider"]) != normalized_provider
+        or str(owner_run["run_id"]) != normalized_run_id
+    ):
+        raise ProviderRunOwnershipConflict(
+            provider=normalized_provider,
+            run_id=normalized_run_id,
+            attempted_owner_type=normalized_owner_type,
+            attempted_owner_id=normalized_owner_id,
+            existing_provider=str(owner_run["provider"]),
+            existing_run_id=str(owner_run["run_id"]),
+            existing_owner_type=str(owner_run["owner_type"]),
+            existing_owner_id=int(owner_run["owner_id"]),
+            reason=(
+                f"{normalized_owner_type} {normalized_owner_id} already owns provider run "
+                f"{owner_run['provider']}/{owner_run['run_id']}"
+            ),
+        )
+
+    normalized_actor_id = str(actor_id or "").strip()
+    normalized_fingerprint = str(request_fingerprint or "").strip()
+    if run_owner is not None:
+        existing_actor = str(run_owner["actor_id"] or "").strip()
+        existing_fingerprint = str(run_owner["request_fingerprint"] or "").strip()
+        if existing_actor and normalized_actor_id and existing_actor != normalized_actor_id:
+            raise ProviderRunOwnershipConflict(
+                provider=normalized_provider,
+                run_id=normalized_run_id,
+                attempted_owner_type=normalized_owner_type,
+                attempted_owner_id=normalized_owner_id,
+                existing_provider=normalized_provider,
+                existing_run_id=normalized_run_id,
+                existing_owner_type=normalized_owner_type,
+                existing_owner_id=normalized_owner_id,
+                reason="provider run Actor identity conflicts with its existing owner",
+            )
+        if (
+            existing_fingerprint
+            and normalized_fingerprint
+            and existing_fingerprint != normalized_fingerprint
+        ):
+            raise ProviderRunOwnershipConflict(
+                provider=normalized_provider,
+                run_id=normalized_run_id,
+                attempted_owner_type=normalized_owner_type,
+                attempted_owner_id=normalized_owner_id,
+                existing_provider=normalized_provider,
+                existing_run_id=normalized_run_id,
+                existing_owner_type=normalized_owner_type,
+                existing_owner_id=normalized_owner_id,
+                reason="provider run request fingerprint conflicts with its existing owner",
+            )
+
+    now = utcnow()
+    if run_owner is None:
+        conn.execute(
+            """INSERT INTO provider_run_registry(
+              provider,run_id,owner_type,owner_id,actor_id,request_fingerprint,
+              provider_started_at,metadata_json,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (
+                normalized_provider,
+                normalized_run_id,
+                normalized_owner_type,
+                normalized_owner_id,
+                normalized_actor_id,
+                normalized_fingerprint,
+                provider_started_at,
+                json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True),
+                now,
+                now,
+            ),
+        )
+        return
+
+    conn.execute(
+        """UPDATE provider_run_registry
+        SET actor_id=CASE WHEN actor_id='' THEN ? ELSE actor_id END,
+            request_fingerprint=CASE WHEN request_fingerprint='' THEN ? ELSE request_fingerprint END,
+            provider_started_at=COALESCE(provider_started_at,?),updated_at=?
+        WHERE provider=? AND run_id=? AND owner_type=? AND owner_id=?""",
+        (
+            normalized_actor_id,
+            normalized_fingerprint,
+            provider_started_at,
+            now,
+            normalized_provider,
+            normalized_run_id,
+            normalized_owner_type,
+            normalized_owner_id,
+        ),
+    )
+
+
+def _transition_provider_run_id(
+    current_run_id: Any, fields: dict[str, Any]
+) -> str:
+    """Return an incoming run ID while forbidding identity removal/replacement."""
+
+    if "run_id" not in fields:
+        return ""
+    current = _provider_evidence_text(current_run_id)
+    incoming = _provider_evidence_text(fields.get("run_id"))
+    if current and incoming != current:
+        raise RuntimeError("persisted provider run_id cannot be cleared or replaced")
+    return incoming
+
+
+def _provider_run_ownership_evidence(
+    conn: sqlite3.Connection, owner_type: str, owner_id: int
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        """SELECT provider,run_id,actor_id,request_fingerprint,provider_started_at
+        FROM provider_run_registry WHERE owner_type=? AND owner_id=?""",
+        (owner_type, owner_id),
+    ).fetchone()
+    if row is not None:
+        return dict(row)
+    conflict = conn.execute(
+        """SELECT provider,run_id,actor_id,request_fingerprint,observed_at AS provider_started_at
+        FROM provider_run_conflicts
+        WHERE attempted_owner_type=? AND attempted_owner_id=?
+        ORDER BY id DESC LIMIT 1""",
+        (owner_type, owner_id),
+    ).fetchone()
+    return dict(conflict) if conflict is not None else None
+
+
 def _normalized_name(value: str) -> str:
     return " ".join(value.split()).casefold()
 
@@ -676,6 +987,11 @@ class Database:
                     conn.execute(f"ALTER TABLE outbox ADD COLUMN {name} {definition}")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_outbox_media_sha ON outbox(media_sha256,status)")
             actor_run_columns = {row[1] for row in conn.execute("PRAGMA table_info(actor_runs)")}
+            if "max_charge_usd" not in actor_run_columns:
+                conn.execute(
+                    "ALTER TABLE actor_runs "
+                    "ADD COLUMN max_charge_usd REAL NOT NULL DEFAULT 0"
+                )
             for name in (
                 "raw_result_count", "parsed_result_count", "new_result_count",
                 "updated_result_count", "duplicate_result_count",
@@ -708,6 +1024,50 @@ class Database:
                 WHERE target.position IS NULL"""
             )
             self._ensure_capture_v2_migration(conn)
+            paid_source_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(paid_source_batches)")
+            }
+            if "max_charge_usd" not in paid_source_columns:
+                conn.execute(
+                    "ALTER TABLE paid_source_batches "
+                    "ADD COLUMN max_charge_usd REAL NOT NULL DEFAULT 0"
+                )
+            legacy_source_rows = conn.execute(
+                """SELECT id,status,charged_usd,normalized_input_json
+                FROM paid_source_batches
+                WHERE status<>'prepared' AND COALESCE(max_charge_usd,0)<=0"""
+            ).fetchall()
+            for legacy in legacy_source_rows:
+                try:
+                    normalized = json.loads(
+                        str(legacy["normalized_input_json"] or "{}")
+                    )
+                except (TypeError, json.JSONDecodeError):
+                    normalized = {}
+                maximum = max(
+                    1,
+                    min(
+                        50,
+                        int(
+                            normalized.get("maxPostsPerProfile")
+                            or normalized.get("maxPosts")
+                            or 50
+                        ),
+                    ),
+                )
+                historical_ceiling = max(
+                    max(0.0, float(legacy["charged_usd"] or 0)),
+                    float(
+                        provider_charge_ceiling(
+                            maximum * LEGACY_SOURCE_RESULT_PRICE_USD
+                        )
+                    ),
+                )
+                conn.execute(
+                    "UPDATE paid_source_batches SET max_charge_usd=? WHERE id=?",
+                    (historical_ceiling, legacy["id"]),
+                )
             self._ensure_contract_test_grant_migration(conn)
             contract_run_columns = {
                 str(row[1]) for row in conn.execute("PRAGMA table_info(contract_runs)")
@@ -715,7 +1075,177 @@ class Database:
             for name in ("lease_owner", "leased_at"):
                 if name not in contract_run_columns:
                     conn.execute(f"ALTER TABLE contract_runs ADD COLUMN {name} TEXT")
+            self._ensure_provider_run_registry(conn)
             self._ensure_source_control_triggers(conn)
+
+    def record_provider_run_ownership_conflict(
+        self,
+        conflict: ProviderRunOwnershipConflict,
+        *,
+        actor_id: str,
+        request_fingerprint: str,
+        dataset_id: str | None = None,
+        key_value_store_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Fail closed after a provider start returned an already-owned run.
+
+        This is intentionally a second transaction: the ownership claim and
+        owner update rolled back together.  The attempted run is stored only
+        as conflict evidence, never in the losing owner's ``run_id`` column.
+        """
+
+        table_by_owner = {
+            "paid_source_batch": "paid_source_batches",
+            "paid_photo_batch": "paid_photo_batches",
+            "paid_access_probe_batch": "paid_access_probe_batches",
+            "contract_run": "contract_runs",
+        }
+        table = table_by_owner.get(conflict.attempted_owner_type)
+        if table is None:
+            raise ValueError(
+                f"unsupported provider run owner: {conflict.attempted_owner_type}"
+            )
+        now = utcnow()
+        evidence = {
+            "dataset_id": str(dataset_id or ""),
+            "key_value_store_id": str(key_value_store_id or ""),
+            "existing_provider": conflict.existing_provider,
+            "existing_run_id": conflict.existing_run_id,
+            "existing_owner_type": conflict.existing_owner_type,
+            "existing_owner_id": conflict.existing_owner_id,
+            "error": str(conflict),
+        }
+        error = (
+            "provider start succeeded but run ownership conflicted; "
+            f"attempted={conflict.provider}/{conflict.run_id}; "
+            f"existing={conflict.existing_owner_type}:{conflict.existing_owner_id}"
+        )
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                f"SELECT * FROM {table} WHERE id=?",
+                (conflict.attempted_owner_id,),
+            ).fetchone()
+            if current is None:
+                raise ValueError(
+                    f"unknown {conflict.attempted_owner_type}: "
+                    f"{conflict.attempted_owner_id}"
+                )
+            if _provider_evidence_text(current["run_id"]):
+                raise RuntimeError(
+                    "losing provider owner unexpectedly persisted a run_id"
+                )
+            conn.execute(
+                """INSERT INTO provider_run_conflicts(
+                  provider,run_id,attempted_owner_type,attempted_owner_id,
+                  existing_provider,existing_run_id,existing_owner_type,
+                  existing_owner_id,actor_id,request_fingerprint,evidence_json,observed_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(provider,run_id,attempted_owner_type,attempted_owner_id)
+                DO UPDATE SET evidence_json=excluded.evidence_json,
+                              observed_at=excluded.observed_at""",
+                (
+                    conflict.provider,
+                    conflict.run_id,
+                    conflict.attempted_owner_type,
+                    conflict.attempted_owner_id,
+                    conflict.existing_provider,
+                    conflict.existing_run_id,
+                    conflict.existing_owner_type,
+                    conflict.existing_owner_id,
+                    str(actor_id or ""),
+                    str(request_fingerprint or ""),
+                    json.dumps(evidence, ensure_ascii=False, sort_keys=True),
+                    now,
+                ),
+            )
+            if conflict.attempted_owner_type == "contract_run":
+                cursor = conn.execute(
+                    """UPDATE contract_runs
+                    SET status='needs_reconcile',error=?,finished_at=?
+                    WHERE id=? AND status='launching' AND run_id IS NULL""",
+                    (error, now, conflict.attempted_owner_id),
+                )
+            else:
+                cursor = conn.execute(
+                    f"""UPDATE {table} SET status='needs_reconcile',error=?,updated_at=?
+                    WHERE id=? AND status='launching' AND run_id IS NULL""",
+                    (error, now, conflict.attempted_owner_id),
+                )
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    f"{conflict.attempted_owner_type} was not at the launch boundary"
+                )
+            if conflict.attempted_owner_type == "paid_source_batch":
+                conn.execute(
+                    """UPDATE capture_epochs SET status='needs_reconcile',updated_at=?
+                    WHERE id=?""",
+                    (now, current["epoch_id"]),
+                )
+            diagnostic_id = int(current["actor_run_id"] or 0) if (
+                conflict.attempted_owner_type
+                in {"paid_photo_batch", "paid_access_probe_batch"}
+            ) else 0
+            if diagnostic_id:
+                conn.execute(
+                    """UPDATE actor_runs
+                    SET status='needs_reconcile',run_id=?,error=?,finished_at=?
+                    WHERE id=?""",
+                    (conflict.run_id, error, now, diagnostic_id),
+                )
+            stored = conn.execute(
+                """SELECT * FROM provider_run_conflicts
+                WHERE provider=? AND run_id=? AND attempted_owner_type=?
+                  AND attempted_owner_id=?""",
+                (
+                    conflict.provider,
+                    conflict.run_id,
+                    conflict.attempted_owner_type,
+                    conflict.attempted_owner_id,
+                ),
+            ).fetchone()
+            return dict(stored)
+
+    @staticmethod
+    def _ensure_provider_run_registry(conn: sqlite3.Connection) -> None:
+        """Backfill ownership for provider runs written by earlier builds.
+
+        Historical collisions fail startup instead of silently selecting one
+        owner: both rows may still be resumable, so choosing a winner without
+        quarantining the other would leave the ownership invariant false.
+        """
+
+        rows = conn.execute(
+            """SELECT provider,run_id,'paid_source_batch' AS owner_type,id AS owner_id,
+                      actor_id,request_hash AS request_fingerprint,launched_at AS provider_started_at,
+                      1 AS owner_order
+               FROM paid_source_batches WHERE NULLIF(TRIM(run_id),'') IS NOT NULL
+               UNION ALL
+               SELECT 'apify',run_id,'paid_photo_batch',id,actor_id,request_hash,launched_at,2
+               FROM paid_photo_batches WHERE NULLIF(TRIM(run_id),'') IS NOT NULL
+               UNION ALL
+               SELECT provider,run_id,'paid_access_probe_batch',id,actor_id,request_hash,launched_at,3
+               FROM paid_access_probe_batches WHERE NULLIF(TRIM(run_id),'') IS NOT NULL
+               UNION ALL
+               SELECT ac.provider,cr.run_id,'contract_run',cr.id,ac.actor_id,
+                      cr.request_hash,cr.leased_at,4
+               FROM contract_runs cr
+               JOIN actor_contracts ac ON ac.id=cr.contract_id
+               WHERE NULLIF(TRIM(cr.run_id),'') IS NOT NULL
+               ORDER BY owner_order,owner_id"""
+        ).fetchall()
+        for row in rows:
+            _claim_provider_run_ownership(
+                conn,
+                provider=str(row["provider"]),
+                run_id=str(row["run_id"]),
+                owner_type=str(row["owner_type"]),
+                owner_id=int(row["owner_id"]),
+                actor_id=str(row["actor_id"] or ""),
+                request_fingerprint=str(row["request_fingerprint"] or ""),
+                provider_started_at=row["provider_started_at"],
+                metadata={"backfilled": True},
+            )
 
     def _ensure_capture_v2_migration(self, conn: sqlite3.Connection) -> None:
         applied = conn.execute(
@@ -1318,6 +1848,40 @@ class Database:
             (provider, actor_id, purpose, at),
         )
 
+    def invalidate_actor_contract(self, contract_id: int, reason: str) -> dict[str, Any]:
+        """Fail one exact Actor fingerprint while retaining its test evidence."""
+
+        now = utcnow()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT * FROM actor_contracts WHERE id=?", (contract_id,)
+            ).fetchone()
+            if current is None:
+                raise ValueError(f"unknown actor contract: {contract_id}")
+            try:
+                evidence = json.loads(str(current["evidence_json"] or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                evidence = {}
+            if not isinstance(evidence, dict):
+                evidence = {}
+            evidence["invalidated_reason"] = str(reason)[:4000]
+            evidence["invalidated_at"] = now
+            conn.execute(
+                """UPDATE actor_contracts SET status='failed',invalidated_at=?,
+                evidence_json=?,updated_at=? WHERE id=?""",
+                (
+                    now,
+                    json.dumps(evidence, ensure_ascii=False, sort_keys=True),
+                    now,
+                    contract_id,
+                ),
+            )
+            updated = conn.execute(
+                "SELECT * FROM actor_contracts WHERE id=?", (contract_id,)
+            ).fetchone()
+            return dict(updated)
+
     @staticmethod
     def _contract_grant_ledger_conn(
         conn: sqlite3.Connection, grant: sqlite3.Row | dict[str, Any]
@@ -1674,7 +2238,13 @@ class Database:
             }.get(test_case, 1.0)
             allocation_id = int(allocation["id"]) if allocation else None
             authorized_max = (
-                float(allocation["authorized_usd"]) * factor if allocation else 0.0
+                float(
+                    provider_charge_ceiling(
+                        float(allocation["authorized_usd"]) * factor
+                    )
+                )
+                if allocation
+                else 0.0
             )
             cursor = conn.execute(
                 """INSERT OR IGNORE INTO contract_runs(
@@ -1705,6 +2275,8 @@ class Database:
         official_used_usd: float = 0,
         outstanding_reserve_usd: float = 0,
         posts_result_price_usd: float = 0,
+        cycle_start_at: str | None = None,
+        baseline_local_settled_usd: float = 0,
     ) -> tuple[dict[str, Any], bool]:
         """Atomically authorize budget and claim one contract-test launch.
 
@@ -1757,8 +2329,14 @@ class Database:
                     )
                     authorized_runs = float(
                         conn.execute(
-                            "SELECT COALESCE(SUM(authorized_max_usd),0) "
-                            "FROM contract_runs WHERE grant_allocation_id=?",
+                            """SELECT COALESCE(SUM(authorized_max_usd),0)
+                            FROM contract_runs WHERE grant_allocation_id=?
+                              AND NOT (
+                                status='failed'
+                                AND NULLIF(TRIM(run_id),'') IS NULL
+                                AND NULLIF(TRIM(dataset_id),'') IS NULL
+                                AND COALESCE(charged_usd,0)<=0
+                              )""",
                             (allocation["id"],),
                         ).fetchone()[0]
                         or 0
@@ -1772,11 +2350,29 @@ class Database:
                             conn,
                             result_price=max(0.0, float(posts_result_price_usd)),
                         )
-                        capacity = max(
-                            0.0,
-                            float(monthly_limit_usd)
-                            - max(0.0, float(official_used_usd))
-                            - max(0.0, float(outstanding_reserve_usd)),
+                        capacity = (
+                            self._atomic_paid_capacity_in_connection(
+                                conn,
+                                cycle_start_at=cycle_start_at,
+                                monthly_limit_usd=monthly_limit_usd,
+                                provider_used_usd=official_used_usd,
+                                baseline_local_settled_usd=(
+                                    baseline_local_settled_usd
+                                ),
+                                outstanding_reserve_usd=(
+                                    outstanding_reserve_usd
+                                ),
+                                posts_result_price_usd=(
+                                    posts_result_price_usd
+                                ),
+                            )
+                            if cycle_start_at
+                            else max(
+                                0.0,
+                                float(monthly_limit_usd)
+                                - max(0.0, float(official_used_usd))
+                                - max(0.0, float(outstanding_reserve_usd)),
+                            )
                         )
                         if (
                             float(reservations["total_unsettled_usd"])
@@ -1794,6 +2390,227 @@ class Database:
             )
             row = conn.execute("SELECT * FROM contract_runs WHERE id=?", (run_id,)).fetchone()
             return dict(row), cursor.rowcount == 1
+
+    def attach_contract_run_provider_identity(
+        self,
+        run_row_id: int,
+        *,
+        run_id: str,
+        dataset_id: str | None,
+        lease_owner: str,
+        provider_started_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist an accepted contract-test run and its global ownership."""
+
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id:
+            raise ValueError("provider run_id is required")
+        now = utcnow()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                """SELECT cr.*,ac.provider AS contract_provider,
+                          ac.actor_id AS contract_actor_id
+                FROM contract_runs cr
+                JOIN actor_contracts ac ON ac.id=cr.contract_id
+                WHERE cr.id=?""",
+                (run_row_id,),
+            ).fetchone()
+            if current is None:
+                raise ValueError(f"unknown contract run: {run_row_id}")
+            if str(current["status"]) != "launching":
+                raise RuntimeError(
+                    f"contract run {run_row_id} is {current['status']}, expected launching"
+                )
+            if str(current["lease_owner"] or "") != str(lease_owner or ""):
+                raise RuntimeError("contract run launch lease belongs to another worker")
+            _claim_provider_run_ownership(
+                conn,
+                provider=str(current["contract_provider"] or ""),
+                run_id=normalized_run_id,
+                owner_type="contract_run",
+                owner_id=run_row_id,
+                actor_id=str(current["contract_actor_id"] or ""),
+                request_fingerprint=str(current["request_hash"] or ""),
+                provider_started_at=provider_started_at or now,
+                metadata={
+                    "dataset_id": str(dataset_id or ""),
+                    "attached_by": "provider_start",
+                },
+            )
+            cursor = conn.execute(
+                """UPDATE contract_runs
+                SET status='run_started',run_id=?,dataset_id=?,leased_at=?
+                WHERE id=? AND status='launching' AND lease_owner=?""",
+                (
+                    normalized_run_id,
+                    str(dataset_id or ""),
+                    provider_started_at or now,
+                    run_row_id,
+                    lease_owner,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("contract run lost atomic provider identity attach")
+            updated = conn.execute(
+                "SELECT * FROM contract_runs WHERE id=?", (run_row_id,)
+            ).fetchone()
+            return dict(updated)
+
+    def reconcile_contract_run(
+        self,
+        run_row_id: int,
+        *,
+        run_id: str | None = None,
+        dataset_id: str | None = None,
+        confirm_not_launched: bool = False,
+    ) -> dict[str, Any]:
+        """Resolve an ambiguous paid contract-test launch without rebuying it.
+
+        Attaching a provider run makes the existing row resumable even after
+        its grant expired or the profile was frozen.  A positive
+        ``confirm_not_launched`` preserves the ambiguous row as failed and,
+        while the original grant is still active, recreates the exact request
+        identity as a fresh pending row that must pass all launch gates again.
+        """
+
+        normalized_run_id = str(run_id or "").strip()
+        if bool(normalized_run_id) == bool(confirm_not_launched):
+            raise ValueError("provide exactly one of run_id or confirm_not_launched")
+        now = utcnow()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                """SELECT cr.*,a.job_id,g.status AS grant_status,g.expires_at,
+                          ac.provider AS contract_provider,
+                          ac.actor_id AS contract_actor_id
+                FROM contract_runs cr
+                JOIN actor_contracts ac ON ac.id=cr.contract_id
+                LEFT JOIN contract_test_allocations a
+                  ON a.id=cr.grant_allocation_id
+                LEFT JOIN contract_test_grants g ON g.id=a.grant_id
+                WHERE cr.id=?""",
+                (run_row_id,),
+            ).fetchone()
+            if current is None:
+                raise ValueError(f"unknown contract run: {run_row_id}")
+            if str(current["status"]) != "needs_reconcile":
+                raise RuntimeError(
+                    f"contract run {run_row_id} is {current['status']}, "
+                    "expected needs_reconcile"
+                )
+            evidence_rows = [dict(current)]
+            registry_evidence = _provider_run_ownership_evidence(
+                conn, "contract_run", run_row_id
+            )
+            if registry_evidence:
+                evidence_rows.append(registry_evidence)
+            if confirm_not_launched and _provider_evidence_present(*evidence_rows):
+                raise RuntimeError(
+                    "contract run 已有 provider run/dataset/charge 證據；"
+                    "不可確認為未啟動"
+                )
+            resolved_run_id: str | None = None
+            resolved_dataset_id: str | None = None
+            if normalized_run_id:
+                resolved_run_id, resolved_dataset_id, _ = _resolve_provider_attach(
+                    *evidence_rows,
+                    run_id=normalized_run_id,
+                    dataset_id=dataset_id,
+                )
+                _claim_provider_run_ownership(
+                    conn,
+                    provider=str(current["contract_provider"] or ""),
+                    run_id=resolved_run_id,
+                    owner_type="contract_run",
+                    owner_id=run_row_id,
+                    actor_id=str(current["contract_actor_id"] or ""),
+                    request_fingerprint=str(current["request_hash"] or ""),
+                    provider_started_at=current["leased_at"] or now,
+                    metadata={
+                        "dataset_id": str(resolved_dataset_id or ""),
+                        "attached_by": "operator_reconcile",
+                    },
+                )
+            job_id = int(current["job_id"] or 0)
+            if job_id:
+                job = conn.execute(
+                    "SELECT status FROM jobs WHERE id=?", (job_id,)
+                ).fetchone()
+                if job and str(job["status"]) == "running":
+                    raise RuntimeError("contract test job is still running; wait before reconciling")
+
+            replacement_id: int | None = None
+            if normalized_run_id:
+                conn.execute(
+                    """UPDATE contract_runs
+                    SET status='run_started',run_id=?,dataset_id=?,error=NULL,
+                        finished_at=NULL,lease_owner=NULL,leased_at=COALESCE(leased_at,?)
+                    WHERE id=? AND status='needs_reconcile'""",
+                    (resolved_run_id, resolved_dataset_id, now, run_row_id),
+                )
+            else:
+                original_hash = str(current["request_hash"])
+                archived_hash = canonical_request_hash(
+                    {
+                        "reconciled_contract_run_id": run_row_id,
+                        "original_request_hash": original_hash,
+                        "confirmed_not_launched_at": now,
+                    }
+                )
+                conn.execute(
+                    """UPDATE contract_runs
+                    SET status='failed',request_hash=?,run_id=NULL,dataset_id=NULL,
+                        error=?,finished_at=?,
+                        lease_owner=NULL
+                    WHERE id=? AND status='needs_reconcile'""",
+                    (
+                        archived_hash,
+                        "operator confirmed provider run was not launched",
+                        now,
+                        run_row_id,
+                    ),
+                )
+                grant_active = (
+                    str(current["grant_status"] or "") == "active"
+                    and str(current["expires_at"] or "") > now
+                )
+                if grant_active:
+                    cursor = conn.execute(
+                        """INSERT INTO contract_runs(
+                          contract_id,request_hash,test_case,status,input_json,
+                          expected_json,result_json,result_count,charged_usd,
+                          grant_allocation_id,authorized_max_usd,started_at
+                        ) VALUES(?,?,?,'pending',?,?, '{}',0,0,?,?,?)""",
+                        (
+                            current["contract_id"],
+                            original_hash,
+                            current["test_case"],
+                            current["input_json"],
+                            current["expected_json"],
+                            current["grant_allocation_id"],
+                            current["authorized_max_usd"],
+                            now,
+                        ),
+                    )
+                    replacement_id = int(cursor.lastrowid)
+
+            if job_id:
+                should_requeue = bool(normalized_run_id or replacement_id)
+                if should_requeue:
+                    conn.execute(
+                        """UPDATE jobs SET status='pending',available_at=?,started_at=NULL,
+                        finished_at=NULL,error=NULL,lease_owner=NULL,leased_at=NULL
+                        WHERE id=? AND status<>'running'""",
+                        (now, job_id),
+                    )
+            updated = conn.execute(
+                "SELECT * FROM contract_runs WHERE id=?", (run_row_id,)
+            ).fetchone()
+            result = dict(updated)
+            result["replacement_run_row_id"] = replacement_id
+            result["job_requeued"] = bool(job_id and (normalized_run_id or replacement_id))
+            return result
 
     def get_or_create_capture_epoch(
         self,
@@ -2045,6 +2862,7 @@ class Database:
             }
         )
         now = utcnow()
+        desired_max_charge = float(provider_charge_ceiling(max_charge_usd))
         with self.connect() as conn:
             cursor = conn.execute(
                 """INSERT OR IGNORE INTO paid_photo_batches(
@@ -2057,7 +2875,7 @@ class Database:
                     photo_capture_id,
                     actor_id,
                     input_json,
-                    max(0.0, float(max_charge_usd)),
+                    desired_max_charge,
                     input_cursor,
                     now,
                     now,
@@ -2136,6 +2954,28 @@ class Database:
             from .capture_v2 import validate_batch_transition
 
             validate_batch_transition(str(current["status"]), status)
+            incoming_run_id = _transition_provider_run_id(current["run_id"], fields)
+            if status == "run_started" and not (
+                incoming_run_id or _provider_evidence_text(current["run_id"])
+            ):
+                raise RuntimeError("run_started requires a durable provider run_id")
+            if incoming_run_id:
+                _claim_provider_run_ownership(
+                    conn,
+                    provider="apify",
+                    run_id=incoming_run_id,
+                    owner_type="paid_photo_batch",
+                    owner_id=batch_id,
+                    actor_id=str(current["actor_id"] or ""),
+                    request_fingerprint=str(current["request_hash"] or ""),
+                    provider_started_at=current["launched_at"] or now,
+                    metadata={
+                        "dataset_id": str(fields.get("dataset_id") or ""),
+                        "key_value_store_id": str(
+                            fields.get("key_value_store_id") or ""
+                        ),
+                    },
+                )
             values = {"status": status, **fields, "updated_at": now}
             if milestone and not current[milestone]:
                 values[milestone] = now
@@ -2160,11 +3000,18 @@ class Database:
         *,
         global_capacity_usd: float,
         minimum_charge_usd: float,
+        posts_result_price_usd: float,
+        cycle_start_at: str | None = None,
+        monthly_limit_usd: float | None = None,
+        provider_used_usd: float = 0,
+        baseline_local_settled_usd: float = 0,
+        outstanding_reserve_usd: float = 0,
     ) -> tuple[dict[str, Any], bool]:
         """Atomically reserve the photo run against every durable Apify ledger."""
 
         now = utcnow()
-        minimum = max(0.0, float(minimum_charge_usd))
+        minimum = float(provider_charge_ceiling(minimum_charge_usd))
+        posts_result_price = max(0.0, float(posts_result_price_usd))
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             current = conn.execute(
@@ -2176,16 +3023,34 @@ class Database:
                 return dict(current), False
             reservations = self._paid_budget_reservations_in_connection(
                 conn,
-                result_price=minimum,
+                result_price=posts_result_price,
                 excluding_photo_batch_id=batch_id,
             )
+            atomic_capacity = max(0.0, float(global_capacity_usd))
+            if cycle_start_at and monthly_limit_usd is not None:
+                atomic_capacity = min(
+                    atomic_capacity,
+                    self._atomic_paid_capacity_in_connection(
+                        conn,
+                        cycle_start_at=cycle_start_at,
+                        monthly_limit_usd=monthly_limit_usd,
+                        provider_used_usd=provider_used_usd,
+                        baseline_local_settled_usd=baseline_local_settled_usd,
+                        outstanding_reserve_usd=outstanding_reserve_usd,
+                        posts_result_price_usd=posts_result_price,
+                    ),
+                )
             available = max(
                 0.0,
-                float(global_capacity_usd)
+                atomic_capacity
                 - float(reservations["total_unsettled_usd"]),
             )
-            clamped = min(max(0.0, float(current["max_charge_usd"])), available)
-            if clamped + 1e-12 < minimum:
+            clamped = float(
+                provider_charge_ceiling(
+                    min(max(0.0, float(current["max_charge_usd"])), available)
+                )
+            )
+            if clamped <= 0 or clamped + 1e-12 < minimum:
                 conn.execute(
                     "UPDATE paid_photo_batches SET max_charge_usd=?,updated_at=? "
                     "WHERE id=? AND status='prepared'",
@@ -2240,6 +3105,12 @@ class Database:
             ).fetchone()
             if current is None:
                 raise ValueError(f"unknown paid photo batch: {batch_id}")
+            capture = conn.execute(
+                "SELECT * FROM profile_photo_captures WHERE id=?",
+                (current["photo_capture_id"],),
+            ).fetchone()
+            if capture is None:
+                raise RuntimeError("找不到照片回溯狀態")
             expected_status = (
                 "import_failed" if abandon_import_failed else "needs_reconcile"
             )
@@ -2248,30 +3119,81 @@ class Database:
                     f"paid photo batch {batch_id} is {current['status']}, "
                     f"expected {expected_status}"
                 )
+            diagnostic_id = int(current["actor_run_id"] or 0)
+            diagnostic = (
+                conn.execute(
+                    "SELECT run_id,charged_usd FROM actor_runs WHERE id=?",
+                    (diagnostic_id,),
+                ).fetchone()
+                if diagnostic_id
+                else None
+            )
+            evidence_rows = [dict(current)]
+            if diagnostic:
+                evidence_rows.append(dict(diagnostic))
+            registry_evidence = _provider_run_ownership_evidence(
+                conn, "paid_photo_batch", batch_id
+            )
+            if registry_evidence:
+                evidence_rows.append(registry_evidence)
+            if confirm_not_launched and _provider_evidence_present(*evidence_rows):
+                raise RuntimeError(
+                    "照片批次已有 provider run/dataset/charge 證據；"
+                    "不可確認為未啟動"
+                )
+            resolved_run_id: str | None = None
+            resolved_dataset_id: str | None = None
+            resolved_store_id: str | None = None
+            if normalized_run_id:
+                (
+                    resolved_run_id,
+                    resolved_dataset_id,
+                    resolved_store_id,
+                ) = _resolve_provider_attach(
+                    *evidence_rows,
+                    run_id=normalized_run_id,
+                    dataset_id=dataset_id,
+                    key_value_store_id=key_value_store_id,
+                )
+                _claim_provider_run_ownership(
+                    conn,
+                    provider="apify",
+                    run_id=resolved_run_id,
+                    owner_type="paid_photo_batch",
+                    owner_id=batch_id,
+                    actor_id=str(current["actor_id"] or ""),
+                    request_fingerprint=str(current["request_hash"] or ""),
+                    provider_started_at=current["launched_at"] or now,
+                    metadata={
+                        "dataset_id": str(resolved_dataset_id or ""),
+                        "key_value_store_id": str(resolved_store_id or ""),
+                        "attached_by": "operator_reconcile",
+                    },
+                )
             from .capture_v2 import validate_batch_transition
 
             destination = "run_started" if normalized_run_id else "failed"
             validate_batch_transition(str(current["status"]), destination)
-            diagnostic_id = int(current["actor_run_id"] or 0)
             if normalized_run_id:
                 conn.execute(
                     """UPDATE paid_photo_batches
                     SET status='run_started',run_id=?,dataset_id=?,key_value_store_id=?,
-                        error=NULL,updated_at=?
+                        launched_at=COALESCE(launched_at,?),error=NULL,updated_at=?
                     WHERE id=? AND status='needs_reconcile'""",
                     (
-                        normalized_run_id,
-                        str(dataset_id or ""),
-                        str(key_value_store_id or ""),
+                        resolved_run_id,
+                        resolved_dataset_id,
+                        resolved_store_id,
+                        now,
                         now,
                         batch_id,
                     ),
                 )
                 if diagnostic_id:
                     conn.execute(
-                        """UPDATE actor_runs SET status='running',run_id=?,error=NULL,
+                    """UPDATE actor_runs SET status='running',run_id=?,error=NULL,
                         finished_at=NULL WHERE id=?""",
-                        (normalized_run_id, diagnostic_id),
+                        (resolved_run_id, diagnostic_id),
                     )
             else:
                 reason = (
@@ -2279,17 +3201,94 @@ class Database:
                     if abandon_import_failed
                     else "operator confirmed provider run was not launched"
                 )
-                conn.execute(
-                    """UPDATE paid_photo_batches SET status='failed',error=?,updated_at=?
-                    WHERE id=? AND status=?""",
-                    (reason, now, batch_id, expected_status),
-                )
+                if confirm_not_launched:
+                    conn.execute(
+                        """UPDATE paid_photo_batches
+                        SET status='failed',run_id=NULL,dataset_id=NULL,
+                            key_value_store_id=NULL,error=?,updated_at=?
+                        WHERE id=? AND status=?""",
+                        (reason, now, batch_id, expected_status),
+                    )
+                else:
+                    conn.execute(
+                        """UPDATE paid_photo_batches
+                        SET status='failed',error=?,updated_at=?
+                        WHERE id=? AND status=?""",
+                        (reason, now, batch_id, expected_status),
+                    )
                 if diagnostic_id:
                     conn.execute(
                         """UPDATE actor_runs SET status='failed',error=?,finished_at=?
                         WHERE id=?""",
                         (reason, now, diagnostic_id),
                     )
+            try:
+                checkpoint = json.loads(str(capture["checkpoint_json"] or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                checkpoint = {}
+            if not isinstance(checkpoint, dict):
+                checkpoint = {}
+            if not normalized_run_id:
+                checkpoint["actor_retry_nonce"] = int(
+                    checkpoint.get("actor_retry_nonce") or 0
+                ) + 1
+            if abandon_import_failed:
+                for key in (
+                    "actor_next_cursor",
+                    "actor_seen_cursors",
+                    "actor_batch_id",
+                    "actor_run_id",
+                    "actor_id",
+                    "actor_evidence",
+                    "actor_inventory_completed",
+                    "actor_declared_total",
+                    "actor_discovered_urls",
+                    "actor_discovered_count",
+                    "actor_collected_items",
+                    "actor_processed_item_ids",
+                    "actor_fallback_error",
+                    "actor_media_retry_attempt",
+                    "actor_media_retry_until",
+                    "actor_pending_media_external_ids",
+                    "actor_exhausted_media_external_ids",
+                ):
+                    checkpoint.pop(key, None)
+                checkpoint["completed"] = False
+                checkpoint["terminal_reason"] = ""
+                checkpoint["stalled_reason"] = ""
+            conn.execute(
+                """UPDATE profile_photo_captures SET status='in_progress',
+                checkpoint_json=?,limited_reason=NULL,next_job_at=?,completed_at=NULL,
+                updated_at=? WHERE id=?""",
+                (
+                    json.dumps(checkpoint, ensure_ascii=False, sort_keys=True),
+                    now,
+                    now,
+                    capture["id"],
+                ),
+            )
+            resume_payload = json.dumps(
+                {
+                    "photo_capture_id": int(capture["id"]),
+                    "iteration": int(checkpoint.get("capture_iteration") or 0),
+                    "manual": True,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            conn.execute(
+                """INSERT OR IGNORE INTO jobs(
+                  profile_id,job_type,priority,status,payload_json,available_at,
+                  created_at,dedupe_key
+                ) VALUES(?,'capture_profile_photos',-120,'pending',?,?,?,?)""",
+                (
+                    current["profile_id"],
+                    resume_payload,
+                    now,
+                    now,
+                    f"capture-account-photos:{capture['id']}:reconcile:{batch_id}",
+                ),
+            )
             updated = conn.execute(
                 "SELECT * FROM paid_photo_batches WHERE id=?", (batch_id,)
             ).fetchone()
@@ -2399,6 +3398,28 @@ class Database:
             from .capture_v2 import validate_batch_transition
 
             validate_batch_transition(str(current["status"]), status)
+            incoming_run_id = _transition_provider_run_id(current["run_id"], fields)
+            if status == "run_started" and not (
+                incoming_run_id or _provider_evidence_text(current["run_id"])
+            ):
+                raise RuntimeError("run_started requires a durable provider run_id")
+            if incoming_run_id:
+                _claim_provider_run_ownership(
+                    conn,
+                    provider=str(current["provider"] or ""),
+                    run_id=incoming_run_id,
+                    owner_type="paid_source_batch",
+                    owner_id=batch_id,
+                    actor_id=str(current["actor_id"] or ""),
+                    request_fingerprint=str(current["request_hash"] or ""),
+                    provider_started_at=current["launched_at"] or now,
+                    metadata={
+                        "dataset_id": str(fields.get("dataset_id") or ""),
+                        "key_value_store_id": str(
+                            fields.get("key_value_store_id") or ""
+                        ),
+                    },
+                )
             values = {"status": status, **fields, "updated_at": now}
             if milestone and not current[milestone]:
                 values[milestone] = now
@@ -2420,9 +3441,14 @@ class Database:
         batch_id: int,
         *,
         lease_owner: str,
+        posts_result_price_usd: float,
         claimed_at: str | None = None,
         budget_capacity_usd: float | None = None,
-        posts_result_price_usd: float = 0,
+        cycle_start_at: str | None = None,
+        monthly_limit_usd: float | None = None,
+        provider_used_usd: float = 0,
+        baseline_local_settled_usd: float = 0,
+        outstanding_reserve_usd: float = 0,
     ) -> tuple[dict[str, Any], bool]:
         """Atomically claim a prepared batch before the external Actor launch.
 
@@ -2443,49 +3469,256 @@ class Database:
                 raise ValueError(f"unknown paid source batch: {batch_id}")
             if str(current["status"]) != "prepared" or current["run_id"]:
                 return dict(current), False
-            if budget_capacity_usd is not None:
-                result_price = max(0.0, float(posts_result_price_usd))
-                try:
-                    normalized = json.loads(
-                        str(current["normalized_input_json"] or "{}")
-                    )
-                except (TypeError, json.JSONDecodeError):
-                    normalized = {}
-                maximum = max(
-                    1,
-                    min(
-                        50,
-                        int(
-                            normalized.get("maxPostsPerProfile")
-                            or normalized.get("maxPosts")
-                            or 50
-                        ),
-                    ),
+            result_price = max(0.0, float(posts_result_price_usd))
+            try:
+                normalized = json.loads(
+                    str(current["normalized_input_json"] or "{}")
                 )
-                requested = maximum * result_price
+            except (TypeError, json.JSONDecodeError):
+                normalized = {}
+            maximum = max(
+                1,
+                min(
+                    50,
+                    int(
+                        normalized.get("maxPostsPerProfile")
+                        or normalized.get("maxPosts")
+                        or 50
+                    ),
+                ),
+            )
+            requested = float(provider_charge_ceiling(maximum * result_price))
+            if budget_capacity_usd is not None or (
+                cycle_start_at and monthly_limit_usd is not None
+            ):
                 reservations = self._paid_budget_reservations_in_connection(
                     conn,
                     result_price=result_price,
                     excluding_source_batch_id=batch_id,
                 )
+                capacity = (
+                    max(0.0, float(budget_capacity_usd))
+                    if budget_capacity_usd is not None
+                    else float("inf")
+                )
+                if cycle_start_at and monthly_limit_usd is not None:
+                    capacity = min(
+                        capacity,
+                        self._atomic_paid_capacity_in_connection(
+                            conn,
+                            cycle_start_at=cycle_start_at,
+                            monthly_limit_usd=monthly_limit_usd,
+                            provider_used_usd=provider_used_usd,
+                            baseline_local_settled_usd=(
+                                baseline_local_settled_usd
+                            ),
+                            outstanding_reserve_usd=outstanding_reserve_usd,
+                            posts_result_price_usd=result_price,
+                        ),
+                    )
                 remaining = max(
                     0.0,
-                    float(budget_capacity_usd)
+                    capacity
                     - float(reservations["total_unsettled_usd"]),
                 )
                 if requested <= 0 or requested > remaining + 1e-12:
                     return dict(current), False
             cursor = conn.execute(
                 """UPDATE paid_source_batches
-                SET status='launching',lease_owner=?,leased_at=?,launched_at=COALESCE(launched_at,?),
-                    updated_at=?
+                SET status='launching',max_charge_usd=?,lease_owner=?,leased_at=?,
+                    launched_at=COALESCE(launched_at,?),updated_at=?
                 WHERE id=? AND status='prepared' AND run_id IS NULL""",
-                (lease_owner, claimed_at, claimed_at, claimed_at, batch_id),
+                (
+                    requested,
+                    lease_owner,
+                    claimed_at,
+                    claimed_at,
+                    claimed_at,
+                    batch_id,
+                ),
             )
             row = conn.execute(
                 "SELECT * FROM paid_source_batches WHERE id=?", (batch_id,)
             ).fetchone()
             return dict(row), cursor.rowcount == 1
+
+    def reconcile_paid_source_batch(
+        self,
+        batch_id: int,
+        *,
+        run_id: str | None = None,
+        dataset_id: str | None = None,
+        key_value_store_id: str | None = None,
+        confirm_not_launched: bool = False,
+    ) -> dict[str, Any]:
+        """Resolve one ambiguous Capture V2 post batch without a duplicate buy."""
+
+        normalized_run_id = str(run_id or "").strip()
+        if bool(normalized_run_id) == bool(confirm_not_launched):
+            raise ValueError("provide exactly one of run_id or confirm_not_launched")
+        now = utcnow()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT * FROM paid_source_batches WHERE id=?", (batch_id,)
+            ).fetchone()
+            if current is None:
+                raise ValueError(f"unknown paid source batch: {batch_id}")
+            if str(current["status"]) != "needs_reconcile":
+                raise RuntimeError(
+                    f"paid source batch {batch_id} is {current['status']}, "
+                    "expected needs_reconcile"
+                )
+            evidence_rows = [dict(current)]
+            registry_evidence = _provider_run_ownership_evidence(
+                conn, "paid_source_batch", batch_id
+            )
+            if registry_evidence:
+                evidence_rows.append(registry_evidence)
+            if confirm_not_launched and _provider_evidence_present(*evidence_rows):
+                raise RuntimeError(
+                    "貼文批次已有 provider run/dataset/charge 證據；"
+                    "不可確認為未啟動"
+                )
+            resolved_run_id: str | None = None
+            resolved_dataset_id: str | None = None
+            resolved_store_id: str | None = None
+            if normalized_run_id:
+                (
+                    resolved_run_id,
+                    resolved_dataset_id,
+                    resolved_store_id,
+                ) = _resolve_provider_attach(
+                    *evidence_rows,
+                    run_id=normalized_run_id,
+                    dataset_id=dataset_id,
+                    key_value_store_id=key_value_store_id,
+                )
+                _claim_provider_run_ownership(
+                    conn,
+                    provider=str(current["provider"] or ""),
+                    run_id=resolved_run_id,
+                    owner_type="paid_source_batch",
+                    owner_id=batch_id,
+                    actor_id=str(current["actor_id"] or ""),
+                    request_fingerprint=str(current["request_hash"] or ""),
+                    provider_started_at=current["launched_at"] or now,
+                    metadata={
+                        "dataset_id": str(resolved_dataset_id or ""),
+                        "key_value_store_id": str(resolved_store_id or ""),
+                        "attached_by": "operator_reconcile",
+                    },
+                )
+            epoch = conn.execute(
+                "SELECT is_active FROM capture_epochs WHERE id=?",
+                (current["epoch_id"],),
+            ).fetchone()
+            if not epoch or not bool(epoch["is_active"]):
+                raise RuntimeError("paid source batch belongs to a closed capture epoch")
+
+            replacement_id: int | None = None
+            if normalized_run_id:
+                conn.execute(
+                    """UPDATE paid_source_batches
+                    SET status='run_started',run_id=?,dataset_id=?,key_value_store_id=?,
+                        launched_at=COALESCE(launched_at,?),error=NULL,
+                        lease_owner=NULL,leased_at=COALESCE(leased_at,?),updated_at=?
+                    WHERE id=? AND status='needs_reconcile'""",
+                    (
+                        resolved_run_id,
+                        resolved_dataset_id,
+                        resolved_store_id,
+                        now,
+                        now,
+                        now,
+                        batch_id,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """UPDATE paid_source_batches
+                    SET status='failed',run_id=NULL,dataset_id=NULL,
+                        key_value_store_id=NULL,error=?,lease_owner=NULL,
+                        updated_at=? WHERE id=? AND status='needs_reconcile'""",
+                    (
+                        "operator confirmed provider run was not launched",
+                        now,
+                        batch_id,
+                    ),
+                )
+                replacement_hash = canonical_request_hash(
+                    {
+                        "reconciled_source_batch_id": batch_id,
+                        "original_request_hash": str(current["request_hash"]),
+                        "confirmed_not_launched_at": now,
+                    }
+                )
+                cursor = conn.execute(
+                    """INSERT INTO paid_source_batches(
+                      request_hash,profile_id,epoch_id,coverage_stream_id,contract_id,
+                      provider,actor_id,intent,observation_window,
+                      normalized_input_json,status,input_cursor,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,'prepared',?,?,?)""",
+                    (
+                        replacement_hash,
+                        current["profile_id"],
+                        current["epoch_id"],
+                        current["coverage_stream_id"],
+                        current["contract_id"],
+                        current["provider"],
+                        current["actor_id"],
+                        current["intent"],
+                        current["observation_window"],
+                        current["normalized_input_json"],
+                        current["input_cursor"],
+                        now,
+                        now,
+                    ),
+                )
+                replacement_id = int(cursor.lastrowid)
+
+            conn.execute(
+                """UPDATE coverage_streams SET status='in_progress',limited_reason=NULL,
+                next_job_at=?,updated_at=? WHERE id=?""",
+                (now, now, current["coverage_stream_id"]),
+            )
+            conn.execute(
+                """UPDATE capture_epochs SET status='ready',
+                terminal_reason=NULL,completed_at=NULL,updated_at=? WHERE id=?""",
+                (now, current["epoch_id"]),
+            )
+            resume_batch_id = replacement_id or batch_id
+            resume_payload = json.dumps(
+                {
+                    "epoch_id": int(current["epoch_id"]),
+                    "coverage_stream_id": int(current["coverage_stream_id"]),
+                    "surface": "timeline_posts",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            conn.execute(
+                """INSERT OR IGNORE INTO jobs(
+                  profile_id,job_type,priority,status,payload_json,available_at,
+                  created_at,dedupe_key,epoch_id,batch_id
+                ) VALUES(?,'capture_posts_v2',-300,'pending',?,?,?,?,?,?)""",
+                (
+                    current["profile_id"],
+                    resume_payload,
+                    now,
+                    now,
+                    f"capture-v2:reconcile:{batch_id}:{resume_batch_id}",
+                    current["epoch_id"],
+                    resume_batch_id,
+                ),
+            )
+            updated = conn.execute(
+                "SELECT * FROM paid_source_batches WHERE id=?", (batch_id,)
+            ).fetchone()
+            result = dict(updated)
+            result["replacement_batch_id"] = replacement_id
+            result["resume_batch_id"] = resume_batch_id
+            return result
 
     def prepare_paid_access_probe_batch(
         self,
@@ -2527,6 +3760,7 @@ class Database:
             }
         )
         now = utcnow()
+        desired_max_charge = float(provider_charge_ceiling(max_charge_usd))
         with self.connect() as conn:
             cursor = conn.execute(
                 """INSERT OR IGNORE INTO paid_access_probe_batches(
@@ -2541,7 +3775,7 @@ class Database:
                     actor_id,
                     observation_window,
                     input_json,
-                    max(0.0, float(max_charge_usd)),
+                    desired_max_charge,
                     now,
                     now,
                 ),
@@ -2568,6 +3802,19 @@ class Database:
                 or str(row["normalized_input_json"]) != input_json
             ):
                 raise ValueError("request_hash already belongs to a different paid access probe")
+            if (
+                str(row["status"]) == "prepared"
+                and desired_max_charge > float(row["max_charge_usd"] or 0)
+            ):
+                conn.execute(
+                    """UPDATE paid_access_probe_batches
+                    SET max_charge_usd=?,updated_at=? WHERE id=? AND status='prepared'""",
+                    (desired_max_charge, now, row["id"]),
+                )
+                row = conn.execute(
+                    "SELECT * FROM paid_access_probe_batches WHERE id=?",
+                    (row["id"],),
+                ).fetchone()
             return dict(row), bool(cursor.rowcount)
 
     def transition_paid_access_probe_batch(
@@ -2617,6 +3864,28 @@ class Database:
             from .capture_v2 import validate_batch_transition
 
             validate_batch_transition(str(current["status"]), status)
+            incoming_run_id = _transition_provider_run_id(current["run_id"], fields)
+            if status == "run_started" and not (
+                incoming_run_id or _provider_evidence_text(current["run_id"])
+            ):
+                raise RuntimeError("run_started requires a durable provider run_id")
+            if incoming_run_id:
+                _claim_provider_run_ownership(
+                    conn,
+                    provider=str(current["provider"] or ""),
+                    run_id=incoming_run_id,
+                    owner_type="paid_access_probe_batch",
+                    owner_id=batch_id,
+                    actor_id=str(current["actor_id"] or ""),
+                    request_fingerprint=str(current["request_hash"] or ""),
+                    provider_started_at=current["launched_at"] or now,
+                    metadata={
+                        "dataset_id": str(fields.get("dataset_id") or ""),
+                        "key_value_store_id": str(
+                            fields.get("key_value_store_id") or ""
+                        ),
+                    },
+                )
             values = {"status": status, **fields, "updated_at": now}
             if milestone and not current[milestone]:
                 values[milestone] = now
@@ -2700,6 +3969,57 @@ class Database:
                     f"paid access probe batch {batch_id} is {current['status']}, "
                     "expected needs_reconcile"
                 )
+            diagnostic_id = int(current["actor_run_id"] or 0)
+            diagnostic = (
+                conn.execute(
+                    "SELECT run_id,charged_usd FROM actor_runs WHERE id=?",
+                    (diagnostic_id,),
+                ).fetchone()
+                if diagnostic_id
+                else None
+            )
+            evidence_rows = [dict(current)]
+            if diagnostic:
+                evidence_rows.append(dict(diagnostic))
+            registry_evidence = _provider_run_ownership_evidence(
+                conn, "paid_access_probe_batch", batch_id
+            )
+            if registry_evidence:
+                evidence_rows.append(registry_evidence)
+            if confirm_not_launched and _provider_evidence_present(*evidence_rows):
+                raise RuntimeError(
+                    "公開探測批次已有 provider run/dataset/charge 證據；"
+                    "不可確認為未啟動"
+                )
+            resolved_run_id: str | None = None
+            resolved_dataset_id: str | None = None
+            resolved_store_id: str | None = None
+            if normalized_run_id:
+                (
+                    resolved_run_id,
+                    resolved_dataset_id,
+                    resolved_store_id,
+                ) = _resolve_provider_attach(
+                    *evidence_rows,
+                    run_id=normalized_run_id,
+                    dataset_id=dataset_id,
+                    key_value_store_id=key_value_store_id,
+                )
+                _claim_provider_run_ownership(
+                    conn,
+                    provider=str(current["provider"] or ""),
+                    run_id=resolved_run_id,
+                    owner_type="paid_access_probe_batch",
+                    owner_id=batch_id,
+                    actor_id=str(current["actor_id"] or ""),
+                    request_fingerprint=str(current["request_hash"] or ""),
+                    provider_started_at=current["launched_at"] or now,
+                    metadata={
+                        "dataset_id": str(resolved_dataset_id or ""),
+                        "key_value_store_id": str(resolved_store_id or ""),
+                        "attached_by": "operator_reconcile",
+                    },
+                )
             from .capture_v2 import validate_batch_transition
 
             validate_batch_transition(
@@ -2707,32 +4027,33 @@ class Database:
                 "run_started" if normalized_run_id else "failed",
             )
 
-            diagnostic_id = int(current["actor_run_id"] or 0)
             if normalized_run_id:
                 conn.execute(
                     """UPDATE paid_access_probe_batches
                     SET status='run_started',run_id=?,dataset_id=?,key_value_store_id=?,
-                        error=NULL,updated_at=?
+                        launched_at=COALESCE(launched_at,?),error=NULL,updated_at=?
                     WHERE id=? AND status='needs_reconcile'""",
                     (
-                        normalized_run_id,
-                        str(dataset_id or ""),
-                        str(key_value_store_id or ""),
+                        resolved_run_id,
+                        resolved_dataset_id,
+                        resolved_store_id,
+                        now,
                         now,
                         batch_id,
                     ),
                 )
                 if diagnostic_id:
                     conn.execute(
-                        """UPDATE actor_runs SET status='running',run_id=?,error=NULL,
+                    """UPDATE actor_runs SET status='running',run_id=?,error=NULL,
                         finished_at=NULL WHERE id=?""",
-                        (normalized_run_id, diagnostic_id),
+                        (resolved_run_id, diagnostic_id),
                     )
             else:
                 reason = "operator confirmed provider run was not launched"
                 conn.execute(
                     """UPDATE paid_access_probe_batches
-                    SET status='failed',error=?,updated_at=?
+                    SET status='failed',run_id=NULL,dataset_id=NULL,
+                        key_value_store_id=NULL,error=?,updated_at=?
                     WHERE id=? AND status='needs_reconcile'""",
                     (reason, now, batch_id),
                 )
@@ -2757,8 +4078,9 @@ class Database:
         excluding_photo_batch_id: int | None = None,
     ) -> dict[str, float]:
         source_unsettled = access_unsettled = contract_unsettled = photo_unsettled = 0.0
+        legacy_actor_unsettled = 0.0
         source_rows = conn.execute(
-            """SELECT id,normalized_input_json,charged_usd
+            """SELECT id,normalized_input_json,max_charge_usd,charged_usd
             FROM paid_source_batches
             WHERE status IN ('launching','run_started','needs_reconcile')"""
         ).fetchall()
@@ -2782,10 +4104,20 @@ class Database:
                     ),
                 ),
             )
-            source_unsettled += max(
-                0.0,
-                maximum * result_price - float(row["charged_usd"] or 0),
+            charged = max(0.0, float(row["charged_usd"] or 0))
+            stored_ceiling = max(0.0, float(row["max_charge_usd"] or 0))
+            # V2.1 persists the accepted launch ceiling.  A zero belongs to a
+            # pre-migration row, where the best available conservative floor
+            # is its known charge or a derivation using today's unit price.
+            ceiling = (
+                stored_ceiling
+                if stored_ceiling > 0
+                else max(
+                    charged,
+                    float(provider_charge_ceiling(maximum * result_price)),
+                )
             )
+            source_unsettled += max(0.0, ceiling - charged)
 
         access_rows = conn.execute(
             """SELECT id,max_charge_usd,charged_usd
@@ -2847,13 +4179,39 @@ class Database:
                 )
             contract_unsettled += max(active_remaining, float(ambiguous or 0))
 
+        # A staged rollback may still expose the old V1 Actor path.  Preserve
+        # its accepted provider ceiling in this same global reservation pool so
+        # two processes cannot both spend the same lagging official balance.
+        for row in conn.execute(
+            """SELECT ar.max_charge_usd,ar.charged_usd
+            FROM actor_runs ar
+            WHERE ar.status IN ('running','needs_reconcile')
+              AND COALESCE(ar.max_charge_usd,0)>0
+              AND NOT EXISTS(
+                SELECT 1 FROM paid_photo_batches ppb WHERE ppb.actor_run_id=ar.id
+              )
+              AND NOT EXISTS(
+                SELECT 1 FROM paid_access_probe_batches pab WHERE pab.actor_run_id=ar.id
+              )"""
+        ):
+            legacy_actor_unsettled += max(
+                0.0,
+                float(row["max_charge_usd"] or 0)
+                - float(row["charged_usd"] or 0),
+            )
+
         return {
             "source_unsettled_usd": source_unsettled,
             "access_probe_unsettled_usd": access_unsettled,
             "photo_unsettled_usd": photo_unsettled,
             "contract_test_unsettled_usd": contract_unsettled,
+            "legacy_actor_unsettled_usd": legacy_actor_unsettled,
             "total_unsettled_usd": (
-                source_unsettled + access_unsettled + photo_unsettled + contract_unsettled
+                source_unsettled
+                + access_unsettled
+                + photo_unsettled
+                + contract_unsettled
+                + legacy_actor_unsettled
             ),
         }
 
@@ -2883,6 +4241,179 @@ class Database:
                 excluding_photo_batch_id=excluding_photo_batch_id,
             )
 
+    @staticmethod
+    def _apify_settled_charge_floor_in_connection(
+        conn: sqlite3.Connection,
+        cycle_start_at: str,
+        *,
+        posts_result_price_usd: float,
+    ) -> float:
+        unsettled = {"launching", "run_started", "needs_reconcile"}
+
+        def settled_or_ceiling(row: sqlite3.Row, ceiling: float) -> float:
+            charged = max(0.0, float(row["charged_usd"] or 0))
+            if charged > 0 or str(row["status"] or "") in unsettled:
+                return charged
+            return max(0.0, ceiling)
+
+        floor = 0.0
+        result_price = max(0.0, float(posts_result_price_usd))
+        for row in conn.execute(
+            """SELECT status,charged_usd,max_charge_usd,normalized_input_json
+            FROM paid_source_batches
+            WHERE COALESCE(launched_at,created_at)>=?
+              AND status<>'prepared'
+              AND NOT(status='failed' AND NULLIF(TRIM(run_id),'') IS NULL
+                      AND NULLIF(TRIM(dataset_id),'') IS NULL
+                      AND NULLIF(TRIM(key_value_store_id),'') IS NULL
+                      AND COALESCE(charged_usd,0)<=0)""",
+            (cycle_start_at,),
+        ):
+            try:
+                normalized = json.loads(str(row["normalized_input_json"] or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                normalized = {}
+            maximum = max(
+                1,
+                min(
+                    50,
+                    int(
+                        normalized.get("maxPostsPerProfile")
+                        or normalized.get("maxPosts")
+                        or 50
+                    ),
+                ),
+            )
+            stored_ceiling = max(0.0, float(row["max_charge_usd"] or 0))
+            historical_fallback = max(
+                max(0.0, float(row["charged_usd"] or 0)),
+                float(provider_charge_ceiling(maximum * result_price)),
+            )
+            floor += settled_or_ceiling(
+                row,
+                stored_ceiling if stored_ceiling > 0 else historical_fallback,
+            )
+        for table in ("paid_access_probe_batches", "paid_photo_batches"):
+            for row in conn.execute(
+                f"""SELECT status,charged_usd,max_charge_usd FROM {table}
+                WHERE COALESCE(launched_at,created_at)>=?
+                  AND status<>'prepared'
+                  AND NOT(status='failed' AND NULLIF(TRIM(run_id),'') IS NULL
+                          AND NULLIF(TRIM(dataset_id),'') IS NULL
+                          AND NULLIF(TRIM(key_value_store_id),'') IS NULL
+                          AND COALESCE(charged_usd,0)<=0)""",
+                (cycle_start_at,),
+            ):
+                floor += settled_or_ceiling(
+                    row, max(0.0, float(row["max_charge_usd"] or 0))
+                )
+        for row in conn.execute(
+            """SELECT status,charged_usd,authorized_max_usd FROM contract_runs
+            WHERE COALESCE(leased_at,started_at)>=? AND status<>'pending'
+              AND NOT(status='failed' AND NULLIF(TRIM(run_id),'') IS NULL
+                      AND NULLIF(TRIM(dataset_id),'') IS NULL
+                      AND COALESCE(charged_usd,0)<=0)""",
+            (cycle_start_at,),
+        ):
+            floor += settled_or_ceiling(
+                row, max(0.0, float(row["authorized_max_usd"] or 0))
+            )
+        unlinked = conn.execute(
+            """SELECT COALESCE(SUM(MAX(ar.charged_usd,0)),0) AS charged
+            FROM actor_runs ar WHERE ar.started_at>=?
+              AND NOT EXISTS(
+                SELECT 1 FROM paid_photo_batches ppb WHERE ppb.actor_run_id=ar.id
+              )
+              AND NOT EXISTS(
+                SELECT 1 FROM paid_access_probe_batches pab WHERE pab.actor_run_id=ar.id
+              )""",
+            (cycle_start_at,),
+        ).fetchone()
+        floor += max(0.0, float(unlinked["charged"] or 0))
+        return floor
+
+    def apify_settled_charge_floor(
+        self, cycle_start_at: str, *, posts_result_price_usd: float
+    ) -> float:
+        """Return locally known settled Apify charges for one billing cycle.
+
+        Provider usage can lag just-finished runs. Durable V2 ledgers are the
+        canonical rows for their runs; legacy/unlinked ``actor_runs`` are added
+        separately so the same charge is never counted twice.
+        """
+
+        with self.connect() as conn:
+            conn.execute("BEGIN")
+            floor = self._apify_settled_charge_floor_in_connection(
+                conn,
+                cycle_start_at,
+                posts_result_price_usd=posts_result_price_usd,
+            )
+        return floor
+
+    @classmethod
+    def _atomic_paid_capacity_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        cycle_start_at: str,
+        monthly_limit_usd: float,
+        provider_used_usd: float,
+        baseline_local_settled_usd: float,
+        outstanding_reserve_usd: float,
+        posts_result_price_usd: float,
+    ) -> float:
+        """Recheck newly settled charges inside the launch claim transaction."""
+
+        current_floor = cls._apify_settled_charge_floor_in_connection(
+            conn,
+            cycle_start_at,
+            posts_result_price_usd=posts_result_price_usd,
+        )
+        baseline = max(0.0, float(baseline_local_settled_usd))
+        effective_used = max(max(0.0, float(provider_used_usd)), baseline) + max(
+            0.0, current_floor - baseline
+        )
+        return max(
+            0.0,
+            float(monthly_limit_usd)
+            - effective_used
+            - max(0.0, float(outstanding_reserve_usd)),
+        )
+
+    @staticmethod
+    def _paid_access_committed_or_reserved_in_connection(
+        conn: sqlite3.Connection,
+        cycle_start_at: str,
+        *,
+        excluding_batch_id: int | None = None,
+    ) -> float:
+        """Count this cycle's access-probe spend and ambiguous ceilings once."""
+
+        total = 0.0
+        for row in conn.execute(
+            """SELECT id,status,run_id,dataset_id,key_value_store_id,
+            charged_usd,max_charge_usd
+            FROM paid_access_probe_batches
+            WHERE COALESCE(launched_at,created_at)>=? AND status<>'prepared'""",
+            (cycle_start_at,),
+        ):
+            if excluding_batch_id is not None and int(row["id"]) == int(
+                excluding_batch_id
+            ):
+                continue
+            status = str(row["status"] or "")
+            charged = max(0.0, float(row["charged_usd"] or 0))
+            ceiling = max(0.0, float(row["max_charge_usd"] or 0))
+            if status in {"launching", "run_started", "needs_reconcile"}:
+                total += max(charged, ceiling)
+            elif not (
+                status == "failed"
+                and not _provider_evidence_present(dict(row))
+            ):
+                total += charged if charged > 0 else ceiling
+        return total
+
     def claim_paid_access_probe_launch(
         self,
         batch_id: int,
@@ -2890,6 +4421,13 @@ class Database:
         global_capacity_usd: float,
         detection_capacity_usd: float,
         posts_result_price_usd: float,
+        cycle_start_at: str | None = None,
+        monthly_limit_usd: float | None = None,
+        provider_used_usd: float = 0,
+        baseline_local_settled_usd: float = 0,
+        outstanding_reserve_usd: float = 0,
+        detection_limit_usd: float | None = None,
+        detection_historical_used_usd: float = 0,
     ) -> tuple[dict[str, Any], bool]:
         """Atomically clamp and claim one prepared probe across every ledger."""
 
@@ -2909,27 +4447,66 @@ class Database:
                 result_price=result_price,
                 excluding_access_probe_batch_id=batch_id,
             )
+            atomic_global_capacity = max(0.0, float(global_capacity_usd))
+            if cycle_start_at and monthly_limit_usd is not None:
+                atomic_global_capacity = min(
+                    atomic_global_capacity,
+                    self._atomic_paid_capacity_in_connection(
+                        conn,
+                        cycle_start_at=cycle_start_at,
+                        monthly_limit_usd=monthly_limit_usd,
+                        provider_used_usd=provider_used_usd,
+                        baseline_local_settled_usd=baseline_local_settled_usd,
+                        outstanding_reserve_usd=outstanding_reserve_usd,
+                        posts_result_price_usd=result_price,
+                    ),
+                )
             global_remaining = max(
                 0.0,
-                float(global_capacity_usd)
+                atomic_global_capacity
                 - float(reservations["total_unsettled_usd"]),
             )
-            detection_remaining = max(
-                0.0,
-                float(detection_capacity_usd)
-                - float(reservations["access_probe_unsettled_usd"]),
+            atomic_detection_capacity = max(
+                0.0, float(detection_capacity_usd)
             )
-            clamped = min(
-                max(0.0, float(current["max_charge_usd"] or 0)),
-                global_remaining,
-                detection_remaining,
-            )
-            if clamped + 1e-12 < result_price:
-                conn.execute(
-                    "UPDATE paid_access_probe_batches SET max_charge_usd=?,updated_at=? "
-                    "WHERE id=? AND status='prepared'",
-                    (clamped, now, batch_id),
+            if cycle_start_at and detection_limit_usd is not None:
+                atomic_detection_capacity = min(
+                    atomic_detection_capacity,
+                    max(
+                        0.0,
+                        float(detection_limit_usd)
+                        - max(0.0, float(detection_historical_used_usd))
+                        - self._paid_access_committed_or_reserved_in_connection(
+                            conn,
+                            cycle_start_at,
+                            excluding_batch_id=batch_id,
+                        ),
+                    ),
                 )
+            # The cycle-aware helper already counts terminal charges and the
+            # full ceiling of every ambiguous access probe.  Subtracting the
+            # access reservation again would double-count it and reject a
+            # batch that exactly fits the detection sub-budget.
+            detection_remaining = (
+                atomic_detection_capacity
+                if cycle_start_at and detection_limit_usd is not None
+                else max(
+                    0.0,
+                    atomic_detection_capacity
+                    - float(reservations["access_probe_unsettled_usd"]),
+                )
+            )
+            clamped = float(
+                provider_charge_ceiling(
+                    min(
+                        max(0.0, float(current["max_charge_usd"] or 0)),
+                        global_remaining,
+                        detection_remaining,
+                    )
+                )
+            )
+            minimum = float(provider_charge_ceiling(result_price))
+            if clamped <= 0 or clamped + 1e-12 < minimum:
                 row = conn.execute(
                     "SELECT * FROM paid_access_probe_batches WHERE id=?", (batch_id,)
                 ).fetchone()
@@ -3421,6 +4998,99 @@ class Database:
             "INSERT OR REPLACE INTO schema_migrations(name,applied_at,details_json) VALUES(?,?,?)",
             (name, utcnow(), json.dumps(details or {}, ensure_ascii=False)),
         )
+
+    def claim_legacy_actor_run_launch(
+        self,
+        profile_id: int | None,
+        category: str,
+        actor_id: str,
+        input_variant: str,
+        payload: dict[str, Any],
+        *,
+        max_charge_usd: float,
+        cycle_start_at: str,
+        monthly_limit_usd: float,
+        provider_used_usd: float,
+        baseline_local_settled_usd: float,
+        posts_result_price_usd: float,
+    ) -> tuple[int | None, str | None]:
+        """Atomically reserve the provider ceiling for a legacy V1 call.
+
+        V1 remains disabled by default, but a rollback deployment may still
+        enable it.  The old read-then-launch sequence allowed two processes to
+        spend the same provider balance while the official usage API lagged.
+        This claim shares the V2 ledgers' ``BEGIN IMMEDIATE`` budget snapshot.
+        """
+
+        def redact(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {
+                    key: (
+                        "***"
+                        if any(
+                            secret in key.lower()
+                            for secret in ("token", "cookie", "password", "secret")
+                        )
+                        else redact(item)
+                    )
+                    for key, item in value.items()
+                }
+            if isinstance(value, list):
+                return [redact(item) for item in value]
+            return value
+
+        ceiling = float(provider_charge_ceiling(max_charge_usd))
+        if ceiling <= 0:
+            return None, "zero_provider_ceiling"
+        now = utcnow()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if profile_id is not None:
+                frozen = conn.execute(
+                    """SELECT 1 FROM profiles p
+                    LEFT JOIN profile_source_controls psc
+                      ON psc.profile_id=p.id AND psc.source='apify'
+                    WHERE p.id=? AND (
+                      COALESCE(p.apify_frozen,0)=1 OR COALESCE(psc.frozen,0)=1
+                    )""",
+                    (profile_id,),
+                ).fetchone()
+                if frozen is not None:
+                    return None, "profile_apify_frozen"
+            capacity = self._atomic_paid_capacity_in_connection(
+                conn,
+                cycle_start_at=cycle_start_at,
+                monthly_limit_usd=monthly_limit_usd,
+                provider_used_usd=provider_used_usd,
+                baseline_local_settled_usd=baseline_local_settled_usd,
+                outstanding_reserve_usd=0,
+                posts_result_price_usd=posts_result_price_usd,
+            )
+            reservations = self._paid_budget_reservations_in_connection(
+                conn,
+                result_price=max(0.0, float(posts_result_price_usd)),
+            )
+            if (
+                float(reservations["total_unsettled_usd"]) + ceiling
+                > capacity + 1e-9
+            ):
+                return None, "monthly_budget_capacity"
+            cursor = conn.execute(
+                """INSERT INTO actor_runs(
+                  profile_id,category,actor_id,input_variant,input_json,status,
+                  max_charge_usd,started_at
+                ) VALUES(?,?,?,?,?,'running',?,?)""",
+                (
+                    profile_id,
+                    category,
+                    actor_id,
+                    input_variant,
+                    json.dumps(redact(payload), ensure_ascii=False),
+                    ceiling,
+                    now,
+                ),
+            )
+            return int(cursor.lastrowid), None
 
     def start_actor_run(self, profile_id: int | None, category: str, actor_id: str, input_variant: str, payload: dict[str, Any]) -> int:
         def redact(value: Any) -> Any:

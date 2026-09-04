@@ -43,7 +43,7 @@ capture_v2:
   enabled: true
   special_profile_id: ""
 actors:
-  posts_v2_primary: test/posts-v2
+  posts_v2_primary: spbotdel/facebook-profile-posts-all-photos-scraper
   posts_v2_fallback: test/posts-v2-fallback
   posts_input:
     profileUrls: "{{profile_url}}"

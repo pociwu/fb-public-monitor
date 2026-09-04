@@ -8,12 +8,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from fb_monitor.apify import ActorResult, MonthlyUsage, StartedActor
+from fb_monitor.apify import ActorResult, ActorRunTerminalError, MonthlyUsage, StartedActor
 from fb_monitor.capture_v2 import canonical_input_json
 from fb_monitor.config import load_settings
 from fb_monitor.normalize import normalize_url
 from fb_monitor.serpapi import SerpApiAccount, SerpApiProfileResult
-from fb_monitor.service import ApifyFrozen, BudgetExceeded, MonitorService
+from fb_monitor.service import (
+    ApifyFrozen,
+    BudgetExceeded,
+    DurableActorRunDeferred,
+    MonitorService,
+    PRICES,
+)
 
 
 def make_service(tmp_path: Path, monkeypatch, *, special_profile_id: str = "100") -> MonitorService:
@@ -38,7 +44,7 @@ capture_v2:
   special_capture_reserve_usd: 4
   contract_test_budget_usd: 0.20
 actors:
-  posts_v2_primary: test/posts-v2
+  posts_v2_primary: spbotdel/facebook-profile-posts-all-photos-scraper
   posts_v2_fallback: test/posts-v2-fallback
   posts_input:
     profileUrls: "{{profile_url}}"
@@ -198,6 +204,62 @@ def test_priority_queue_releases_due_ordinary_job_after_four_priority_jobs(
 
     assert selected["id"] == ordinary_id
     assert selected["priority"] == 10
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("current_epoch", "runs_immediately"),
+    [("epoch-1", True), ("epoch-2", False)],
+)
+async def test_posts_successor_bypasses_global_spacing_only_within_same_epoch(
+    tmp_path: Path, monkeypatch, current_epoch: str, runs_immediately: bool
+):
+    service = make_service(tmp_path, monkeypatch)
+    service.settings.spacing_min_minutes = 30
+    service.settings.spacing_max_minutes = 30
+    service.db.execute("DELETE FROM jobs")
+    now = datetime.now(UTC)
+    previous_id = service._enqueue(
+        1,
+        "capture_posts_v2",
+        -100,
+        now,
+        {"epoch_id": "epoch-1", "coverage_stream_id": 1},
+    )
+    service.db.execute(
+        """UPDATE jobs SET status='done',started_at=?,finished_at=? WHERE id=?""",
+        (now.isoformat(), now.isoformat(), previous_id),
+    )
+    current_id = service._enqueue(
+        1,
+        "capture_posts_v2",
+        -100,
+        now,
+        {"epoch_id": current_epoch, "coverage_stream_id": 2},
+    )
+    calls: list[tuple[int, dict]] = []
+
+    async def capture(profile_id: int, payload: dict):
+        calls.append((profile_id, payload))
+
+    monkeypatch.setattr(service, "capture_posts_v2", capture)
+
+    await service._run_next_job()
+
+    current = service.db.row("SELECT * FROM jobs WHERE id=?", (current_id,))
+    if runs_immediately:
+        assert calls == [
+            (1, {"epoch_id": "epoch-1", "coverage_stream_id": 2})
+        ]
+        assert current["status"] == "done"
+        assert current["attempts"] == 1
+    else:
+        assert calls == []
+        assert current["status"] == "pending"
+        assert current["attempts"] == 0
+        assert datetime.fromisoformat(current["available_at"]) >= now + timedelta(
+            minutes=29, seconds=59
+        )
 
 
 @pytest.mark.asyncio
@@ -658,6 +720,7 @@ async def test_capture_posts_persists_raw_before_import_and_commits_explicit_ter
     tmp_path: Path, monkeypatch
 ):
     service = make_service(tmp_path, monkeypatch)
+    service.settings.capture_v2_posts_batch_size = 20
     pass_exact_contract(service)
     _, epoch, coverage = capture_scope(service)
     allow_budget(service)
@@ -710,7 +773,7 @@ async def test_capture_posts_persists_raw_before_import_and_commits_explicit_ter
 
     assert transitions == ["launching", "run_started", "raw_saved", "imported", "committed"]
     assert starts[0]["profileUrls"] == ["https://www.facebook.com/100"]
-    assert starts[0]["maxPostsPerProfile"] == 50
+    assert starts[0]["maxPostsPerProfile"] == 20
     assert starts[0]["expandAllPhotos"] is True
     assert starts[0]["omitPinnedPosts"] is True
     assert starts[0]["knownPostIds"] == []
@@ -725,6 +788,145 @@ async def test_capture_posts_persists_raw_before_import_and_commits_explicit_ter
     assert complete["status"] == "complete"
     assert json.loads(complete["terminal_evidence_json"])["source"] == "SUMMARY"
     assert service.db.row("SELECT COUNT(*) count FROM entities WHERE kind='post'")["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_posts_finish_timeout_resumes_same_run_after_exact_contract_expires(
+    tmp_path: Path, monkeypatch
+):
+    service = make_service(tmp_path, monkeypatch)
+    contract = pass_exact_contract(service)
+    _, epoch, coverage = capture_scope(service)
+    allow_budget(service)
+    starts: list[str] = []
+    finishes: list[str] = []
+
+    async def start(actor_id, payload, max_charge_usd=None):
+        starts.append(actor_id)
+        return StartedActor("durable-post-run", "post-dataset", "post-store")
+
+    async def finish(started):
+        finishes.append(started.run_id)
+        if len(finishes) == 1:
+            raise TimeoutError("provider status query timed out")
+        return ActorResult(
+            [
+                {
+                    "postId": "durable-post-1",
+                    "postUrl": "https://facebook.com/100/posts/durable-post-1",
+                    "text": "already purchased",
+                }
+            ],
+            {
+                "profiles": [
+                    {
+                        "profileId": "100",
+                        "status": "succeeded",
+                        "coverageStatus": "complete",
+                        "hasNextPage": False,
+                    }
+                ]
+            },
+            started.run_id,
+            charged_usd=0.01,
+        )
+
+    service.apify.start = start
+    service.apify.finish = finish
+    payload = {
+        "epoch_id": epoch["id"],
+        "coverage_stream_id": coverage["id"],
+    }
+
+    with pytest.raises(DurableActorRunDeferred, match="同一 run"):
+        await service.capture_posts_v2(1, payload)
+
+    started_batch = service.db.row(
+        "SELECT * FROM paid_source_batches WHERE coverage_stream_id=?",
+        (coverage["id"],),
+    )
+    assert started_batch["status"] == "run_started"
+    assert started_batch["run_id"] == "durable-post-run"
+    service.db.execute(
+        """UPDATE actor_contracts SET status='expired',
+        schema_fingerprint='drifted-after-launch',
+        input_mapping_hash='drifted-after-launch' WHERE id=?""",
+        (contract["id"],),
+    )
+
+    await service.capture_posts_v2(1, payload)
+
+    committed = service.db.row(
+        "SELECT * FROM paid_source_batches WHERE id=?", (started_batch["id"],)
+    )
+    assert starts == [service.settings.actors.posts_v2_primary]
+    assert finishes == ["durable-post-run", "durable-post-run"]
+    assert committed["status"] == "committed"
+    assert service.db.row(
+        "SELECT status FROM coverage_streams WHERE id=?", (coverage["id"],)
+    )["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_full_history_successor_uses_configured_batch_size_and_delay(
+    tmp_path: Path, monkeypatch
+):
+    service = make_service(tmp_path, monkeypatch)
+    service.settings.capture_v2_posts_batch_size = 20
+    service.settings.capture_v2_posts_batch_spacing_min_minutes = 7
+    service.settings.capture_v2_posts_batch_spacing_max_minutes = 7
+    pass_exact_contract(service)
+    _, epoch, coverage = capture_scope(service)
+    allow_budget(service)
+    service.db.execute(
+        "UPDATE jobs SET status='running' WHERE job_type='capture_posts_v2'"
+    )
+    started_payloads: list[dict] = []
+
+    async def start(actor_id, actor_payload, max_charge_usd=None):
+        started_payloads.append(actor_payload)
+        return StartedActor("run-page-1", "dataset-page-1", "store-page-1")
+
+    async def finish(started):
+        return ActorResult(
+            [
+                {
+                    "postId": "page-1-post",
+                    "postUrl": "https://facebook.com/100/posts/page-1-post",
+                    "created_at": "2026-08-20T12:00:00+00:00",
+                }
+            ],
+            {
+                "profiles": [
+                    {
+                        "profileId": "100",
+                        "status": "succeeded",
+                        "pointer": {"nextCursor": "page-2-cursor"},
+                    }
+                ]
+            },
+            started.run_id,
+            charged_usd=0.01,
+        )
+
+    service.apify.start = start
+    service.apify.finish = finish
+    before = datetime.now(UTC)
+
+    await service.capture_posts_v2(
+        1, {"epoch_id": epoch["id"], "coverage_stream_id": coverage["id"]}
+    )
+
+    after = datetime.now(UTC)
+    successor = service.db.row(
+        """SELECT * FROM jobs WHERE job_type='capture_posts_v2'
+        AND status='pending' ORDER BY id DESC LIMIT 1"""
+    )
+    assert started_payloads[0]["maxPostsPerProfile"] == 20
+    assert successor is not None
+    available_at = datetime.fromisoformat(successor["available_at"])
+    assert before + timedelta(minutes=7) <= available_at <= after + timedelta(minutes=7)
+    assert json.loads(successor["payload_json"])["epoch_id"] == epoch["id"]
 
 
 @pytest.mark.asyncio
@@ -1225,6 +1427,49 @@ async def test_ambiguous_launch_is_needs_reconcile_and_is_never_repurchased(
 
 
 @pytest.mark.asyncio
+async def test_started_run_ownership_conflict_is_durable_and_never_repurchased(
+    tmp_path: Path, monkeypatch
+):
+    service = make_service(tmp_path, monkeypatch)
+    pass_exact_contract(service)
+    _, epoch, coverage = capture_scope(service)
+    allow_budget(service)
+    service.db.execute(
+        """INSERT INTO provider_run_registry(
+          provider,run_id,owner_type,owner_id,actor_id,request_fingerprint,
+          metadata_json,created_at,updated_at
+        ) VALUES('apify','reused-provider-run','paid_source_batch',999,
+                 'other/actor','other-request','{}','now','now')"""
+    )
+    starts = 0
+
+    async def start(actor_id, payload, max_charge_usd=None):
+        nonlocal starts
+        starts += 1
+        return StartedActor("reused-provider-run", "reused-dataset", "reused-store")
+
+    service.apify.start = start
+    payload = {"epoch_id": epoch["id"], "coverage_stream_id": coverage["id"]}
+
+    with pytest.raises(RuntimeError, match="run 身分衝突"):
+        await service.capture_posts_v2(1, payload)
+    await service.capture_posts_v2(1, payload)
+
+    batch = service.db.row("SELECT * FROM paid_source_batches")
+    assert starts == 1
+    assert batch["status"] == "needs_reconcile"
+    assert batch["run_id"] is None
+    assert service.db.row(
+        """SELECT run_id FROM provider_run_conflicts
+        WHERE attempted_owner_type='paid_source_batch' AND attempted_owner_id=?""",
+        (batch["id"],),
+    )["run_id"] == "reused-provider-run"
+    assert service.db.row(
+        "SELECT status FROM capture_epochs WHERE id=?", (epoch["id"],)
+    )["status"] == "needs_reconcile"
+
+
+@pytest.mark.asyncio
 async def test_preexisting_launching_without_run_id_becomes_needs_reconcile_without_start(
     tmp_path: Path, monkeypatch
 ):
@@ -1530,6 +1775,53 @@ def test_confirmed_public_special_resumes_capture_without_requeueing_detection(
     assert service.db.row("SELECT COUNT(*) count FROM jobs")["count"] == 0
 
 
+def test_special_capture_reserve_releases_after_timeline_terminal_even_when_auxiliary_is_limited(
+    tmp_path: Path, monkeypatch
+):
+    service = make_service(tmp_path, monkeypatch)
+    service.db.execute("UPDATE profiles SET public_state='public' WHERE id=1")
+    observation = confirm_public_access(service)
+    epoch, _ = service.db.get_or_create_capture_epoch(
+        1,
+        "initial_public_capture",
+        status="ready",
+        scope={
+            "all_public_history": True,
+            "capture_intent": "initial_public_capture",
+            "special": True,
+        },
+        signal_observation_id=int(observation["id"]),
+        reserved_budget_usd=service.settings.special_capture_reserve_usd,
+    )
+    timeline = service.db.upsert_coverage_stream(
+        int(epoch["id"]), stream="posts", surface="timeline_posts"
+    )
+    service.db.update_coverage_stream(int(timeline["id"]), status="in_progress")
+    service.db.update_coverage_stream(
+        int(timeline["id"]),
+        status="complete",
+        terminal_evidence_json={"kind": "feed_exhausted"},
+    )
+    auxiliary = service.db.upsert_coverage_stream(
+        int(epoch["id"]), stream="posts", surface="reels"
+    )
+    service.db.update_coverage_stream(
+        int(auxiliary["id"]),
+        status="source_limited",
+        limited_reason="reels has no contracted collector",
+    )
+    service._refresh_capture_v2_epoch(int(epoch["id"]))
+    assert service.db.row(
+        "SELECT status,is_active FROM capture_epochs WHERE id=?", (epoch["id"],)
+    ) == {"status": "source_limited", "is_active": 0}
+
+    assert service._capture_v2_special_history_complete() is True
+    assert service._capture_v2_outstanding_reserve(
+        spending_profile_id=999,
+        purpose="source_capture",
+    ) == 0.0
+
+
 def test_legacy_public_flag_without_strong_observation_only_schedules_detection(
     tmp_path: Path, monkeypatch
 ):
@@ -1673,6 +1965,240 @@ async def test_restart_requeues_run_started_capture_and_finishes_without_new_lau
     assert service.db.row("SELECT status FROM coverage_streams WHERE id=?", (coverage["id"],))["status"] == "complete"
 
 
+@pytest.mark.asyncio
+async def test_restart_supersedes_stale_committed_job_without_starting_future_successor(
+    tmp_path: Path, monkeypatch
+):
+    service = make_service(tmp_path, monkeypatch)
+    contract = pass_exact_contract(service)
+    profile, epoch, coverage = capture_scope(service)
+    service.db.execute("DELETE FROM jobs")
+    now = datetime.now(UTC)
+    current_id = service._enqueue(
+        1,
+        "capture_posts_v2",
+        -300,
+        now,
+        {
+            "epoch_id": epoch["id"],
+            "coverage_stream_id": coverage["id"],
+            "surface": "timeline_posts",
+        },
+    )
+    actor_payload = service._capture_v2_posts_payload(
+        profile,
+        actor_id=service.settings.actors.posts_v2_primary,
+        maximum=20,
+        cursor=None,
+        known_post_ids=[],
+    )
+    batch, _ = service.db.prepare_paid_source_batch(
+        profile_id=1,
+        epoch_id=epoch["id"],
+        coverage_stream_id=coverage["id"],
+        contract_id=contract["id"],
+        provider="apify",
+        actor_id=contract["actor_id"],
+        intent="recovery_capture",
+        observation_window="committed-recovery-window",
+        normalized_input=actor_payload,
+    )
+    service.db.execute(
+        """UPDATE paid_source_batches SET status='committed',run_id='finished-run',
+        committed_at=?,updated_at=? WHERE id=?""",
+        (now.isoformat(), now.isoformat(), batch["id"]),
+    )
+    service.db.execute(
+        """UPDATE coverage_streams SET provider_checkpoint_json=?,updated_at=?
+        WHERE id=?""",
+        (
+            json.dumps({"request_hash": batch["request_hash"]}),
+            now.isoformat(),
+            coverage["id"],
+        ),
+    )
+    service.db.execute(
+        """UPDATE jobs SET status='running',started_at=?,finished_at=NULL,
+        lease_owner=NULL,leased_at=NULL WHERE id=?""",
+        ((now - timedelta(hours=1)).isoformat(), current_id),
+    )
+    successor_id = service._enqueue(
+        1,
+        "capture_posts_v2",
+        -300,
+        now + timedelta(hours=1),
+        {
+            "epoch_id": epoch["id"],
+            "coverage_stream_id": coverage["id"],
+            "surface": "timeline_posts",
+        },
+    )
+    calls = 0
+
+    async def capture(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(service, "capture_posts_v2", capture)
+
+    recovered = service._recover_stale_capture_v2_jobs()
+    await service._run_next_job()
+
+    assert recovered == {"pending": 0, "needs_reconcile": 0}
+    stale = service.db.row("SELECT * FROM jobs WHERE id=?", (current_id,))
+    successor = service.db.row("SELECT * FROM jobs WHERE id=?", (successor_id,))
+    assert stale["status"] == "superseded"
+    assert "successor" in stale["error"]
+    assert successor["status"] == "pending"
+    assert successor["attempts"] == 0
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_recovered_posts_terminal_unknown_charge_uses_full_batch_ceiling(
+    tmp_path: Path, monkeypatch
+):
+    service = make_service(tmp_path, monkeypatch)
+    contract = pass_exact_contract(service)
+    profile, epoch, coverage = capture_scope(service)
+    actor_payload = service._capture_v2_posts_payload(
+        profile,
+        actor_id=service.settings.actors.posts_v2_primary,
+        maximum=20,
+        cursor=None,
+        known_post_ids=[],
+    )
+    batch, _ = service.db.prepare_paid_source_batch(
+        profile_id=1,
+        epoch_id=epoch["id"],
+        coverage_stream_id=coverage["id"],
+        contract_id=contract["id"],
+        provider="apify",
+        actor_id=contract["actor_id"],
+        intent="recovery_capture",
+        observation_window="terminal-unknown-charge",
+        normalized_input=actor_payload,
+        request_hash="f" * 64,
+    )
+    service.db.transition_paid_source_batch(batch["id"], "launching")
+    service.db.transition_paid_source_batch(
+        batch["id"],
+        "run_started",
+        run_id="terminal-run",
+        dataset_id="terminal-dataset",
+        key_value_store_id="terminal-store",
+    )
+    starts = 0
+
+    async def start(*args, **kwargs):
+        nonlocal starts
+        starts += 1
+        raise AssertionError("recovery must finish the durable run")
+
+    async def finish(started):
+        raise ActorRunTerminalError(
+            started.run_id, "FAILED", "provider did not report charge", None
+        )
+
+    monkeypatch.setattr(service.apify, "start", start)
+    monkeypatch.setattr(service.apify, "finish", finish)
+
+    with pytest.raises(ActorRunTerminalError, match="provider did not report charge"):
+        await service.capture_posts_v2(
+            1, {"epoch_id": epoch["id"], "coverage_stream_id": coverage["id"]}
+        )
+
+    failed = service.db.row(
+        "SELECT * FROM paid_source_batches WHERE id=?", (batch["id"],)
+    )
+    expected = 20 * PRICES["posts"]
+    assert failed["status"] == "failed"
+    assert failed["charged_usd"] == pytest.approx(expected)
+    assert starts == 0
+    assert service.db.apify_settled_charge_floor(
+        "2000-01-01T00:00:00+00:00", posts_result_price_usd=PRICES["posts"]
+    ) == pytest.approx(expected)
+
+
+@pytest.mark.asyncio
+async def test_final_freeze_after_source_claim_returns_batch_to_prepared(
+    tmp_path: Path, monkeypatch
+):
+    service = make_service(tmp_path, monkeypatch)
+    pass_exact_contract(service)
+    _, epoch, coverage = capture_scope(service)
+    allow_budget(service, used=0)
+    original_claim = service.db.claim_paid_source_batch_launch
+
+    def claim_then_freeze(*args, **kwargs):
+        result = original_claim(*args, **kwargs)
+        service.db.execute("UPDATE profiles SET apify_frozen=1 WHERE id=1")
+        return result
+
+    starts = 0
+
+    async def start(*args, **kwargs):
+        nonlocal starts
+        starts += 1
+        raise AssertionError("final freeze must win before Actor start")
+
+    monkeypatch.setattr(service.db, "claim_paid_source_batch_launch", claim_then_freeze)
+    monkeypatch.setattr(service.apify, "start", start)
+
+    with pytest.raises(ApifyFrozen):
+        await service.capture_posts_v2(
+            1, {"epoch_id": epoch["id"], "coverage_stream_id": coverage["id"]}
+        )
+
+    batch = service.db.row("SELECT * FROM paid_source_batches")
+    assert batch["status"] == "prepared"
+    assert batch["launched_at"] is None
+    assert batch["run_id"] is None
+    assert starts == 0
+    assert service.db.apify_settled_charge_floor(
+        "2000-01-01T00:00:00+00:00", posts_result_price_usd=PRICES["posts"]
+    ) == 0
+
+
+@pytest.mark.asyncio
+async def test_final_freeze_after_access_probe_claim_returns_batch_to_prepared(
+    tmp_path: Path, monkeypatch
+):
+    service = make_service(tmp_path, monkeypatch)
+    pass_exact_contract(service)
+    allow_budget(service, used=0)
+    profile = service.db.row("SELECT * FROM profiles WHERE id=1")
+    original_claim = service.db.claim_paid_access_probe_launch
+
+    def claim_then_freeze(*args, **kwargs):
+        result = original_claim(*args, **kwargs)
+        service.db.execute("UPDATE profiles SET apify_frozen=1 WHERE id=1")
+        return result
+
+    starts = 0
+
+    async def start(*args, **kwargs):
+        nonlocal starts
+        starts += 1
+        raise AssertionError("final freeze must win before Actor start")
+
+    monkeypatch.setattr(service.db, "claim_paid_access_probe_launch", claim_then_freeze)
+    monkeypatch.setattr(service.apify, "start", start)
+
+    with pytest.raises(ApifyFrozen):
+        await service._capture_v2_apify_probe(profile)
+
+    batch = service.db.row("SELECT * FROM paid_access_probe_batches")
+    assert batch["status"] == "prepared"
+    assert batch["launched_at"] is None
+    assert batch["actor_run_id"] is None
+    assert batch["run_id"] is None
+    assert starts == 0
+    assert service.db.apify_settled_charge_floor(
+        "2000-01-01T00:00:00+00:00", posts_result_price_usd=PRICES["posts"]
+    ) == 0
+
+
 def test_restart_quarantines_ambiguous_capture_and_contract_launches(
     tmp_path: Path, monkeypatch
 ):
@@ -1704,15 +2230,25 @@ def test_restart_quarantines_ambiguous_capture_and_contract_launches(
     )
     service.db.execute("UPDATE jobs SET status='running' WHERE id=?", (capture_job["id"],))
 
+    grant = service.db.create_contract_test_grant(
+        max_usd=0.20, authorized_by="test"
+    )
+    contract_job_id, _, allocation = service.db.queue_contract_test_job(
+        grant_id=grant["id"],
+        profile_id=1,
+        actor_id=service.settings.actors.posts_v2_fallback,
+        schema_fingerprint="legacy-fallback-fingerprint",
+        fixture_ack=True,
+        priority=-10,
+    )
     pending_contract = service.db.upsert_actor_contract(
         provider="apify",
         actor_id=service.settings.actors.posts_v2_fallback,
         purpose="posts_backfill",
-        schema_fingerprint=service._posts_v2_fingerprint(
-            service.settings.actors.posts_v2_fallback
-        ),
+        schema_fingerprint="legacy-fallback-fingerprint",
         input_mapping_hash="fallback-mapping",
         status="pending",
+        evidence={"test_generation": allocation["test_generation"]},
     )
     contract_run, _ = service.db.record_contract_run(
         pending_contract["id"],
@@ -1722,13 +2258,6 @@ def test_restart_quarantines_ambiguous_capture_and_contract_launches(
     )
     service.db.execute(
         "UPDATE contract_runs SET status='launching' WHERE id=?", (contract_run["id"],)
-    )
-    contract_job_id = service._enqueue(
-        1,
-        "contract_test_posts_v2",
-        -10,
-        service._capture_v2_datetime("2026-08-16T00:00:00+00:00"),
-        {"actor_id": service.settings.actors.posts_v2_fallback},
     )
     service.db.execute("UPDATE jobs SET status='running' WHERE id=?", (contract_job_id,))
 
@@ -1997,7 +2526,22 @@ async def test_contract_test_validates_two_pages_replay_and_known_boundary(
     assert contract["status"] == "passed"
     assert contract["expires_at"]
     assert service.db.row("SELECT COUNT(*) count FROM contract_runs")["count"] == 4
-    assert service.db.row("SELECT COUNT(*) count FROM capture_epochs")["count"] == 0
+    assert service.db.row("SELECT public_state FROM profiles WHERE id=1") == {
+        "public_state": "public"
+    }
+    assert service.db.row(
+        """SELECT source,auth_scope,verdict,identity_match
+        FROM access_observations ORDER BY id DESC LIMIT 1"""
+    ) == {
+        "source": "contract_explicit",
+        "auth_scope": "anonymous",
+        "verdict": "confirmed_public",
+        "identity_match": 1,
+    }
+    assert service.db.row("SELECT COUNT(*) count FROM capture_epochs")["count"] == 1
+    assert service.db.row(
+        "SELECT COUNT(*) count FROM jobs WHERE job_type='capture_posts_v2'"
+    )["count"] == 1
 
     # A deliberate retest is a new generation and must really call the Actor;
     # retrying the same generation replays its durable contract results.
@@ -2173,6 +2717,12 @@ def test_contract_item_guards_parse_time_and_detect_pinned(tmp_path: Path, monke
     assert service._capture_v2_item_published_at({"timestamp": 1_787_200_000_000}) == datetime.fromtimestamp(
         1_787_200_000, UTC
     )
+    assert service._capture_v2_item_published_at(
+        {"created_at": "2026-08-20T12:00:00+08:00"}
+    ) == datetime(2026, 8, 20, 4, 0, tzinfo=UTC)
+    assert service._capture_v2_item_published_at(
+        {"creation_time": 1_787_200_000}
+    ) == datetime.fromtimestamp(1_787_200_000, UTC)
     assert service._capture_v2_item_published_at({"date": "not-a-date"}) is None
 
 
@@ -2369,7 +2919,9 @@ async def test_production_batch_rejects_wrong_profile_before_import_or_cursor_ad
     assert checkpoint["output_cursor"] is None
 
 
-def test_primary_and_fallback_payloads_and_fingerprints_are_isolated(tmp_path: Path, monkeypatch):
+def test_only_primary_actor_has_a_supported_payload_and_fingerprint(
+    tmp_path: Path, monkeypatch
+):
     service = make_service(tmp_path, monkeypatch)
     profile = service.db.row("SELECT * FROM profiles WHERE id=1")
     primary = service._capture_v2_posts_payload(
@@ -2379,21 +2931,20 @@ def test_primary_and_fallback_payloads_and_fingerprints_are_isolated(tmp_path: P
         cursor="primary-cursor",
         known_post_ids=["p1"],
     )
-    fallback = service._capture_v2_posts_payload(
-        profile,
-        actor_id=service.settings.actors.posts_v2_fallback,
-        maximum=10,
-        cursor="fallback-cursor",
-        known_post_ids=["p1"],
-    )
-
     assert primary["profileUrls"] == [profile["url"]]
     assert primary["maxPostsPerProfile"] == 10
     assert primary["omitPinnedPosts"] is True
     assert "startUrls" not in primary and "maxPosts" not in primary
-    assert fallback["startUrls"] == [profile["url"]]
-    assert fallback["maxPosts"] == 10
-    assert "profileUrls" not in fallback and "maxPostsPerProfile" not in fallback
-    assert service._posts_v2_fingerprint(
-        service.settings.actors.posts_v2_primary
-    ) != service._posts_v2_fingerprint(service.settings.actors.posts_v2_fallback)
+    with pytest.raises(ValueError, match="明確.*adapter"):
+        service._capture_v2_posts_payload(
+            profile,
+            actor_id=service.settings.actors.posts_v2_fallback,
+            maximum=10,
+            cursor="fallback-cursor",
+            known_post_ids=["p1"],
+        )
+    with pytest.raises(ValueError, match="明確.*adapter"):
+        service._posts_v2_fingerprint(service.settings.actors.posts_v2_fallback)
+    assert service._posts_v2_contract_candidates() == (
+        service.settings.actors.posts_v2_primary,
+    )

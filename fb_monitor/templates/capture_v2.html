@@ -21,14 +21,14 @@
     <article class="capture-contract">
       <div class="panel-heading"><strong>{{ contract.role }} Actor</strong><span class="badge {{ 'passed' if contract.valid else contract.status }}">{% if contract.valid %}已通過{% elif contract.status == 'passed' %}指紋已失效{% else %}{{ contract.status }}{% endif %}</span></div>
       <p class="break-all">{{ contract.actor_id }}</p>
-      <small>儲存狀態：{{ contract.status }}{% if contract.latest_run_status %} · 最後測試：{{ contract.latest_run_status }}{% endif %}<br>指紋：<span class="break-all capture-fingerprint">{{ contract.fingerprint }}</span><br>當前預期：<span class="break-all capture-fingerprint">{{ contract.expected_fingerprint }}</span>{% if contract.updated_at %}<br>更新：{{ contract.updated_display }}{% endif %}{% if contract.latest_run_error %}<br>錯誤：{{ contract.latest_run_error }}{% endif %}</small>
+      <small>儲存狀態：{{ contract.status }}{% if contract.latest_run_status %} · 最後測試：#{{ contract.latest_run_row_id }} {{ contract.latest_run_status }}{% endif %}<br>指紋：<span class="break-all capture-fingerprint">{{ contract.fingerprint }}</span><br>當前預期：<span class="break-all capture-fingerprint">{{ contract.expected_fingerprint }}</span>{% if contract.updated_at %}<br>更新：{{ contract.updated_display }}{% endif %}{% if contract.latest_run_error %}<br>錯誤：{{ contract.latest_run_error }}{% endif %}</small>
     </article>
   {% else %}<p class="empty">未設定候選 Actor。</p>{% endfor %}
   </div>
 </section>
 
 <section class="panel">
-  <div class="panel-heading"><div><h2>契約測試 grant</h2><small>一次明確核准建立一輪全域共用上限 ${{ "%.2f"|format(contract_budget) }}；不會對每個帳號或候選 Actor 各自重複核准。主要 Actor 失敗後，備援只能使用同輪剩餘，或先結束本輪再明確核准新輪。</small></div></div>
+  <div class="panel-heading"><div><h2>契約測試 grant</h2><small>一次明確核准建立一輪全域共用上限 ${{ "%.2f"|format(contract_budget) }}；不會對每個帳號重複核准。目前只測試具備 V2 adapter 的主要 Actor；測試失敗後需結束本輪或等待到期，再由操作人明確核准新輪。</small></div></div>
   {% if contract_grant %}
   <div class="capture-kv">
     <span>Grant #{{ contract_grant.id }}</span><span class="badge {{ contract_grant.status }}">{{ contract_grant.status }}</span>
@@ -47,11 +47,11 @@
 </section>
 
 <section class="panel">
-  <div class="panel-heading"><div><h2>帳號操作</h2><small>只有已經匿名、身分一致確認公開的 fixture 可執行契約測試。操作人還必須確認該 fixture 預期至少有 25 篇歷史公開貼文；實際 contract 仍只驗證前 20 篇和一次邊界呼叫。</small></div></div>
-  <div class="queue-table"><table><thead><tr><th>帳號</th><th>Apify</th><th>契約測試</th><th>續抓</th></tr></thead><tbody>
+  <div class="panel-heading"><div><h2>帳號操作</h2><small>有匿名、身分一致 confirmed_public 的 fixture 可直接執行契約測試。尚無公開證據時，可人工確認數字 ID fixture，但只會解鎖契約測試；正式回溯仍必須有強公開證據。測試 fixture 預期需有 25+ 篇公開貼文。</small></div></div>
+  <div class="queue-table"><table><thead><tr><th>帳號</th><th>目前閥門</th><th>Apify</th><th>契約測試</th><th>續抓</th></tr></thead><tbody>
   {% for profile in profiles %}
-    <tr><td><a href="/capture-v2?profile_id={{ profile.id }}">{{ profile.display_name or profile.name }}</a><br><small class="break-all">{{ profile.url }}</small><br><small>{{ profile.contract_eligibility_reason }}</small></td><td><span class="badge {{ 'failed' if profile.apify_frozen else 'ok' }}">{{ '已凍結' if profile.apify_frozen else '可用' }}</span></td><td><div class="capture-actions">{% for contract in contracts %}<form method="post" action="/profiles/{{ profile.id }}/capture-v2/contract-test" onsubmit="return confirm('執行 {{ contract.role }} Actor 貼文游標契約測試？會使用本輪 grant 剩餘額度。')"><input type="hidden" name="actor_id" value="{{ contract.actor_id }}"><label><input type="checkbox" name="fixture_ack" value="1" required> 已確認預期有 25+ 篇公開貼文</label><button class="button secondary" type="submit"{% if not enabled or not profile.contract_eligible or not contract_grant or contract_grant.status != 'active' or contracts|selectattr('valid')|list %} disabled{% endif %}>{{ contract.role }}測試</button></form>{% endfor %}</div></td><td><form method="post" action="/profiles/{{ profile.id }}/capture-v2/continue" onsubmit="return confirm('建立或重用此帳號的 Capture V2 epoch，並排入貼文續抓？')"><button class="button" type="submit"{% if not enabled or profile.apify_frozen or not contracts|selectattr('valid')|list %} disabled{% endif %}>繼續回溯</button></form></td></tr>
-  {% else %}<tr><td colspan="4" class="muted">沒有啟用中的帳號。</td></tr>{% endfor %}
+    <tr><td><a href="/capture-v2?profile_id={{ profile.id }}">{{ profile.display_name or profile.name }}</a><br><small class="break-all">{{ profile.url }}</small><br><small>{{ profile.contract_eligibility_reason }}</small></td><td><span class="badge {{ profile.capture_v2_gate.code }}">{{ profile.capture_v2_gate.label }}</span><br><small>{{ profile.capture_v2_gate.reason }}</small></td><td><span class="badge {{ 'failed' if profile.apify_frozen else 'ok' }}">{{ '已凍結' if profile.apify_frozen else '可用' }}</span></td><td><div class="capture-actions">{% for contract in contracts %}<form method="post" action="/profiles/{{ profile.id }}/capture-v2/contract-test" onsubmit="return confirm('執行 {{ contract.role }} Actor 貼文游標契約測試？會使用本輪 grant 剩餘額度。')"><input type="hidden" name="actor_id" value="{{ contract.actor_id }}"><label><input type="checkbox" name="fixture_ack" value="1" required> 已確認預期有 25+ 篇公開貼文</label>{% if not profile.contract_eligible and profile.contract_bootstrap_eligible %}<label><input type="checkbox" name="bootstrap_ack" value="1" required> 人工確認數字 ID {{ profile.numeric_fb_id }}；只用於契約測試</label>{% endif %}<button class="button secondary" type="submit"{% if not enabled or not profile.contract_eligible and not profile.contract_bootstrap_eligible or not contract_grant or contract_grant.status != 'active' or contracts|selectattr('valid')|list %} disabled{% endif %}>{{ contract.role }}測試</button></form>{% endfor %}</div></td><td><form method="post" action="/profiles/{{ profile.id }}/capture-v2/continue" onsubmit="return confirm('建立或重用此帳號的 Capture V2 epoch，並排入貼文續抓？')"><button class="button" type="submit"{% if not enabled or profile.apify_frozen or not profile.contract_eligible or not contracts|selectattr('valid')|list %} disabled{% endif %}>繼續回溯</button></form></td></tr>
+  {% else %}<tr><td colspan="5" class="muted">沒有啟用中的帳號。</td></tr>{% endfor %}
   </tbody></table></div>
 </section>
 

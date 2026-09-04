@@ -158,6 +158,7 @@ class Settings:
     facebook_browser_data_dir: Path = Path("/browser-data")
     facebook_browser_timeout_seconds: int = 60
     photo_actor_fallback_enabled: bool = True
+    photo_actor_fallback_on_browser_guard_long_deferral: bool = True
     photo_actor_max_charge_usd: float = 0.50
     photo_actor_result_price_usd: float = 2.90 / 1000
     telegram_bot_token: str = ""
@@ -173,6 +174,9 @@ class Settings:
     special_detection_budget_usd: float = 0.55
     actor_contract_test_budget_usd: float = 0.20
     actor_contract_test_grant_hours: float = 24
+    capture_v2_posts_batch_size: int = 20
+    capture_v2_posts_batch_spacing_min_minutes: float = 5
+    capture_v2_posts_batch_spacing_max_minutes: float = 10
     browser_account_min_minutes: float = 30
     browser_account_max_minutes: float = 60
     browser_cross_account_min_minutes: float = 2
@@ -243,6 +247,32 @@ def load_settings(path: str | Path | None = None) -> Settings:
         ),
         comments_input=actors_raw.get("comments_input", {}),
     )
+    capture_v2_posts_batch_size = max(
+        1,
+        min(50, int(capture_v2.get("posts_batch_size", 20))),
+    )
+    capture_v2_posts_batch_spacing_min_minutes = max(
+        1.0,
+        min(
+            1440.0,
+            float(capture_v2.get("posts_batch_spacing_min_minutes", 5)),
+        ),
+    )
+    capture_v2_posts_batch_spacing_max_minutes = max(
+        1.0,
+        min(
+            1440.0,
+            float(capture_v2.get("posts_batch_spacing_max_minutes", 10)),
+        ),
+    )
+    if (
+        capture_v2_posts_batch_spacing_max_minutes
+        < capture_v2_posts_batch_spacing_min_minutes
+    ):
+        raise ValueError(
+            "capture_v2.posts_batch_spacing_max_minutes "
+            "不可小於 posts_batch_spacing_min_minutes"
+        )
     settings = Settings(
         config_path=config_path,
         data_dir=data_dir,
@@ -325,6 +355,13 @@ def load_settings(path: str | Path | None = None) -> Settings:
         actor_contract_test_grant_hours=max(
             1.0, float(capture_v2.get("contract_test_grant_hours", 24))
         ),
+        capture_v2_posts_batch_size=capture_v2_posts_batch_size,
+        capture_v2_posts_batch_spacing_min_minutes=(
+            capture_v2_posts_batch_spacing_min_minutes
+        ),
+        capture_v2_posts_batch_spacing_max_minutes=(
+            capture_v2_posts_batch_spacing_max_minutes
+        ),
         browser_account_min_minutes=max(1.0, float(browser_guard.get("account_min_minutes", 30))),
         browser_account_max_minutes=max(1.0, float(browser_guard.get("account_max_minutes", 60))),
         browser_cross_account_min_minutes=max(0.5, float(browser_guard.get("cross_account_min_minutes", 2))),
@@ -334,6 +371,16 @@ def load_settings(path: str | Path | None = None) -> Settings:
         browser_daily_batches=max(1, int(browser_guard.get("daily_batches", 8))),
         browser_breaker_hours=max(1, int(browser_guard.get("breaker_hours", 24))),
         browser_breaker_repeat_hours=max(1, int(browser_guard.get("breaker_repeat_hours", 72))),
+        photo_actor_fallback_on_browser_guard_long_deferral=os.getenv(
+            "PHOTO_ACTOR_FALLBACK_ON_BROWSER_GUARD_LONG_DEFERRAL",
+            str(
+                photo_capture.get(
+                    "actor_fallback_on_browser_guard_long_deferral",
+                    "1",
+                )
+            ),
+        ).lower()
+        in {"1", "true", "yes", "on"},
         evidence_retention_days=max(1, int(evidence.get("retention_days", 180))),
         evidence_cap_bytes=max(1024 * 1024, int(evidence.get("cap_mib", 500)) * 1024 * 1024),
     )

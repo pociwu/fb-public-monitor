@@ -8,6 +8,20 @@ from typing import Any
 from apify_client import ApifyClient
 
 
+def provider_charge_ceiling(value: float | Decimal) -> Decimal:
+    """Return the exact provider Decimal used by both ledger and launch.
+
+    Apify's Python client accepts ``Decimal`` for this field.  Preserving the
+    full decimal avoids both an upward hard-cap breach and a downward limit
+    that cannot pay for the requested result count.
+    """
+
+    amount = Decimal(str(value))
+    if not amount.is_finite() or amount <= 0:
+        return Decimal("0")
+    return amount
+
+
 @dataclass(slots=True)
 class ActorResult:
     items: list[dict[str, Any]]
@@ -23,6 +37,12 @@ class MonthlyUsage:
     used_usd: float
     cycle_start_at: str
     cycle_end_at: str
+    # ``used_usd`` may be an effective, conservative value returned by the
+    # monitor. Keep the raw provider value and the local floor observed at that
+    # same instant so an atomic launch claim can account for newly settled rows
+    # without double-counting the baseline.
+    provider_used_usd: float | None = None
+    local_settled_floor_usd: float = 0.0
 
 
 @dataclass(slots=True)
@@ -103,8 +123,11 @@ class ApifyGateway:
 
     def _call_sync(self, actor_id: str, payload: dict[str, Any], max_charge_usd: float | None) -> ActorResult:
         kwargs: dict[str, Any] = {"run_input": payload, "timeout_secs": 3600}
-        if max_charge_usd is not None and max_charge_usd > 0:
-            kwargs["max_total_charge_usd"] = Decimal(str(round(max_charge_usd, 4)))
+        if max_charge_usd is not None:
+            ceiling = provider_charge_ceiling(max_charge_usd)
+            if ceiling <= 0:
+                raise ValueError("Apify 付費上限正規化後為零；禁止無上限啟動")
+            kwargs["max_total_charge_usd"] = ceiling
         actor = self.client.actor(actor_id)  # type: ignore[union-attr]
         # Never retry without the charge ceiling: the configured monthly hard cap
         # is more important than completing a run against an outdated SDK.
@@ -130,8 +153,11 @@ class ApifyGateway:
 
     def _start_sync(self, actor_id: str, payload: dict[str, Any], max_charge_usd: float | None) -> StartedActor:
         kwargs: dict[str, Any] = {"run_input": payload}
-        if max_charge_usd is not None and max_charge_usd > 0:
-            kwargs["max_total_charge_usd"] = Decimal(str(round(max_charge_usd, 4)))
+        if max_charge_usd is not None:
+            ceiling = provider_charge_ceiling(max_charge_usd)
+            if ceiling <= 0:
+                raise ValueError("Apify 付費上限正規化後為零；禁止無上限啟動")
+            kwargs["max_total_charge_usd"] = ceiling
         run = self.client.actor(actor_id).start(**kwargs)  # type: ignore[union-attr]
         if not run or not run.get("id"):
             raise RuntimeError(f"Actor {actor_id} 未回傳 run 資訊")
@@ -148,16 +174,14 @@ class ApifyGateway:
             raise RuntimeError(f"Actor run {started.run_id} 未回傳完成狀態")
         status = str(run.get("status") or "").upper()
         if status in {"FAILED", "ABORTED", "TIMED-OUT", "TIMED_OUT"}:
+            terminal_charge = run.get("usageTotalUsd")
+            if terminal_charge is None:
+                terminal_charge = run.get("usageUsd")
             raise ActorRunTerminalError(
                 started.run_id,
                 status,
                 str(run.get("statusMessage") or status),
-                (
-                    float(run.get("usageTotalUsd") or run.get("usageUsd"))
-                    if run.get("usageTotalUsd") is not None
-                    or run.get("usageUsd") is not None
-                    else None
-                ),
+                float(terminal_charge) if terminal_charge is not None else None,
             )
         if status not in {"SUCCEEDED"}:
             message = run.get("statusMessage") or status or "unknown"

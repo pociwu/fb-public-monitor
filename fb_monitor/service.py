@@ -20,6 +20,7 @@ from .apify import (
     ApifyGateway,
     MonthlyUsage,
     StartedActor,
+    provider_charge_ceiling,
 )
 from .brightdata import BrightDataError, BrightDataGateway
 from .browser_guard import BrowserDecision, BrowserGuard
@@ -51,7 +52,12 @@ from .capture_v2 import (
     request_hash as capture_request_hash,
 )
 from .config import Settings, actor_input, load_settings
-from .db import Database, canonical_request_hash, utcnow
+from .db import (
+    Database,
+    ProviderRunOwnershipConflict,
+    canonical_request_hash,
+    utcnow,
+)
 from .facebook_browser import (
     FacebookBrowserChallengeRequired,
     FacebookBrowserError,
@@ -83,7 +89,9 @@ NOTIFICATION_HYGIENE_MIGRATION = "notification_hygiene_v5_20260723"
 BROWSER_NAME_REPAIR_MIGRATION = "browser_name_heading_v2_20260803"
 HISTORICAL_NAME_REPAIR_MIGRATION = "historical_profile_name_v1_20260803"
 LATEST_ONLY_BACKFILL_REPAIR_MIGRATION = "latest_only_backfill_v1_20260812"
+CAPTURE_V2_COMMENT_NOOP_RETIREMENT_MIGRATION = "capture_v2_comment_noop_retirement_v1_20260904"
 CAPTURE_V2_CONTRACT_SCHEMA = "posts-summary-cursor-media-target-v2"
+CAPTURE_V2_POSTS_ACTOR = "spbotdel/facebook-profile-posts-all-photos-scraper"
 WORKER_LEASE_MINUTES = 30
 
 
@@ -103,6 +111,14 @@ class BrowserGuardDeferred(RuntimeError):
     def __init__(self, decision: BrowserDecision):
         super().__init__(f"Chromium 安全閘門延後：{decision.reason}")
         self.decision = decision
+
+
+class DurableActorRunDeferred(Exception):
+    """A known provider run needs another finish/poll attempt, not a new buy."""
+
+    def __init__(self, message: str, retry_at: datetime | None = None):
+        super().__init__(message)
+        self.retry_at = retry_at or (datetime.now(UTC) + timedelta(minutes=15))
 
 
 def actor_summary_error(summary: dict[str, Any] | None) -> str | None:
@@ -137,6 +153,8 @@ class MonitorService:
             settings.facebook_browser_data_dir,
             settings.facebook_browser_timeout_seconds,
             settings.browser_canary_max_posts,
+            album_batch_max_operations=settings.browser_album_operations,
+            album_batch_max_seconds=settings.browser_batch_seconds,
         )
         # A separate empty user-data directory is the only browser allowed to
         # confirm anonymous public visibility.  It never shares cookies with
@@ -147,6 +165,8 @@ class MonitorService:
             settings.facebook_browser_timeout_seconds,
             0,
             require_login=False,
+            album_batch_max_operations=settings.browser_album_operations,
+            album_batch_max_seconds=settings.browser_batch_seconds,
         )
         account_spacing = (
             settings.browser_account_min_minutes,
@@ -245,6 +265,7 @@ class MonitorService:
         self._cleanup_capture_raw()
         self._pause_unsafe_v1_jobs()
         self._recover_stale_capture_v2_jobs()
+        self._retire_legacy_capture_v2_comment_jobs()
         self._seed_capture_v2()
         self._seed_browser_name_repair()
         self._seed_historical_name_repair()
@@ -471,6 +492,85 @@ class MonitorService:
             )
         return count
 
+    def _retire_legacy_capture_v2_comment_jobs(self) -> dict[str, int]:
+        """Retire pending comment jobs created by the pre-V2.1 coordinator.
+
+        Those jobs never had an executable comments Actor contract, but each
+        one could still consume the global cross-profile spacing window.  Keep
+        the rows as an audit trail, terminate their matching checkpoints
+        honestly, and leave any already-running row alone.
+        """
+
+        counts = {"jobs_superseded": 0, "coverage_source_limited": 0}
+        if self.db.migration_applied(CAPTURE_V2_COMMENT_NOOP_RETIREMENT_MIGRATION):
+            return counts
+
+        reason = (
+            "V2.1 升級已退役舊版無執行器的留言工作；"
+            "留言 Actor 尚未通過獨立 cursor／nested replies／terminal 契約"
+        )
+        affected_epochs: set[int] = set()
+        jobs = self.db.rows(
+            """SELECT * FROM jobs
+            WHERE job_type='capture_comments_v2' AND status='pending'
+            ORDER BY id"""
+        )
+        for job in jobs:
+            try:
+                payload = json.loads(job.get("payload_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            coverage_id = int(payload.get("coverage_stream_id") or 0)
+            epoch_id = int(payload.get("epoch_id") or 0)
+            profile_id = int(job.get("profile_id") or 0)
+            coverage = None
+            if coverage_id and epoch_id and profile_id:
+                coverage = self.db.row(
+                    """SELECT cs.id,cs.epoch_id,cs.status FROM coverage_streams cs
+                    JOIN capture_epochs ce ON ce.id=cs.epoch_id
+                    WHERE cs.id=? AND cs.epoch_id=? AND ce.profile_id=?
+                      AND cs.stream='comments' AND cs.surface='post_comments'""",
+                    (coverage_id, epoch_id, profile_id),
+                )
+            if coverage and str(coverage.get("status") or "") in {
+                CoverageStatus.PENDING.value,
+                CoverageStatus.IN_PROGRESS.value,
+            }:
+                self.db.update_coverage_stream(
+                    int(coverage["id"]),
+                    status=CoverageStatus.SOURCE_LIMITED.value,
+                    limited_reason=reason,
+                    terminal_evidence_json={},
+                    next_job_at=None,
+                )
+                affected_epochs.add(int(coverage["epoch_id"]))
+                counts["coverage_source_limited"] += 1
+            self.db.execute(
+                """UPDATE jobs SET status='superseded',finished_at=?,error=?,
+                lease_owner=NULL,leased_at=NULL
+                WHERE id=? AND status='pending'""",
+                (utcnow(), reason, job["id"]),
+            )
+            counts["jobs_superseded"] += 1
+
+        for epoch_id in affected_epochs:
+            self._refresh_capture_v2_epoch(epoch_id)
+        self.db.mark_migration(CAPTURE_V2_COMMENT_NOOP_RETIREMENT_MIGRATION, counts)
+        if counts["jobs_superseded"]:
+            self.db.add_event(
+                f"migration:{CAPTURE_V2_COMMENT_NOOP_RETIREMENT_MIGRATION}",
+                "capture_v2_upgrade",
+                {
+                    "title": "Capture V2.1 舊留言工作已退役",
+                    "text": (
+                        f"已保留紀錄並退役 {counts['jobs_superseded']} 個無執行器工作；"
+                        f"結束 {counts['coverage_source_limited']} 個留言覆蓋檢查點。"
+                    ),
+                },
+                notify=False,
+            )
+        return counts
+
     def _recover_stale_capture_v2_jobs(self) -> dict[str, int]:
         """Recover V2 jobs left ``running`` by a stopped container.
 
@@ -535,6 +635,62 @@ class MonitorService:
                         reconcile_reason = "run_started 缺少 run_id；需人工 reconcile"
                     elif batch_status == "needs_reconcile":
                         reconcile_reason = str(batch.get("error") or "付費批次需人工 reconcile")
+                    elif batch_status == "committed":
+                        committed_coverage = self.db.row(
+                            "SELECT provider_checkpoint_json FROM coverage_streams WHERE id=?",
+                            (coverage_stream_id,),
+                        )
+                        try:
+                            committed_checkpoint = json.loads(
+                                str(
+                                    (committed_coverage or {}).get(
+                                        "provider_checkpoint_json"
+                                    )
+                                    or "{}"
+                                )
+                            )
+                        except (TypeError, json.JSONDecodeError):
+                            committed_checkpoint = {}
+                        checkpoint_matches = bool(
+                            isinstance(committed_checkpoint, dict)
+                            and str(committed_checkpoint.get("request_hash") or "")
+                            == str(batch.get("request_hash") or "")
+                        )
+                        successor_exists = False
+                        if checkpoint_matches:
+                            for successor in self.db.rows(
+                                """SELECT payload_json FROM jobs
+                                WHERE profile_id=? AND job_type='capture_posts_v2'
+                                  AND status='pending' ORDER BY id""",
+                                (job["profile_id"],),
+                            ):
+                                try:
+                                    successor_payload = json.loads(
+                                        successor.get("payload_json") or "{}"
+                                    )
+                                except (TypeError, json.JSONDecodeError):
+                                    successor_payload = {}
+                                if (
+                                    int(successor_payload.get("epoch_id") or 0)
+                                    == epoch_id
+                                    and int(
+                                        successor_payload.get("coverage_stream_id") or 0
+                                    )
+                                    == coverage_stream_id
+                                ):
+                                    successor_exists = True
+                                    break
+                        if successor_exists:
+                            self.db.execute(
+                                """UPDATE jobs SET status='superseded',finished_at=?,
+                                error=?,lease_owner=NULL,leased_at=NULL WHERE id=?""",
+                                (
+                                    now,
+                                    "已提交頁面已有節流 successor；停止 crash replay",
+                                    job["id"],
+                                ),
+                            )
+                            continue
                 if reconcile_reason and epoch_id:
                     self.db.execute(
                         "UPDATE capture_epochs SET status='needs_reconcile',updated_at=? WHERE id=?",
@@ -592,11 +748,13 @@ class MonitorService:
                 contract_run = self.db.row(
                     """SELECT cr.* FROM contract_runs cr
                     JOIN actor_contracts ac ON ac.id=cr.contract_id
+                    JOIN contract_test_allocations cta
+                      ON cta.id=cr.grant_allocation_id AND cta.job_id=?
                     WHERE ac.provider='apify' AND ac.actor_id=?
                       AND ac.purpose='posts_backfill'
                       AND cr.status IN ('launching','run_started','needs_reconcile')
                     ORDER BY cr.id DESC LIMIT 1""",
-                    (actor_id,),
+                    (job["id"], actor_id),
                 )
                 if contract_run:
                     run_status = str(contract_run.get("status") or "")
@@ -625,10 +783,31 @@ class MonitorService:
                 )
                 counts["needs_reconcile"] += 1
             else:
+                available_at = now
+                if (
+                    job["job_type"] == "capture_posts_v2"
+                    and batch
+                    and str(batch.get("status") or "") == "committed"
+                    and batch.get("committed_at")
+                ):
+                    minimum_delay = max(
+                        0.0,
+                        float(
+                            getattr(
+                                self.settings,
+                                "capture_v2_posts_batch_spacing_min_minutes",
+                                5,
+                            )
+                        ),
+                    )
+                    earliest = self._capture_v2_datetime(
+                        batch["committed_at"]
+                    ) + timedelta(minutes=minimum_delay)
+                    available_at = max(datetime.now(UTC), earliest).isoformat()
                 self.db.execute(
                     """UPDATE jobs SET status='pending',available_at=?,started_at=NULL,
                     finished_at=NULL,error=NULL,lease_owner=NULL,leased_at=NULL WHERE id=?""",
-                    (now, job["id"]),
+                    (available_at, job["id"]),
                 )
                 counts["pending"] += 1
         return counts
@@ -688,13 +867,13 @@ class MonitorService:
 
     def _posts_v2_fingerprint(self, actor_id: str | None = None) -> str:
         selected = actor_id or self.settings.actors.posts_v2_primary
+        if selected != CAPTURE_V2_POSTS_ACTOR:
+            raise ValueError(
+                f"Capture V2 尚無 {selected} 的明確 input/cursor adapter"
+            )
         payload = {
             "actor_id": selected,
-            "schema": (
-                f"{CAPTURE_V2_CONTRACT_SCHEMA}:spbotdel-profileUrls-maxPostsPerProfile-v1"
-                if selected == self.settings.actors.posts_v2_primary
-                else f"{CAPTURE_V2_CONTRACT_SCHEMA}:fallback-startUrls-maxPosts-v1"
-            ),
+            "schema": f"{CAPTURE_V2_CONTRACT_SCHEMA}:spbotdel-profileUrls-maxPostsPerProfile-v1",
             "mapping": self._posts_v2_contract_mapping(selected),
         }
         return hashlib.sha256(
@@ -702,28 +881,16 @@ class MonitorService:
         ).hexdigest()
 
     def _posts_v2_contract_mapping(self, actor_id: str) -> dict[str, Any]:
-        if actor_id == self.settings.actors.posts_v2_primary:
-            required = {
-                "profileUrls": "list[profile_url]",
-                "maxPostsPerProfile": "max_posts<=50",
-                "expandAllPhotos": True,
-                "omitPinnedPosts": True,
-                "startCursor": "cursor_if_present",
-                "knownPostIds": "known_ids<=20",
-            }
-        elif actor_id == self.settings.actors.posts_v2_fallback:
-            # Fallback has a separate contract on purpose.  If its store
-            # schema changes, only its fingerprint expires; a passed primary
-            # contract can never authorize the fallback payload.
-            required = {
-                "startUrls": "list[profile_url]",
-                "maxPosts": "max_posts<=50",
-                "expandAllPhotos": True,
-                "startCursor": "cursor_if_present",
-                "knownPostIds": "known_ids<=20",
-            }
-        else:
-            raise ValueError("Actor 不在 Capture V2 primary/fallback 候選名單")
+        if actor_id != CAPTURE_V2_POSTS_ACTOR:
+            raise ValueError(f"Capture V2 尚無 {actor_id} 的明確 adapter")
+        required = {
+            "profileUrls": "list[profile_url]",
+            "maxPostsPerProfile": "max_posts<=50",
+            "expandAllPhotos": True,
+            "omitPinnedPosts": True,
+            "startCursor": "cursor_if_present",
+            "knownPostIds": "known_ids<=20",
+        }
         return {"configured": self.settings.actors.posts_input, "required": required}
 
     def _valid_posts_v2_contract(self, actor_id: str | None = None) -> dict[str, Any] | None:
@@ -740,15 +907,23 @@ class MonitorService:
         return contract
 
     def _preferred_posts_v2_contract(self) -> dict[str, Any] | None:
-        for actor_id in dict.fromkeys(
-            (
-                self.settings.actors.posts_v2_primary,
-                self.settings.actors.posts_v2_fallback,
-            )
-        ):
+        for actor_id in self._posts_v2_contract_candidates():
             if contract := self._valid_posts_v2_contract(actor_id):
                 return contract
         return None
+
+    def _posts_v2_contract_candidates(self) -> tuple[str, ...]:
+        """Return only Actors whose configured adapter can satisfy V2.
+
+        ``unseenuser/fb-posts`` paginates internally but does not expose the
+        cross-run cursor/known-ID contract required by Capture V2.  Keeping it
+        out of the candidate list prevents an operator from paying for a test
+        that cannot possibly pass.  A future fallback must receive its own
+        explicit adapter before it is admitted here.
+        """
+
+        primary = str(self.settings.actors.posts_v2_primary or "").strip()
+        return (primary,) if primary == CAPTURE_V2_POSTS_ACTOR else ()
 
     def _ensure_capture_v2_epoch(
         self,
@@ -1486,7 +1661,7 @@ class MonitorService:
         # These fields are the tested Capture V2 contract.  They deliberately
         # win over a stale template so a configuration typo cannot silently
         # turn a cursor run back into a paid first-page request.
-        if selected == self.settings.actors.posts_v2_primary:
+        if selected == CAPTURE_V2_POSTS_ACTOR:
             for stale in ("startUrls", "maxPosts"):
                 payload.pop(stale, None)
             payload.update(
@@ -1498,19 +1673,8 @@ class MonitorService:
                     "omitPinnedPosts": True,
                 }
             )
-        elif selected == self.settings.actors.posts_v2_fallback:
-            for stale in ("profileUrls", "maxPostsPerProfile", "omitPinnedPosts"):
-                payload.pop(stale, None)
-            payload.update(
-                {
-                    "startUrls": [profile_url],
-                    "maxPosts": max_posts,
-                    "knownPostIds": known,
-                    "expandAllPhotos": True,
-                }
-            )
         else:
-            raise ValueError("Actor 不在 Capture V2 primary/fallback 候選名單")
+            raise ValueError(f"Capture V2 尚無 {selected} 的明確 adapter")
         if cursor:
             payload["startCursor"] = str(cursor)
         else:
@@ -1557,6 +1721,9 @@ class MonitorService:
         contract: dict[str, Any] | None = None
         request = ""
         if batch:
+            request = str(batch.get("request_hash") or "")
+            if not request:
+                raise RuntimeError("公開探測批次缺少 durable request_hash")
             actor_id = str(batch["actor_id"])
             try:
                 payload = json.loads(str(batch["normalized_input_json"] or "{}"))
@@ -1636,7 +1803,8 @@ class MonitorService:
                   COALESCE(SUM(CASE
                     WHEN status IN ('launching','run_started','needs_reconcile')
                     THEN MAX(max_charge_usd-charged_usd,0) ELSE 0 END),0) unsettled
-                FROM paid_access_probe_batches WHERE created_at>=?""",
+                FROM paid_access_probe_batches
+                WHERE COALESCE(launched_at,created_at)>=? AND status<>'prepared'""",
                 (usage.cycle_start_at,),
             ) or {"charged": 0, "unsettled": 0}
             detection_charged = (
@@ -1681,19 +1849,15 @@ class MonitorService:
                     "特殊帳號 Apify 公開探測保留額不足",
                     self._usage_cycle_resume(usage),
                 )
-            if batch is None:
-                batch, _ = self.db.prepare_paid_access_probe_batch(
-                    profile_id=profile_id,
-                    contract_id=int(contract["id"]),
-                    provider="apify",
-                    actor_id=actor_id,
-                    observation_window=window.key,
-                    normalized_input=payload,
-                    max_charge_usd=max_charge,
-                    request_hash=request,
-                )
-            batch = self.db.clamp_paid_access_probe_max_charge(
-                int(batch["id"]), max_charge
+            batch, _ = self.db.prepare_paid_access_probe_batch(
+                profile_id=profile_id,
+                contract_id=int(contract["id"]),
+                provider="apify",
+                actor_id=actor_id,
+                observation_window=window.key,
+                normalized_input=payload,
+                max_charge_usd=max_charge,
+                request_hash=request,
             )
             if float(batch["max_charge_usd"] or 0) < PRICES["posts"]:
                 raise BudgetExceeded(
@@ -1747,6 +1911,17 @@ class MonitorService:
                     global_capacity_usd=global_capacity,
                     detection_capacity_usd=detection_capacity,
                     posts_result_price_usd=PRICES["posts"],
+                    cycle_start_at=usage.cycle_start_at,
+                    monthly_limit_usd=self.settings.monthly_budget_usd,
+                    provider_used_usd=(
+                        usage.provider_used_usd
+                        if usage.provider_used_usd is not None
+                        else usage.used_usd
+                    ),
+                    baseline_local_settled_usd=usage.local_settled_floor_usd,
+                    outstanding_reserve_usd=outstanding_reserve,
+                    detection_limit_usd=self.settings.special_detection_budget_usd,
+                    detection_historical_used_usd=float(historical["total"] or 0),
                 )
                 if not claimed:
                     if str(batch.get("status") or "") == "prepared":
@@ -1769,11 +1944,12 @@ class MonitorService:
                 # No await or other external operation may sit between this
                 # final freeze check and start().
                 if self.db.profile_source_frozen(profile_id, "apify"):
-                    self.db.transition_paid_access_probe_batch(
-                        int(batch["id"]),
-                        "failed",
-                        expected_status="launching",
-                        error="凍結於 Actor 啟動邊界生效；未產生付費執行",
+                    self.db.execute(
+                        """UPDATE paid_access_probe_batches
+                        SET status='prepared',launched_at=NULL,actor_run_id=NULL,
+                            error=NULL,updated_at=?
+                        WHERE id=? AND status='launching' AND run_id IS NULL""",
+                        (utcnow(), batch["id"]),
                     )
                     self.db.finish_actor_run(
                         diagnostic_id,
@@ -1796,15 +1972,28 @@ class MonitorService:
                         diagnostic_id, status="needs_reconcile", error=str(exc)
                     )
                     raise RuntimeError("公開探測 Actor launch 結果不明；已停止自動重買") from exc
-                batch = self.db.transition_paid_access_probe_batch(
-                    int(batch["id"]),
-                    "run_started",
-                    expected_status="launching",
-                    run_id=started.run_id,
-                    dataset_id=started.dataset_id,
-                    key_value_store_id=started.key_value_store_id,
-                    error=None,
-                )
+                try:
+                    batch = self.db.transition_paid_access_probe_batch(
+                        int(batch["id"]),
+                        "run_started",
+                        expected_status="launching",
+                        run_id=started.run_id,
+                        dataset_id=started.dataset_id,
+                        key_value_store_id=started.key_value_store_id,
+                        error=None,
+                    )
+                except ProviderRunOwnershipConflict as exc:
+                    self.db.record_provider_run_ownership_conflict(
+                        exc,
+                        actor_id=actor_id,
+                        request_fingerprint=str(batch["request_hash"]),
+                        dataset_id=started.dataset_id,
+                        key_value_store_id=started.key_value_store_id,
+                    )
+                    raise RuntimeError(
+                        "公開探測 Actor 已啟動，但 provider run 身分衝突；"
+                        "已停止自動重買並等待人工對帳"
+                    ) from exc
             else:
                 started = StartedActor(
                     str(batch.get("run_id") or ""),
@@ -1837,21 +2026,46 @@ class MonitorService:
                 try:
                     result = await self.apify.finish(started)
                     path, raw_sha256 = self._save_capture_v2_raw(batch, result)
-                except Exception as exc:
+                except ActorRunTerminalError as exc:
+                    settled_charge = (
+                        max(0.0, float(exc.charged_usd))
+                        if exc.charged_usd is not None
+                        else max(
+                            float(batch.get("max_charge_usd") or 0),
+                            PRICES["posts"],
+                        )
+                    )
                     self.db.transition_paid_access_probe_batch(
                         int(batch["id"]),
-                        "needs_reconcile",
+                        "failed",
                         expected_status="run_started",
+                        charged_usd=settled_charge,
                         error=str(exc)[:4000],
                     )
                     if diagnostic_id:
                         self.db.finish_actor_run(
                             diagnostic_id,
-                            status="needs_reconcile",
+                            status="failed",
                             run_id=str(batch.get("run_id") or ""),
+                            charged_usd=settled_charge,
                             error=str(exc),
                         )
                     raise
+                except Exception as exc:
+                    self.db.execute(
+                        """UPDATE paid_access_probe_batches SET error=?,updated_at=?
+                        WHERE id=? AND status='run_started' AND run_id IS NOT NULL""",
+                        (str(exc)[:4000], utcnow(), batch["id"]),
+                    )
+                    if diagnostic_id:
+                        self.db.execute(
+                            """UPDATE actor_runs SET status='running',error=?,finished_at=NULL
+                            WHERE id=?""",
+                            (str(exc)[:4000], diagnostic_id),
+                        )
+                    raise DurableActorRunDeferred(
+                        "公開探測 Actor run 已知；完成查詢暫時失敗，稍後重試同一 run"
+                    ) from exc
                 raw = self._load_capture_v2_raw(path)
             batch = self.db.transition_paid_access_probe_batch(
                 int(batch["id"]),
@@ -2340,7 +2554,9 @@ class MonitorService:
             "publishedTime",
             "postedAt",
             "createdAt",
+            "created_at",
             "creationTime",
+            "creation_time",
             "date",
             "time",
         ):
@@ -2516,15 +2732,14 @@ class MonitorService:
             raise BudgetExceeded("Capture V2 契約測試付費授權與帳號、Actor 或版本不相符")
         if (
             str(allocation.get("purpose") or "") != "posts_cursor"
-            or str(allocation.get("grant_status") or "") not in {"active", "fulfilled"}
-            or str(allocation.get("job_status") or "") != "running"
             or int(allocation.get("job_profile_id") or 0) != int(profile_id)
             or str(allocation.get("job_type") or "") != "contract_test_posts_v2"
             or float(allocation.get("authorized_usd") or 0) <= 0
         ):
-            raise BudgetExceeded("Capture V2 契約測試付費授權目前不可使用")
-        if self._capture_v2_datetime(allocation["expires_at"]) <= datetime.now(UTC):
-            raise BudgetExceeded("Capture V2 契約測試付費授權已逾期")
+            raise BudgetExceeded("Capture V2 契約測試付費授權資料不完整")
+        # Grant/job liveness is checked only at the new paid launch boundary.
+        # An already-started run remains recoverable after expiry, freezing or
+        # a worker crash; finishing it cannot create another provider charge.
         return allocation
 
     def _capture_v2_contract_launch_authorized(self, allocation_id: int) -> bool:
@@ -2588,9 +2803,13 @@ class MonitorService:
             or float(row.get("authorized_max_usd") or 0) <= 0
         ):
             raise BudgetExceeded("契約測試批次沒有可驗證的付費授權；禁止啟動 Actor")
-        max_charge_usd = min(
-            max(0.0, float(max_charge_usd)),
-            max(0.0, float(row["authorized_max_usd"])),
+        max_charge_usd = float(
+            provider_charge_ceiling(
+                min(
+                    max(0.0, float(max_charge_usd)),
+                    max(0.0, float(row["authorized_max_usd"])),
+                )
+            )
         )
         if max_charge_usd <= 0:
             raise BudgetExceeded("契約測試批次核准額度為零；禁止啟動 Actor")
@@ -2652,9 +2871,17 @@ class MonitorService:
                 int(row["id"]),
                 lease_owner=self.worker_id,
                 monthly_limit_usd=self.settings.monthly_budget_usd,
-                official_used_usd=official_usage.used_usd,
+                official_used_usd=(
+                    official_usage.provider_used_usd
+                    if official_usage.provider_used_usd is not None
+                    else official_usage.used_usd
+                ),
                 outstanding_reserve_usd=outstanding_reserve,
                 posts_result_price_usd=PRICES["posts"],
+                cycle_start_at=official_usage.cycle_start_at,
+                baseline_local_settled_usd=(
+                    official_usage.local_settled_floor_usd
+                ),
             )
             if not claimed:
                 if str(row.get("status") or "") == "succeeded":
@@ -2699,19 +2926,53 @@ class MonitorService:
                 raise RuntimeError(
                     f"契約測試 {test_case} launch 不明，已停止自動重買"
                 ) from exc
-            self.db.execute(
-                """UPDATE contract_runs SET status='run_started',run_id=?,dataset_id=?,leased_at=?
-                WHERE id=? AND status='launching' AND lease_owner=?""",
-                (started.run_id, started.dataset_id, utcnow(), row["id"], self.worker_id),
-            )
+            try:
+                self.db.attach_contract_run_provider_identity(
+                    int(row["id"]),
+                    run_id=started.run_id,
+                    dataset_id=started.dataset_id,
+                    lease_owner=self.worker_id,
+                    provider_started_at=utcnow(),
+                )
+            except ProviderRunOwnershipConflict as exc:
+                self.db.record_provider_run_ownership_conflict(
+                    exc,
+                    actor_id=str(contract["actor_id"]),
+                    request_fingerprint=str(row["request_hash"]),
+                    dataset_id=started.dataset_id,
+                )
+                raise RuntimeError(
+                    "契約測試 Actor 已啟動，但 provider run 身分衝突；"
+                    "已停止自動重買並等待人工對帳"
+                ) from exc
         try:
             result = await self.apify.finish(started)
-        except Exception as exc:
+        except ActorRunTerminalError as exc:
+            settled_charge = (
+                max(0.0, float(exc.charged_usd))
+                if exc.charged_usd is not None
+                else max(float(max_charge_usd), PRICES["posts"])
+            )
             self.db.execute(
-                "UPDATE contract_runs SET status='needs_reconcile',error=?,finished_at=? WHERE id=?",
-                (str(exc)[:4000], utcnow(), row["id"]),
+                """UPDATE contract_runs SET status='failed',charged_usd=?,error=?,finished_at=?
+                WHERE id=?""",
+                (
+                    settled_charge,
+                    str(exc)[:4000],
+                    utcnow(),
+                    row["id"],
+                ),
             )
             raise
+        except Exception as exc:
+            self.db.execute(
+                """UPDATE contract_runs SET status='run_started',error=?,finished_at=NULL
+                WHERE id=? AND run_id IS NOT NULL""",
+                (str(exc)[:4000], row["id"]),
+            )
+            raise DurableActorRunDeferred(
+                f"契約測試 {test_case} 的 Actor run 已知；稍後重試同一 run"
+            ) from exc
         result_json = json.dumps(
             {"items": result.items, "summary": result.summary}, ensure_ascii=False
         )
@@ -2758,15 +3019,10 @@ class MonitorService:
         fixture_minimum = int(payload.get("fixture_expected_min_public_posts") or 0)
         if fixture_ack not in {"1", "true", "yes", "on"} or fixture_minimum < 25:
             raise ValueError("契約測試前須確認此帳號至少有 25 篇可見非置頂貼文")
-        if self.db.profile_source_frozen(profile_id, "apify"):
-            raise ApifyFrozen("此帳號已凍結 Apify；契約測試未啟動付費 Actor")
         actor_id = str(payload.get("actor_id") or self.settings.actors.posts_v2_primary)
-        candidates = {
-            self.settings.actors.posts_v2_primary,
-            self.settings.actors.posts_v2_fallback,
-        }
+        candidates = set(self._posts_v2_contract_candidates())
         if actor_id not in candidates:
-            raise ValueError("Actor 不在 Capture V2 primary/fallback 候選名單")
+            raise ValueError("Actor 沒有可用的 Capture V2 游標契約 adapter")
         test_generation = str(payload.get("contract_test_id") or "")
         if not test_generation:
             raise BudgetExceeded("Capture V2 契約測試缺少耐久測試世代")
@@ -2936,14 +3192,61 @@ class MonitorService:
         )
         if str(passed.get("schema_fingerprint") or "") != schema_fingerprint:
             raise RuntimeError("Capture V2 契約 fingerprint 寫入失敗")
-        refreshed = self.db.row("SELECT * FROM profiles WHERE id=?", (profile_id,)) or profile
-        special = self._special_profile()
-        if (
-            special
-            and int(special["id"]) == profile_id
-            and self._has_confirmed_public_observation(profile_id)
+
+        # A successful contract run is itself an anonymous, identity-bound
+        # public-content verification.  Recording it breaks the former
+        # bootstrap loop in which a contract test required Chromium proof,
+        # while the paid probe capable of supplying equivalent proof required
+        # an already-passed contract.  Production remains fail-closed: only a
+        # fully passed four-case contract reaches this branch.
+        target_id = self._capture_v2_target_id(profile)
+        observation, classification, access_state = self._record_capture_v2_access(
+            profile,
+            source=EvidenceSource.APIFY,
+            source_label="contract_explicit",
+            auth_scope=AuthScope.ANONYMOUS,
+            signal=EvidenceSignal.EXPLICIT_PUBLIC,
+            purpose=ObservationPurpose.VERIFICATION,
+            observed_id=target_id,
+            identity_match=bool(target_id),
+            evidence={
+                "contract_id": int(passed["id"]),
+                "actor_id": actor_id,
+                "schema_fingerprint": schema_fingerprint,
+                "cases": ["page_1", "page_2", "page_2_replay", "known_boundary"],
+                "run_ids": [result.run_id for result in results if result.run_id],
+            },
+            contract_explicit_access=True,
+        )
+        if not (
+            classification is EvidenceClass.STRONG_PUBLIC
+            and access_state is AccessState.CONFIRMED_PUBLIC
         ):
-            self._ensure_capture_v2_epoch(refreshed, "contract_passed")
+            raise RuntimeError("Capture V2 契約通過但未能建立強公開證據")
+        previous_state = str(profile.get("public_state") or "unknown")
+        self.db.execute(
+            "UPDATE profiles SET public_state='public',last_success_at=?,last_error=NULL WHERE id=?",
+            (utcnow(), profile_id),
+        )
+        if previous_state != "public":
+            display = profile.get("display_name") or profile.get("name") or "Facebook"
+            self.db.add_event(
+                f"capture-v2:profile:{profile_id}:opened:{observation['id']}",
+                "profile_opened",
+                {"title": f"{display} 已公開", "source_url": profile["url"]},
+                profile_id,
+            )
+
+        # One validated adapter is reusable across profiles.  Wake every
+        # confirmed-public pending history instead of only the special profile;
+        # the durable global queue and monthly budget still serialize launches.
+        for candidate in self.db.rows(
+            "SELECT * FROM profiles WHERE enabled=1 ORDER BY id"
+        ):
+            if self._has_confirmed_public_observation(int(candidate["id"])):
+                self._resume_or_seed_capture_v2_history(
+                    candidate, "contract_passed_sweep"
+                )
 
     def _capture_v2_raw_path(self, request_hash: str) -> Path:
         return self._provider_raw_path("capture-v2", request_hash)
@@ -3179,11 +3482,34 @@ class MonitorService:
         }
         if scope.get("capture_intent"):
             successor_payload["intent"] = str(scope["capture_intent"])
+        minimum_delay = max(
+            0.0,
+            float(
+                getattr(
+                    self.settings,
+                    "capture_v2_posts_batch_spacing_min_minutes",
+                    5,
+                )
+            ),
+        )
+        maximum_delay = max(
+            minimum_delay,
+            float(
+                getattr(
+                    self.settings,
+                    "capture_v2_posts_batch_spacing_max_minutes",
+                    10,
+                )
+            ),
+        )
+        available = datetime.now(UTC) + timedelta(
+            minutes=random.uniform(minimum_delay, maximum_delay)
+        )
         return self._enqueue(
             profile_id,
             "capture_posts_v2",
             int(epoch.get("priority") or -50),
-            datetime.now(UTC),
+            available,
             successor_payload,
         )
 
@@ -3283,12 +3609,15 @@ class MonitorService:
         profile: dict[str, Any],
         epoch: dict[str, Any],
     ) -> None:
-        """Create one comments checkpoint/job per post, after posts terminal.
+        """Record comment coverage honestly without queueing no-op jobs.
 
         The comments Actor is intentionally not authorized by the posts
-        contract.  Jobs are still made durable now; the handler records an
-        explicit source limitation until an exact ``comments_backfill``
-        contract is available, rather than spending through the V1 path.
+        contract and the V2 durable comments executor is not implemented yet.
+        Previously one doomed job was queued for every post; global spacing
+        could then spend days processing work that was guaranteed not to call
+        Apify.  Create the durable checkpoints, mark their common limitation
+        synchronously, and enqueue nothing until an executable comments
+        contract exists.
         """
 
         contract = self.db.valid_actor_contract(
@@ -3303,31 +3632,21 @@ class MonitorService:
             provider="apify",
             contract_id=int(contract["id"]) if contract else None,
         )
+        reason = (
+            "留言 Actor 尚未通過獨立 cursor／nested replies／terminal 契約；未啟動付費 Actor"
+            if not contract
+            else "留言 Actor 契約已登錄，但 V2 durable cursor executor 尚未啟用；未啟動付費 Actor"
+        )
         for checkpoint in checkpoints:
-            dedupe_key = f"capture-v2:comments:{epoch['id']}:{checkpoint.post_entity_id}"
-            # The active-only unique index intentionally permits later retries,
-            # but terminal-post reconciliation can itself be replayed.  Do not
-            # turn a committed-batch replay into a second historical comments
-            # purchase for a checkpoint that already has a durable job record.
-            if self.db.row(
-                "SELECT id FROM jobs WHERE dedupe_key=? ORDER BY id LIMIT 1",
-                (dedupe_key,),
-            ):
-                continue
-            self.db.queue_unique_job(
-                profile_id=int(profile["id"]),
-                job_type="capture_comments_v2",
-                priority=int(epoch.get("priority") or -50) + 1,
-                dedupe_key=dedupe_key,
-                payload={
-                    "epoch_id": int(epoch["id"]),
-                    "coverage_stream_id": checkpoint.coverage_stream_id,
-                    "post_entity_id": checkpoint.post_entity_id,
-                    "post_external_id": checkpoint.post_external_id,
-                    "post_url": checkpoint.post_url,
-                },
-                epoch_id=int(epoch["id"]),
+            self.db.update_coverage_stream(
+                checkpoint.coverage_stream_id,
+                provider="apify",
+                contract_id=int(contract["id"]) if contract else None,
+                status=CoverageStatus.SOURCE_LIMITED.value,
+                limited_reason=reason,
+                terminal_evidence_json={},
             )
+        self._refresh_capture_v2_epoch(int(epoch["id"]))
 
     async def capture_comments_v2(self, profile_id: int, payload: dict[str, Any]) -> None:
         """Fail closed until a separately tested comments cursor contract exists."""
@@ -3567,10 +3886,21 @@ class MonitorService:
         special = self._special_profile()
         if not special:
             return False
+        # Auxiliary surfaces (reels, standalone photo pages, avatar history)
+        # may honestly conclude as source_limited even after the timeline
+        # itself reached a verified terminal.  The special reserve protects
+        # the post-history objective, so release it from the same evidence
+        # used by _capture_v2_concluded_history: a closed, complete
+        # timeline_posts stream belonging to a full-history epoch.
         for row in self.db.rows(
-            """SELECT scope_json FROM capture_epochs
-            WHERE profile_id=? AND is_active=0 AND status='complete'
-            ORDER BY id DESC""",
+            """SELECT ce.scope_json FROM capture_epochs ce
+            JOIN coverage_streams cs ON cs.epoch_id=ce.id
+              AND cs.stream='posts' AND cs.surface='timeline_posts'
+              AND cs.scope_type='profile' AND cs.scope_id=''
+              AND cs.status='complete'
+            WHERE ce.profile_id=? AND ce.is_active=0
+              AND ce.status IN ('complete','source_limited')
+            ORDER BY COALESCE(ce.completed_at,ce.updated_at) DESC,ce.id DESC""",
             (special["id"],),
         ):
             try:
@@ -3645,71 +3975,13 @@ class MonitorService:
             raise ValueError("Capture V2 posts 僅接受 timeline_posts surface")
         if str(coverage.get("status")) == CoverageStatus.COMPLETE.value:
             return
-        if not self._has_confirmed_public_observation(profile_id):
-            if str(coverage.get("status") or "") in {
-                CoverageStatus.PENDING.value,
-                CoverageStatus.IN_PROGRESS.value,
-                CoverageStatus.BUDGET_PAUSED.value,
-                CoverageStatus.MANUAL_PAUSED.value,
-            }:
-                self.db.update_coverage_stream(
-                    int(coverage["id"]),
-                    status=CoverageStatus.MANUAL_PAUSED.value,
-                    limited_reason="缺少匿名且身分一致的 confirmed_public 存取證據",
-                )
-            self.db.execute(
-                "UPDATE capture_epochs SET status='manual_paused',updated_at=? WHERE id=?",
-                (utcnow(), epoch["id"]),
-            )
-            raise RuntimeError("Capture V2 尚未取得匿名 confirmed_public 證據；禁止付費")
-
-        contract: dict[str, Any] | None = None
-        actor_id = ""
-        if coverage.get("contract_id") is not None:
-            selected = self.db.row(
-                """SELECT * FROM actor_contracts WHERE id=? AND provider='apify'
-                AND purpose='posts_backfill' AND status='passed'""",
-                (coverage["contract_id"],),
-            )
-            if selected:
-                actor_id = str(selected.get("actor_id") or "")
-                exact = self._valid_posts_v2_contract(actor_id)
-                if exact and int(exact["id"]) == int(selected["id"]):
-                    contract = exact
-        else:
-            contract = self._preferred_posts_v2_contract()
-            if contract:
-                actor_id = str(contract["actor_id"])
-                self.db.update_coverage_stream(
-                    int(coverage["id"]), contract_id=int(contract["id"]), provider="apify"
-                )
-                coverage = self.db.row(
-                    "SELECT * FROM coverage_streams WHERE id=?", (coverage["id"],)
-                ) or coverage
-        if not contract:
-            self.db.update_coverage_stream(
-                int(coverage["id"]),
-                status=CoverageStatus.MANUAL_PAUSED.value,
-                limited_reason="缺少 exact fingerprint passed contract",
-            )
-            self.db.execute(
-                "UPDATE capture_epochs SET status='awaiting_contract',updated_at=? WHERE id=?",
-                (utcnow(), epoch["id"]),
-            )
-            raise RuntimeError("Capture V2 缺少 exact fingerprint passed contract；禁止付費")
-
-        if str(coverage.get("status")) != CoverageStatus.IN_PROGRESS.value:
-            self.db.update_coverage_stream(
-                int(coverage["id"]),
-                status=CoverageStatus.IN_PROGRESS.value,
-                limited_reason=None,
-                terminal_evidence_json={},
-            )
-            coverage = self.db.row(
-                "SELECT * FROM coverage_streams WHERE id=?", (coverage["id"],)
-            ) or coverage
-
-        maximum = 50
+        maximum = max(
+            1,
+            min(
+                50,
+                int(getattr(self.settings, "capture_v2_posts_batch_size", 20)),
+            ),
+        )
         try:
             checkpoint = json.loads(coverage.get("provider_checkpoint_json") or "{}")
         except (TypeError, json.JSONDecodeError):
@@ -3727,6 +3999,101 @@ class MonitorService:
                 != str(latest_batch["request_hash"])
             )
         )
+        # Once a durable batch has crossed the paid boundary, finishing or
+        # replaying that exact persisted run must come before today's access,
+        # contract-expiry, budget, or operator-freeze gates.  Those gates may
+        # prevent a *new* purchase, but they must never strand an already-paid
+        # run or cause a second launch after a transient finish() failure.
+        recovery_without_current_gates = bool(
+            recover_latest
+            and latest_batch
+            and str(latest_batch.get("status") or "") != "prepared"
+        )
+
+        contract: dict[str, Any] | None = None
+        actor_id = ""
+        if recovery_without_current_gates:
+            assert latest_batch is not None
+            actor_id = str(latest_batch.get("actor_id") or "")
+            selected = self.db.row(
+                """SELECT * FROM actor_contracts WHERE id=? AND provider='apify'
+                AND purpose='posts_backfill'""",
+                (latest_batch.get("contract_id"),),
+            )
+            persisted_contract_is_exact = bool(
+                selected
+                and actor_id
+                and str(selected.get("actor_id") or "") == actor_id
+            )
+            if not persisted_contract_is_exact:
+                raise RuntimeError("已付款 batch 的 exact Actor/contract 證據損毀；禁止重買")
+            contract = selected
+        else:
+            if not self._has_confirmed_public_observation(profile_id):
+                if str(coverage.get("status") or "") in {
+                    CoverageStatus.PENDING.value,
+                    CoverageStatus.IN_PROGRESS.value,
+                    CoverageStatus.BUDGET_PAUSED.value,
+                    CoverageStatus.MANUAL_PAUSED.value,
+                }:
+                    self.db.update_coverage_stream(
+                        int(coverage["id"]),
+                        status=CoverageStatus.MANUAL_PAUSED.value,
+                        limited_reason="缺少匿名且身分一致的 confirmed_public 存取證據",
+                    )
+                self.db.execute(
+                    "UPDATE capture_epochs SET status='manual_paused',updated_at=? WHERE id=?",
+                    (utcnow(), epoch["id"]),
+                )
+                raise RuntimeError("Capture V2 尚未取得匿名 confirmed_public 證據；禁止付費")
+
+            if coverage.get("contract_id") is not None:
+                selected = self.db.row(
+                    """SELECT * FROM actor_contracts WHERE id=? AND provider='apify'
+                    AND purpose='posts_backfill' AND status='passed'""",
+                    (coverage["contract_id"],),
+                )
+                if selected:
+                    actor_id = str(selected.get("actor_id") or "")
+                    exact = self._valid_posts_v2_contract(actor_id)
+                    if exact and int(exact["id"]) == int(selected["id"]):
+                        contract = exact
+            else:
+                contract = self._preferred_posts_v2_contract()
+                if contract:
+                    actor_id = str(contract["actor_id"])
+                    self.db.update_coverage_stream(
+                        int(coverage["id"]),
+                        contract_id=int(contract["id"]),
+                        provider="apify",
+                    )
+                    coverage = self.db.row(
+                        "SELECT * FROM coverage_streams WHERE id=?", (coverage["id"],)
+                    ) or coverage
+            if not contract:
+                self.db.update_coverage_stream(
+                    int(coverage["id"]),
+                    status=CoverageStatus.MANUAL_PAUSED.value,
+                    limited_reason="缺少 exact fingerprint passed contract",
+                )
+                self.db.execute(
+                    "UPDATE capture_epochs SET status='awaiting_contract',updated_at=? WHERE id=?",
+                    (utcnow(), epoch["id"]),
+                )
+                raise RuntimeError("Capture V2 缺少 exact fingerprint passed contract；禁止付費")
+
+        assert contract is not None
+        if str(coverage.get("status")) != CoverageStatus.IN_PROGRESS.value:
+            self.db.update_coverage_stream(
+                int(coverage["id"]),
+                status=CoverageStatus.IN_PROGRESS.value,
+                limited_reason=None,
+                terminal_evidence_json={},
+            )
+            coverage = self.db.row(
+                "SELECT * FROM coverage_streams WHERE id=?", (coverage["id"],)
+            ) or coverage
+
         if recover_latest:
             batch = latest_batch
             if (
@@ -3748,7 +4115,7 @@ class MonitorService:
                     int(
                         actor_payload.get("maxPostsPerProfile")
                         or actor_payload.get("maxPosts")
-                        or 50
+                        or maximum
                     ),
                 ),
             )
@@ -3842,6 +4209,7 @@ class MonitorService:
                 request_hash=request,
             )
         status = str(batch["status"])
+        requested = float(provider_charge_ceiling(maximum * PRICES["posts"]))
         if status == "committed":
             raw = self._load_capture_v2_raw(batch["raw_path"])
             self._capture_v2_validate_actor_result(
@@ -3903,7 +4271,6 @@ class MonitorService:
                     )
                     raise ApifyFrozen("此帳號已凍結 Apify；Capture V2 未啟動付費 Actor")
                 _, usage = await self._official_available()
-                requested = maximum * PRICES["posts"]
                 outstanding_reserve = self._capture_v2_outstanding_reserve(
                     spending_profile_id=profile_id,
                     purpose="source_capture",
@@ -3956,6 +4323,15 @@ class MonitorService:
                     lease_owner=self.worker_id,
                     budget_capacity_usd=budget_capacity,
                     posts_result_price_usd=PRICES["posts"],
+                    cycle_start_at=usage.cycle_start_at,
+                    monthly_limit_usd=self.settings.monthly_budget_usd,
+                    provider_used_usd=(
+                        usage.provider_used_usd
+                        if usage.provider_used_usd is not None
+                        else usage.used_usd
+                    ),
+                    baseline_local_settled_usd=usage.local_settled_floor_usd,
+                    outstanding_reserve_usd=outstanding_reserve,
                 )
                 if not claimed:
                     if str(batch.get("status") or "") == "prepared":
@@ -3998,7 +4374,10 @@ class MonitorService:
                     )
                     raise ApifyFrozen("此帳號已凍結 Apify；Capture V2 未啟動付費 Actor")
                 try:
-                    started = await self.apify.start(actor_id, actor_payload, requested)
+                    launch_ceiling = float(batch.get("max_charge_usd") or requested)
+                    started = await self.apify.start(
+                        actor_id, actor_payload, launch_ceiling
+                    )
                 except Exception as exc:
                     self.db.transition_paid_source_batch(
                         int(batch["id"]),
@@ -4011,17 +4390,30 @@ class MonitorService:
                         (utcnow(), epoch_id),
                     )
                     raise RuntimeError("Actor launch 結果不明；已停止自動重買") from exc
-                batch = self.db.transition_paid_source_batch(
-                    int(batch["id"]),
-                    "run_started",
-                    expected_status="launching",
-                    run_id=started.run_id,
-                    dataset_id=started.dataset_id,
-                    key_value_store_id=started.key_value_store_id,
-                    lease_owner=self.worker_id,
-                    leased_at=utcnow(),
-                    error=None,
-                )
+                try:
+                    batch = self.db.transition_paid_source_batch(
+                        int(batch["id"]),
+                        "run_started",
+                        expected_status="launching",
+                        run_id=started.run_id,
+                        dataset_id=started.dataset_id,
+                        key_value_store_id=started.key_value_store_id,
+                        lease_owner=self.worker_id,
+                        leased_at=utcnow(),
+                        error=None,
+                    )
+                except ProviderRunOwnershipConflict as exc:
+                    self.db.record_provider_run_ownership_conflict(
+                        exc,
+                        actor_id=actor_id,
+                        request_fingerprint=str(batch["request_hash"]),
+                        dataset_id=started.dataset_id,
+                        key_value_store_id=started.key_value_store_id,
+                    )
+                    raise RuntimeError(
+                        "Capture V2 Actor 已啟動，但 provider run 身分衝突；"
+                        "已停止自動重買並等待人工對帳"
+                    ) from exc
             else:
                 started = StartedActor(
                     str(batch.get("run_id") or ""),
@@ -4043,18 +4435,54 @@ class MonitorService:
             try:
                 result = await self.apify.finish(started)
                 path, raw_sha256 = self._save_capture_v2_raw(batch, result)
-            except Exception as exc:
+            except ActorRunTerminalError as exc:
+                launch_ceiling = float(batch.get("max_charge_usd") or requested)
+                settled_charge = (
+                    max(0.0, float(exc.charged_usd))
+                    if exc.charged_usd is not None
+                    else max(
+                        launch_ceiling,
+                        float(provider_charge_ceiling(PRICES["posts"])),
+                    )
+                )
                 self.db.transition_paid_source_batch(
                     int(batch["id"]),
-                    "needs_reconcile",
+                    "failed",
                     expected_status="run_started",
+                    charged_usd=settled_charge,
                     error=str(exc)[:4000],
                 )
-                self.db.execute(
-                    "UPDATE capture_epochs SET status='needs_reconcile',updated_at=? WHERE id=?",
-                    (utcnow(), epoch_id),
+                self.db.update_coverage_stream(
+                    coverage_stream_id,
+                    status=CoverageStatus.FAILED.value,
+                    limited_reason=str(exc)[:4000],
+                    terminal_evidence_json={},
                 )
+                self.db.set_profile_source_control(
+                    profile_id,
+                    "apify",
+                    frozen=True,
+                    reason=(
+                        "Capture V2 Actor run 明確失敗；已停止此帳號的 Apify，"
+                        "等待人工檢查或切換"
+                    ),
+                    metadata={
+                        "batch_id": int(batch["id"]),
+                        "run_id": str(batch.get("run_id") or ""),
+                        "status": exc.status,
+                    },
+                )
+                self._refresh_capture_v2_epoch(epoch_id)
                 raise
+            except Exception as exc:
+                self.db.execute(
+                    """UPDATE paid_source_batches SET error=?,updated_at=?
+                    WHERE id=? AND status='run_started' AND run_id IS NOT NULL""",
+                    (str(exc)[:4000], utcnow(), batch["id"]),
+                )
+                raise DurableActorRunDeferred(
+                    "Capture V2 Actor run 已知；完成查詢暫時失敗，稍後重試同一 run"
+                ) from exc
             batch = self.db.transition_paid_source_batch(
                 int(batch["id"]),
                 "raw_saved",
@@ -4089,6 +4517,15 @@ class MonitorService:
                 status=CoverageStatus.FAILED.value,
                 limited_reason=summary_error,
             )
+            self.db.invalidate_actor_contract(int(contract["id"]), summary_error)
+            self.db.set_profile_source_control(
+                profile_id,
+                "apify",
+                frozen=True,
+                reason="Capture V2 SUMMARY 不符合契約；等待人工重測或切換 Actor",
+                metadata={"batch_id": int(batch["id"]), "error": summary_error},
+            )
+            self._refresh_capture_v2_epoch(epoch_id)
             raise RuntimeError(summary_error)
 
         try:
@@ -4112,6 +4549,15 @@ class MonitorService:
                 status=CoverageStatus.FAILED.value,
                 limited_reason=str(exc)[:4000],
             )
+            self.db.invalidate_actor_contract(int(contract["id"]), str(exc))
+            self.db.set_profile_source_control(
+                profile_id,
+                "apify",
+                frozen=True,
+                reason="Capture V2 schema／身分／游標驗證失敗；等待人工重測或切換 Actor",
+                metadata={"batch_id": int(batch["id"]), "error": str(exc)[:4000]},
+            )
+            self._refresh_capture_v2_epoch(epoch_id)
             raise
         self.db.execute(
             "UPDATE paid_source_batches SET output_cursor=?,updated_at=? WHERE id=?",
@@ -4428,8 +4874,75 @@ class MonitorService:
             and job["job_type"] in {"visit", "browser_visit"}
             and job_payload.get("manual") is True
         )
-        last = self.db.row("SELECT started_at FROM jobs WHERE profile_id IS NOT NULL AND started_at IS NOT NULL AND id<>? ORDER BY started_at DESC LIMIT 1", (job["id"],))
-        if not is_manual_visit and job["profile_id"] is not None and last and last["started_at"]:
+        last = self.db.row(
+            """SELECT profile_id,job_type,started_at,payload_json FROM jobs
+            WHERE profile_id IS NOT NULL AND started_at IS NOT NULL AND id<>?
+            ORDER BY started_at DESC LIMIT 1""",
+            (job["id"],),
+        )
+        try:
+            last_payload = json.loads(last.get("payload_json") or "{}") if last else {}
+        except (TypeError, json.JSONDecodeError):
+            last_payload = {}
+        if not isinstance(job_payload, dict):
+            job_payload = {}
+        if not isinstance(last_payload, dict):
+            last_payload = {}
+        # Capture V2 successor pages already carry their own configurable
+        # 5–10 minute availability delay.  Do not expand that to the global
+        # 20–30 minute cross-account visit spacing when both adjacent jobs are
+        # pages of the same profile/epoch.
+        same_profile_posts_successor = bool(
+            job["job_type"] == "capture_posts_v2"
+            and last
+            and last.get("job_type") == "capture_posts_v2"
+            and int(last.get("profile_id") or 0) == int(job["profile_id"] or 0)
+            and str(job_payload.get("epoch_id") or "")
+            and str(job_payload.get("epoch_id") or "")
+            == str(last_payload.get("epoch_id") or "")
+        )
+        # Local slices of an already-purchased photo Actor result are not new
+        # Facebook visits.  Let them drain at their own one-minute cadence so
+        # a large saved dataset does not needlessly take hours to import.
+        same_capture_local_photo_successor = bool(
+            job["job_type"] == "capture_profile_photos"
+            and job_payload.get("local_actor_drain") is True
+            and last
+            and last.get("job_type") == "capture_profile_photos"
+            and int(last.get("profile_id") or 0) == int(job["profile_id"] or 0)
+            and str(job_payload.get("photo_capture_id") or "")
+            and str(job_payload.get("photo_capture_id") or "")
+            == str(last_payload.get("photo_capture_id") or "")
+        )
+        if same_capture_local_photo_successor:
+            try:
+                local_batch_id = int(job_payload.get("local_actor_batch_id") or 0)
+                local_capture_id = int(job_payload.get("photo_capture_id") or 0)
+            except (TypeError, ValueError):
+                local_batch_id = local_capture_id = 0
+            local_batch = (
+                self.db.row(
+                    """SELECT 1 FROM paid_photo_batches
+                    WHERE id=? AND photo_capture_id=? AND profile_id=?
+                      AND status='imported'""",
+                    (
+                        local_batch_id,
+                        local_capture_id,
+                        int(job.get("profile_id") or 0),
+                    ),
+                )
+                if local_batch_id > 0 and local_capture_id > 0
+                else None
+            )
+            same_capture_local_photo_successor = bool(local_batch)
+        if (
+            not is_manual_visit
+            and not same_profile_posts_successor
+            and not same_capture_local_photo_successor
+            and job["profile_id"] is not None
+            and last
+            and last["started_at"]
+        ):
             earliest = datetime.fromisoformat(last["started_at"]) + timedelta(minutes=random.uniform(self.settings.spacing_min_minutes, self.settings.spacing_max_minutes))
             if earliest > datetime.now(UTC):
                 self.db.execute(
@@ -4514,6 +5027,18 @@ class MonitorService:
                 WHERE id=? AND status='running' AND lease_owner=?""",
                 (job_terminal_status, utcnow(), job["id"], self.worker_id),
             )
+        except DurableActorRunDeferred as exc:
+            self.db.execute(
+                """UPDATE jobs SET status='pending',available_at=?,started_at=NULL,
+                finished_at=NULL,error=?,lease_owner=NULL,leased_at=NULL
+                WHERE id=? AND status='running' AND lease_owner=?""",
+                (
+                    exc.retry_at.isoformat(),
+                    str(exc)[:2000],
+                    job["id"],
+                    self.worker_id,
+                ),
+            )
         except BrowserGuardDeferred as exc:
             resume = exc.decision.retry_at or (datetime.now(UTC) + timedelta(minutes=5))
             self.db.execute(
@@ -4533,6 +5058,52 @@ class MonitorService:
                 self._schedule_next(int(job["profile_id"]))
         except BudgetExceeded as exc:
             resume = exc.resume_at or self._next_month()
+            if job["job_type"] == "contract_test_posts_v2":
+                grant_id = int(job_payload.get("contract_grant_id") or 0)
+                grant = self.db.row(
+                    "SELECT status,expires_at FROM contract_test_grants WHERE id=?",
+                    (grant_id,),
+                )
+                now_dt = datetime.now(UTC)
+                expires_at = (
+                    self._capture_v2_datetime(grant["expires_at"])
+                    if grant and grant.get("expires_at")
+                    else now_dt
+                )
+                # A manually authorized contract job may retry a transient
+                # usage lookup only while the same grant remains valid.  It
+                # must never clone itself into the next billing cycle after
+                # that authorization has expired.
+                if (
+                    grant
+                    and str(grant.get("status") or "") == "active"
+                    and now_dt < expires_at
+                    and resume < expires_at
+                ):
+                    self.db.execute(
+                        """UPDATE jobs SET status='pending',available_at=?,started_at=NULL,
+                        finished_at=NULL,error=?,attempts=CASE WHEN attempts>0 THEN attempts-1 ELSE 0 END,
+                        lease_owner=NULL,leased_at=NULL
+                        WHERE id=? AND status='running' AND lease_owner=?""",
+                        (
+                            resume.isoformat(),
+                            str(exc)[:2000],
+                            job["id"],
+                            self.worker_id,
+                        ),
+                    )
+                else:
+                    self.db.execute(
+                        """UPDATE jobs SET status='failed',finished_at=?,error=?
+                        WHERE id=? AND status='running' AND lease_owner=?""",
+                        (
+                            utcnow(),
+                            "契約測試 grant 已關閉或逾期；請重新核准新輪次",
+                            job["id"],
+                            self.worker_id,
+                        ),
+                    )
+                return
             self.db.execute(
                 """UPDATE jobs SET status='deferred_budget',finished_at=?,error=?
                 WHERE id=? AND status='running' AND lease_owner=?""",
@@ -4560,21 +5131,38 @@ class MonitorService:
                 )
 
     def queue_public_photo_capture(
-        self, profile_id: int
+        self, profile_id: int, *, source_policy: str = "auto"
     ) -> tuple[bool, dict[str, Any]]:
-        """Queue one signed-in-account-visible, profile-scoped photo inventory.
+        """Queue one profile-scoped photo inventory with an explicit source policy.
 
         Photo-page inventory has its own generation ledger.  It must not claim
-        the single active Capture V2 epoch slot.  Chromium is the primary
-        source and the separately budgeted photo Actor is a durable fallback.
+        the single active Capture V2 epoch slot. ``auto`` prefers the logged-in
+        Chromium inventory and may use the separately budgeted public-photo
+        Actor as supplemental fallback; ``account`` never launches Apify;
+        ``apify`` bypasses Chromium and BrowserGuard entirely.
         """
+        source_policy = str(source_policy or "auto").strip().lower()
+        if source_policy not in {"auto", "account", "apify"}:
+            raise ValueError("照片來源必須是 auto、account 或 apify")
         profile = self.db.row(
             "SELECT * FROM profiles WHERE id=? AND enabled=1", (profile_id,)
         )
         if not profile:
             raise ValueError("找不到啟用中的監控帳號")
-        if not self.settings.facebook_browser_enabled:
+        if source_policy == "account" and not self.settings.facebook_browser_enabled:
             raise FacebookBrowserError("Facebook 登入帳號照片瀏覽器尚未啟用")
+        actor_enabled = bool(
+            getattr(self.settings, "photo_actor_fallback_enabled", True)
+            and str(getattr(self.settings.actors, "profile_photos", "") or "").strip()
+        )
+        if source_policy == "apify" and not actor_enabled:
+            raise RuntimeError("Apify 照片 Actor 尚未啟用或設定")
+        if (
+            source_policy == "auto"
+            and not self.settings.facebook_browser_enabled
+            and not actor_enabled
+        ):
+            raise RuntimeError("登入瀏覽器與 Apify 照片 Actor 皆未啟用")
 
         now = utcnow()
         already_active = False
@@ -4614,6 +5202,20 @@ class MonitorService:
                 capture_id = int(latest["id"])
                 generation = int(latest["generation"])
                 already_active = capture_id in active_capture_ids
+
+                try:
+                    source_checkpoint = json.loads(
+                        str(latest.get("checkpoint_json") or "{}")
+                    )
+                except (TypeError, json.JSONDecodeError):
+                    source_checkpoint = {}
+                if not isinstance(source_checkpoint, dict):
+                    source_checkpoint = {}
+                if not already_active:
+                    source_checkpoint["source_policy"] = source_policy
+                    latest["checkpoint_json"] = json.dumps(
+                        source_checkpoint, ensure_ascii=False, sort_keys=True
+                    )
 
                 # A terminal Actor batch is immutable: replaying the same
                 # request hash would only re-import its old raw file.  A new
@@ -4672,6 +5274,10 @@ class MonitorService:
                         "actor_collected_items",
                         "actor_processed_item_ids",
                         "actor_fallback_error",
+                        "actor_media_retry_attempt",
+                        "actor_media_retry_until",
+                        "actor_pending_media_external_ids",
+                        "actor_exhausted_media_external_ids",
                     ):
                         retry_checkpoint.pop(key, None)
                     retry_checkpoint["completed"] = False
@@ -4682,12 +5288,17 @@ class MonitorService:
                     )
             else:
                 generation = int((latest or {}).get("generation") or 0) + 1
+                initial_checkpoint = json.dumps(
+                    {"source_policy": source_policy},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
                 cursor = conn.execute(
                     """INSERT INTO profile_photo_captures(
                       profile_id,generation,status,checkpoint_json,
                       terminal_evidence_json,next_job_at,created_at,updated_at
-                    ) VALUES(?,?,'pending','{}','{}',?,?,?)""",
-                    (profile_id, generation, now, now, now),
+                    ) VALUES(?,?,'pending',?,'{}',?,?,?)""",
+                    (profile_id, generation, initial_checkpoint, now, now, now),
                 )
                 capture_id = int(cursor.lastrowid)
 
@@ -4699,7 +5310,7 @@ class MonitorService:
                     (
                         str(latest.get("checkpoint_json") or "{}")
                         if resumable and latest
-                        else "{}",
+                        else initial_checkpoint,
                         now,
                         now,
                         capture_id,
@@ -4721,6 +5332,7 @@ class MonitorService:
                 "photo_capture_id": capture_id,
                 "iteration": 0,
                 "manual": True,
+                "source_policy": source_policy,
             },
         )
         refreshed = self.db.row(
@@ -4894,6 +5506,16 @@ class MonitorService:
                 int(batch["id"]),
                 global_capacity_usd=global_capacity,
                 minimum_charge_usd=minimum_charge,
+                posts_result_price_usd=PRICES["posts"],
+                cycle_start_at=usage.cycle_start_at,
+                monthly_limit_usd=self.settings.monthly_budget_usd,
+                provider_used_usd=(
+                    usage.provider_used_usd
+                    if usage.provider_used_usd is not None
+                    else usage.used_usd
+                ),
+                baseline_local_settled_usd=usage.local_settled_floor_usd,
+                outstanding_reserve_usd=outstanding_reserve,
             )
             if not claimed:
                 if str(batch.get("status") or "") == "prepared":
@@ -4917,11 +5539,12 @@ class MonitorService:
                 error=None,
             )
             if self.db.profile_source_frozen(profile_id, "apify"):
-                self.db.transition_paid_photo_batch(
-                    int(batch["id"]),
-                    "failed",
-                    expected_status="launching",
-                    error="凍結於 Actor 啟動邊界生效；未產生付費執行",
+                self.db.execute(
+                    """UPDATE paid_photo_batches
+                    SET status='prepared',launched_at=NULL,actor_run_id=NULL,
+                        error=NULL,updated_at=?
+                    WHERE id=? AND status='launching' AND run_id IS NULL""",
+                    (utcnow(), batch["id"]),
                 )
                 self.db.finish_actor_run(
                     diagnostic_id,
@@ -4950,15 +5573,28 @@ class MonitorService:
                 raise RuntimeError(
                     "照片 Actor launch 結果不明；已停止自動重買"
                 ) from exc
-            batch = self.db.transition_paid_photo_batch(
-                int(batch["id"]),
-                "run_started",
-                expected_status="launching",
-                run_id=started.run_id,
-                dataset_id=started.dataset_id,
-                key_value_store_id=started.key_value_store_id,
-                error=None,
-            )
+            try:
+                batch = self.db.transition_paid_photo_batch(
+                    int(batch["id"]),
+                    "run_started",
+                    expected_status="launching",
+                    run_id=started.run_id,
+                    dataset_id=started.dataset_id,
+                    key_value_store_id=started.key_value_store_id,
+                    error=None,
+                )
+            except ProviderRunOwnershipConflict as exc:
+                self.db.record_provider_run_ownership_conflict(
+                    exc,
+                    actor_id=actor_id,
+                    request_fingerprint=str(batch["request_hash"]),
+                    dataset_id=started.dataset_id,
+                    key_value_store_id=started.key_value_store_id,
+                )
+                raise RuntimeError(
+                    "照片 Actor 已啟動，但 provider run 身分衝突；"
+                    "已停止自動重買並等待人工對帳"
+                ) from exc
             status = "run_started"
 
         raw: dict[str, Any] | None = None
@@ -4986,8 +5622,8 @@ class MonitorService:
                 raw_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
             else:
                 if not self.apify.token:
-                    raise RuntimeError(
-                        "APIFY_TOKEN 尚未設定，無法收尾已啟動的照片 Actor run"
+                    raise DurableActorRunDeferred(
+                        "APIFY_TOKEN 尚未設定；已啟動的照片 Actor run 保留並稍後重試"
                     )
                 try:
                     result = await self.apify.finish(started)
@@ -5032,20 +5668,20 @@ class MonitorService:
                         f"照片 Actor run 已明確失敗：{exc.status}"
                     ) from exc
                 except Exception as exc:
-                    self.db.transition_paid_photo_batch(
-                        int(batch["id"]),
-                        "needs_reconcile",
-                        expected_status="run_started",
-                        error=str(exc)[:4000],
+                    self.db.execute(
+                        """UPDATE paid_photo_batches SET error=?,updated_at=?
+                        WHERE id=? AND status='run_started' AND run_id IS NOT NULL""",
+                        (str(exc)[:4000], utcnow(), batch["id"]),
                     )
                     if diagnostic_id:
-                        self.db.finish_actor_run(
-                            diagnostic_id,
-                            status="needs_reconcile",
-                            run_id=started.run_id,
-                            error=str(exc),
+                        self.db.execute(
+                            """UPDATE actor_runs SET status='running',error=?,finished_at=NULL
+                            WHERE id=?""",
+                            (str(exc)[:4000], diagnostic_id),
                         )
-                    raise
+                    raise DurableActorRunDeferred(
+                        "照片 Actor run 已知；完成查詢暫時失敗，稍後重試同一 run"
+                    ) from exc
                 raw = self._load_capture_v2_raw(path)
                 estimate = max(
                     float(result.charged_usd),
@@ -5360,27 +5996,41 @@ class MonitorService:
             raise ValueError("帳號可見照片回溯工作與帳號不相符")
         if str(capture.get("status") or "") == "complete":
             return
-        active_actor_batch = self.db.row(
-            """SELECT * FROM paid_photo_batches
-            WHERE photo_capture_id=? AND status IN(
-              'prepared','launching','run_started','needs_reconcile',
-              'raw_saved','import_failed','imported'
-            ) ORDER BY id DESC LIMIT 1""",
-            (capture_id,),
+        active_actor_batch = (
+            None
+            if payload.get("_skip_actor_recovery") is True
+            else self.db.row(
+                """SELECT * FROM paid_photo_batches
+                WHERE photo_capture_id=? AND status IN(
+                  'launching','run_started','raw_saved','import_failed','imported'
+                ) ORDER BY id DESC LIMIT 1""",
+                (capture_id,),
+            )
         )
         if not active_actor_batch:
             if not bool(profile.get("enabled")):
                 return
-            if not self.settings.facebook_browser_enabled:
-                raise FacebookBrowserError(
-                    "Facebook 登入帳號照片瀏覽器尚未啟用"
-                )
         try:
             progress = json.loads(capture.get("checkpoint_json") or "{}")
         except (TypeError, json.JSONDecodeError):
             progress = {}
         if not isinstance(progress, dict):
             progress = {}
+        source_policy = str(
+            payload.get("source_policy")
+            or progress.get("source_policy")
+            or "auto"
+        ).strip().lower()
+        if source_policy not in {"auto", "account", "apify"}:
+            raise ValueError("照片來源必須是 auto、account 或 apify")
+        progress["source_policy"] = source_policy
+        browser_guard_deferred: BrowserGuardDeferred | None = None
+        browser_retry_value = progress.get("browser_guard_retry_at")
+        browser_retry_at = (
+            self._capture_v2_datetime(browser_retry_value)
+            if browser_retry_value
+            else None
+        )
         owner_aliases = {
             str(value).strip()
             for value in progress.get("profile_owner_aliases") or []
@@ -5450,6 +6100,31 @@ class MonitorService:
                 )
                 raise
             except (ApifyFrozen, RuntimeError) as actor_exc:
+                if (
+                    source_policy in {"auto", "account"}
+                    and self.settings.facebook_browser_enabled
+                ):
+                    # A supplemental Actor ledger that needs reconciliation or
+                    # manual raw repair must not block the signed-in account
+                    # inventory.  Preserve the paid row for diagnostics and
+                    # finish this generation with the primary browser source.
+                    progress["actor_fallback_error"] = str(actor_exc)
+                    self.db.execute(
+                        """UPDATE profile_photo_captures
+                        SET checkpoint_json=?,limited_reason=?,updated_at=?
+                        WHERE id=?""",
+                        (
+                            json.dumps(progress, ensure_ascii=False, sort_keys=True),
+                            f"Apify 照片後備待處理：{actor_exc}",
+                            utcnow(),
+                            capture_id,
+                        ),
+                    )
+                    browser_payload = dict(payload)
+                    browser_payload["_skip_actor_recovery"] = True
+                    return await self.capture_profile_photos(
+                        profile_id, browser_payload
+                    )
                 now = utcnow()
                 progress["actor_fallback_error"] = str(actor_exc)
                 self.db.execute(
@@ -5459,6 +6134,47 @@ class MonitorService:
                     (
                         json.dumps(progress, ensure_ascii=False, sort_keys=True),
                         f"Apify 照片後備：{actor_exc}", now, now, capture_id,
+                    ),
+                )
+                return "source_limited"
+        elif source_policy == "apify" or (
+            source_policy == "auto" and not self.settings.facebook_browser_enabled
+        ):
+            # Explicit Apify mode never consumes a Chromium BrowserGuard slot.
+            # Auto mode also remains useful on deployments where only the
+            # public photo Actor is configured.
+            try:
+                result = await self._capture_profile_photos_actor(
+                    profile, capture, progress
+                )
+            except BudgetExceeded as exc:
+                resume = exc.resume_at or self._next_month()
+                self.db.execute(
+                    """UPDATE profile_photo_captures SET status='budget_paused',
+                    checkpoint_json=?,limited_reason=?,next_job_at=?,
+                    completed_at=NULL,updated_at=? WHERE id=?""",
+                    (
+                        json.dumps(progress, ensure_ascii=False, sort_keys=True),
+                        str(exc),
+                        resume.isoformat(),
+                        utcnow(),
+                        capture_id,
+                    ),
+                )
+                raise
+            except (ApifyFrozen, RuntimeError) as actor_exc:
+                now = utcnow()
+                progress["actor_fallback_error"] = str(actor_exc)
+                self.db.execute(
+                    """UPDATE profile_photo_captures SET status='source_limited',
+                    checkpoint_json=?,limited_reason=?,next_job_at=NULL,
+                    completed_at=?,updated_at=? WHERE id=?""",
+                    (
+                        json.dumps(progress, ensure_ascii=False, sort_keys=True),
+                        f"Apify 照片來源：{actor_exc}",
+                        now,
+                        now,
+                        capture_id,
                     ),
                 )
                 return "source_limited"
@@ -5472,35 +6188,109 @@ class MonitorService:
                 "stalled_reason": "",
             }
         else:
-            self._acquire_browser(
-                profile,
-                anonymous=False,
-                operation="capture_profile_photos",
-                defer_job=True,
-            )
-            browser_error: FacebookBrowserError | None = None
-            try:
-                result = await self.facebook_browser.account_profile_photos(
-                    str(profile["url"]), progress, diagnostic_key
+            if not self.settings.facebook_browser_enabled:
+                raise FacebookBrowserError(
+                    "Facebook 登入帳號照片瀏覽器尚未啟用"
                 )
-                if isinstance(result, dict):
-                    result.setdefault("source", "logged_in_browser")
-                    result_progress = result.get("progress")
-                    if isinstance(result_progress, dict):
-                        result_progress.setdefault("source", "logged_in_browser")
-                browser_used = True
-            except FacebookBrowserChallengeRequired as exc:
-                self._record_browser_challenge(
+            try:
+                self._acquire_browser(
                     profile,
                     anonymous=False,
-                    diagnostic_key=diagnostic_key,
-                    error=exc,
+                    operation="capture_profile_photos",
+                    defer_job=True,
                 )
-                browser_error = exc
-            except FacebookBrowserLoginRequired as exc:
-                browser_error = exc
-            except FacebookBrowserError as exc:
-                browser_error = exc
+            except BrowserGuardDeferred as exc:
+                long_deferral = exc.decision.reason in {
+                    "daily_limit",
+                    "breaker_open",
+                }
+                actor_on_long_deferral = bool(
+                    source_policy == "auto"
+                    and long_deferral
+                    and getattr(
+                        self.settings,
+                        "photo_actor_fallback_on_browser_guard_long_deferral",
+                        True,
+                    )
+                )
+                if not actor_on_long_deferral:
+                    raise
+                browser_guard_deferred = exc
+                browser_retry_at = exc.decision.retry_at or (
+                    datetime.now(UTC) + timedelta(hours=8)
+                )
+                progress.update(
+                    {
+                        "browser_guard_reason": exc.decision.reason,
+                        "browser_guard_retry_at": browser_retry_at.isoformat(),
+                        "browser_fallback_reason": str(exc),
+                        "source": "apify_actor_pending_account_retry",
+                    }
+                )
+                # Persist the fallback handoff before crossing the paid launch
+                # boundary. A crash can then finish the exact Actor batch and
+                # still schedule Chromium for the original guard retry time.
+                self.db.execute(
+                    """UPDATE profile_photo_captures SET status='in_progress',
+                    checkpoint_json=?,limited_reason=?,next_job_at=?,updated_at=?
+                    WHERE id=?""",
+                    (
+                        json.dumps(progress, ensure_ascii=False, sort_keys=True),
+                        str(exc),
+                        browser_retry_at.isoformat(),
+                        utcnow(),
+                        capture_id,
+                    ),
+                )
+                try:
+                    result = await self._capture_profile_photos_actor(
+                        profile, capture, progress
+                    )
+                except (BudgetExceeded, ApifyFrozen, RuntimeError) as actor_exc:
+                    # The browser retry is useful even when the optional paid
+                    # supplement is unavailable. Let the scheduler return this
+                    # same job to the durable guard time without creating a
+                    # deferred-budget clone.
+                    progress["actor_fallback_error"] = str(actor_exc)
+                    self.db.execute(
+                        """UPDATE profile_photo_captures SET status='in_progress',
+                        checkpoint_json=?,limited_reason=?,next_job_at=?,updated_at=?
+                        WHERE id=?""",
+                        (
+                            json.dumps(progress, ensure_ascii=False, sort_keys=True),
+                            f"{exc}；Apify 照片後備：{actor_exc}",
+                            browser_retry_at.isoformat(),
+                            utcnow(),
+                            capture_id,
+                        ),
+                    )
+                    raise exc from actor_exc
+            browser_error: FacebookBrowserError | None = None
+            if browser_guard_deferred is None:
+                try:
+                    result = await self.facebook_browser.account_profile_photos(
+                        str(profile["url"]), progress, diagnostic_key
+                    )
+                    if isinstance(result, dict):
+                        result.setdefault("source", "logged_in_browser")
+                        result_progress = result.get("progress")
+                        if isinstance(result_progress, dict):
+                            result_progress.setdefault("source", "logged_in_browser")
+                    browser_used = True
+                    progress.pop("browser_guard_reason", None)
+                    progress.pop("browser_guard_retry_at", None)
+                except FacebookBrowserChallengeRequired as exc:
+                    self._record_browser_challenge(
+                        profile,
+                        anonymous=False,
+                        diagnostic_key=diagnostic_key,
+                        error=exc,
+                    )
+                    browser_error = exc
+                except FacebookBrowserLoginRequired as exc:
+                    browser_error = exc
+                except FacebookBrowserError as exc:
+                    browser_error = exc
 
             if browser_error is not None:
                 progress.update(
@@ -5510,6 +6300,21 @@ class MonitorService:
                         "browser_fallback_reason": str(browser_error),
                     }
                 )
+                if source_policy == "account":
+                    now = utcnow()
+                    self.db.execute(
+                        """UPDATE profile_photo_captures SET status='source_limited',
+                        checkpoint_json=?,limited_reason=?,next_job_at=NULL,
+                        completed_at=?,updated_at=? WHERE id=?""",
+                        (
+                            json.dumps(progress, ensure_ascii=False, sort_keys=True),
+                            f"登入瀏覽器：{browser_error}",
+                            now,
+                            now,
+                            capture_id,
+                        ),
+                    )
+                    return "source_limited"
                 try:
                     result = await self._capture_profile_photos_actor(
                         profile, capture, progress
@@ -6149,8 +6954,68 @@ class MonitorService:
             }
             ready_after_ingest = ready_photo_external_ids()
             processed_actor_ids.update(actor_candidate_ids & ready_after_ingest)
-            checkpoint["actor_processed_item_ids"] = sorted(processed_actor_ids)
             actor_page_pending_ids = actor_page_ids - processed_actor_ids
+            unattempted_actor_ids = (
+                actor_page_ids - actor_candidate_ids - processed_actor_ids
+            )
+            if actor_page_pending_ids and not unattempted_actor_ids:
+                actor_retry_attempt = int(
+                    checkpoint.get("actor_media_retry_attempt") or 0
+                ) + 1
+                actor_retry_until_text = str(
+                    checkpoint.get("actor_media_retry_until") or ""
+                )
+                try:
+                    actor_retry_until = datetime.fromisoformat(
+                        actor_retry_until_text
+                    )
+                    if actor_retry_until.tzinfo is None:
+                        actor_retry_until = actor_retry_until.replace(tzinfo=UTC)
+                except ValueError:
+                    actor_retry_until = datetime.now(UTC) + timedelta(
+                        days=max(1, self.settings.media_retry_days)
+                    )
+                checkpoint.update(
+                    {
+                        "actor_media_retry_attempt": actor_retry_attempt,
+                        "actor_media_retry_until": actor_retry_until.isoformat(),
+                        "actor_pending_media_external_ids": sorted(
+                            actor_page_pending_ids
+                        ),
+                    }
+                )
+                if datetime.now(UTC) < actor_retry_until:
+                    result["actor_media_retry_pending"] = True
+                    result["actor_media_retry_delay_minutes"] = min(
+                        360,
+                        15 * (2 ** min(5, actor_retry_attempt - 1)),
+                    )
+                else:
+                    # Actor media is supplemental and cannot keep a paid raw
+                    # batch in an infinite one-minute replay loop.  Preserve
+                    # every failed identity for diagnostics, mark the local raw
+                    # slice exhausted after the configured 30-day window, and
+                    # continue to the signed-in inventory when available.
+                    exhausted = {
+                        str(value)
+                        for value in checkpoint.get(
+                            "actor_exhausted_media_external_ids"
+                        )
+                        or []
+                        if str(value)
+                    }
+                    exhausted.update(actor_page_pending_ids)
+                    checkpoint["actor_exhausted_media_external_ids"] = sorted(
+                        exhausted
+                    )
+                    processed_actor_ids.update(actor_page_pending_ids)
+                    actor_page_pending_ids = set()
+                    checkpoint.pop("actor_pending_media_external_ids", None)
+                    result["actor_media_retry_pending"] = False
+                    result["actor_media_retry_exhausted"] = True
+            elif not actor_page_pending_ids:
+                checkpoint.pop("actor_pending_media_external_ids", None)
+            checkpoint["actor_processed_item_ids"] = sorted(processed_actor_ids)
             browser_handoff_pending = bool(
                 checkpoint.get("fallback_browser_batch_items")
             )
@@ -6346,6 +7211,14 @@ class MonitorService:
 
         media_retry_pending = False
         retry_delay = timedelta(minutes=1)
+        actor_drain_delay = timedelta(
+            minutes=max(
+                1,
+                int(result.get("actor_media_retry_delay_minutes") or 1),
+            )
+        )
+        if result.get("actor_media_retry_pending"):
+            retry_delay = max(retry_delay, actor_drain_delay)
         if collector_completed and not inventory_terminal:
             stalled_reason = "照片網格缺少完整終點證據"
         elif completed and ready_count < total_seen:
@@ -6401,9 +7274,44 @@ class MonitorService:
                 or checkpoint.get("grid_complete") is False
             )
         )
+        account_retry_pending = bool(
+            source_policy == "auto"
+            and browser_retry_at is not None
+            and not browser_used
+        )
+        local_actor_raw_pending = bool(
+            actor_batch_id
+            and not actor_batch_ready_to_commit
+        )
+        actor_provider_page_pending = bool(
+            account_retry_pending and result.get("actor_provider_resumable")
+        )
+        actor_continuation_required = bool(
+            local_actor_raw_pending or actor_provider_page_pending
+        )
+        account_retry_required = account_retry_pending and not actor_continuation_required
+        if account_retry_pending:
+            # Actor output is supplemental only.  A long BrowserGuard delay
+            # must therefore leave the generation resumable and return later
+            # for authenticated inventory/terminal evidence.  Drain every
+            # local 20-item slice from the already-purchased raw result before
+            # switching policies, otherwise the active paid batch would take
+            # precedence over the account retry and strand its final slice.
+            resumable = True
+            stalled_reason = ""
+            checkpoint["source_policy"] = (
+                "auto" if actor_continuation_required else "account"
+            )
         if resumable:
             next_iteration = iteration + 1
-            available = datetime.now(UTC) + retry_delay
+            now_dt = datetime.now(UTC)
+            available = (
+                max(now_dt, browser_retry_at)
+                if account_retry_required and browser_retry_at is not None
+                else now_dt + (
+                    actor_drain_delay if local_actor_raw_pending else retry_delay
+                )
+            )
             checkpoint["capture_iteration"] = next_iteration
             self.db.execute(
                 """UPDATE profile_photo_captures SET status='in_progress',checkpoint_json=?,
@@ -6427,6 +7335,17 @@ class MonitorService:
                     "photo_capture_id": capture_id,
                     "iteration": next_iteration,
                     "manual": True,
+                    "source_policy": (
+                        "auto"
+                        if actor_continuation_required
+                        else "account"
+                        if account_retry_required
+                        else source_policy
+                    ),
+                    "local_actor_drain": local_actor_raw_pending,
+                    "local_actor_batch_id": (
+                        int(actor_batch_id) if local_actor_raw_pending else None
+                    ),
                 },
                 available_at=available.isoformat(),
             )
@@ -6551,11 +7470,31 @@ class MonitorService:
                 if end_at.tzinfo is None:
                     end_at = end_at.replace(tzinfo=UTC)
                 if start_at <= now <= end_at:
-                    return max(0.0, self.settings.monthly_budget_usd - float(snapshot["used_usd"]))
+                    effective_used = max(
+                        float(snapshot["used_usd"]),
+                        self.db.apify_settled_charge_floor(
+                            str(snapshot["cycle_start_at"]),
+                            posts_result_price_usd=PRICES["posts"],
+                        ),
+                    )
+                    return max(
+                        0.0,
+                        self.settings.monthly_budget_usd - effective_used,
+                    )
             except (KeyError, TypeError, ValueError):
                 pass
         month = datetime.now(UTC).strftime("%Y-%m")
-        return max(0.0, self.settings.monthly_budget_usd - self.db.usage_total(month))
+        cycle_start_at = datetime.now(UTC).replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0
+        ).isoformat()
+        effective_used = max(
+            self.db.usage_total(month),
+            self.db.apify_settled_charge_floor(
+                cycle_start_at,
+                posts_result_price_usd=PRICES["posts"],
+            ),
+        )
+        return max(0.0, self.settings.monthly_budget_usd - effective_used)
 
     @staticmethod
     def _next_month() -> datetime:
@@ -6591,8 +7530,28 @@ class MonitorService:
                 "Apify 官方用量查詢失敗；本次付費工作已取消",
                 datetime.now(UTC) + timedelta(minutes=15),
             ) from exc
-        self.db.save_apify_usage(usage.used_usd, usage.cycle_start_at, usage.cycle_end_at)
-        return max(0.0, self.settings.monthly_budget_usd - usage.used_usd), usage
+        self.db.save_apify_usage(
+            usage.used_usd, usage.cycle_start_at, usage.cycle_end_at
+        )
+        local_settled_floor = self.db.apify_settled_charge_floor(
+            usage.cycle_start_at,
+            posts_result_price_usd=PRICES["posts"],
+        )
+        effective_used = max(
+            float(usage.used_usd),
+            local_settled_floor,
+        )
+        effective_usage = MonthlyUsage(
+            used_usd=effective_used,
+            cycle_start_at=usage.cycle_start_at,
+            cycle_end_at=usage.cycle_end_at,
+            provider_used_usd=float(usage.used_usd),
+            local_settled_floor_usd=local_settled_floor,
+        )
+        return (
+            max(0.0, self.settings.monthly_budget_usd - effective_used),
+            effective_usage,
+        )
 
     async def _actor(self, category: str, actor_id: str, payload: dict[str, Any], profile_id: int | None = None, input_variant: str = "default") -> ActorResult:
         if profile_id is not None and self.db.profile_source_frozen(profile_id, "apify"):
@@ -6612,11 +7571,49 @@ class MonitorService:
         # the paid Actor so a freeze applied during that await wins the race.
         if profile_id is not None and self.db.profile_source_frozen(profile_id, "apify"):
             raise ApifyFrozen("此帳號已凍結 Apify；本次付費工作未執行")
-        diagnostic_id = self.db.start_actor_run(profile_id, category, actor_id, input_variant, payload)
+        diagnostic_id, denial = self.db.claim_legacy_actor_run_launch(
+            profile_id,
+            category,
+            actor_id,
+            input_variant,
+            payload,
+            max_charge_usd=remaining,
+            cycle_start_at=official_usage.cycle_start_at,
+            monthly_limit_usd=self.settings.monthly_budget_usd,
+            provider_used_usd=(
+                official_usage.provider_used_usd
+                if official_usage.provider_used_usd is not None
+                else official_usage.used_usd
+            ),
+            baseline_local_settled_usd=official_usage.local_settled_floor_usd,
+            posts_result_price_usd=PRICES["posts"],
+        )
+        if diagnostic_id is None:
+            if denial == "profile_apify_frozen":
+                raise ApifyFrozen("此帳號已凍結 Apify；本次付費工作未執行")
+            raise BudgetExceeded(
+                "Apify 原子預算保留不足；舊版付費工作未啟動",
+                self._usage_cycle_resume(official_usage),
+            )
+        if profile_id is not None and self.db.profile_source_frozen(profile_id, "apify"):
+            self.db.finish_actor_run(
+                diagnostic_id,
+                status="failed",
+                error="凍結於 Actor 啟動邊界生效；未啟動",
+            )
+            raise ApifyFrozen("此帳號已凍結 Apify；本次付費工作未執行")
         try:
             result = await self.apify.call(actor_id, payload, remaining)
         except Exception as exc:
-            self.db.finish_actor_run(diagnostic_id, status="failed", error=str(exc))
+            # ``call()`` combines provider start and wait.  An exception can
+            # therefore mean the run was accepted but its identifiers were
+            # not returned.  Retain the full ceiling until the operator or the
+            # provider usage snapshot resolves that ambiguity.
+            self.db.finish_actor_run(
+                diagnostic_id,
+                status="needs_reconcile",
+                error=str(exc),
+            )
             raise
         result.diagnostic_id = diagnostic_id
         raw_result_count = result.raw_result_count if result.raw_result_count is not None else len(result.items)

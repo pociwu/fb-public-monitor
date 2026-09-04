@@ -549,6 +549,8 @@ class FacebookBrowserGateway:
         canary_max_posts: int = 2,
         *,
         require_login: bool = True,
+        album_batch_max_operations: int = 20,
+        album_batch_max_seconds: int = 180,
     ):
         self.enabled = enabled
         self.data_dir = data_dir
@@ -558,10 +560,11 @@ class FacebookBrowserGateway:
         # Separate limits keep existing deployments configurable while making
         # the risk-control contract explicit: never perform over twenty Next
         # operations or keep a viewer open longer than three minutes per batch.
-        self.album_batch_max_operations = 20
-        self.album_batch_max_new_photos = 20
-        self.album_batch_max_seconds = 180
-        self.profile_photo_grid_batch_max_scrolls = 20
+        configured_operations = max(1, min(20, int(album_batch_max_operations)))
+        self.album_batch_max_operations = configured_operations
+        self.album_batch_max_new_photos = configured_operations
+        self.album_batch_max_seconds = max(30, min(180, int(album_batch_max_seconds)))
+        self.profile_photo_grid_batch_max_scrolls = configured_operations
         self.profile_photo_grid_stable_rounds = 3
         self.profile_photo_grid_replay_wait_ms = 200
         self.profile_photo_grid_replay_max_seconds = 45
