@@ -9,63 +9,74 @@
   <a class="stat-card-link" href="/jobs?status=active" aria-label="查看工作佇列詳細內容"><article><span>工作佇列</span><strong>{{ pending.count or 0 }}</strong><small>查看詳細 →</small></article></a>
   <article><span>待送通知</span><strong>{{ outbox.count or 0 }}</strong></article>
   <article><span>媒體</span><strong>{{ media.ready or 0 }} / {{ media.total or 0 }}</strong></article>
-  <a class="stat-card-link" href="/capture-v2" aria-label="查看 Capture V2 回溯狀態"><article><span>Capture V2</span><strong>{% if capture_v2.enabled %}{{ capture_v2.coverage_complete }} / {{ capture_v2.coverage_total }}{% else %}未啟用{% endif %}</strong><small>進行中 epoch：{{ capture_v2.active_epochs }} · 待處理批次：{{ capture_v2.open_batches }}<br>查看詳細 →</small></article></a>
+  <a class="stat-card-link" href="/capture-v2" aria-label="查看分批回溯狀態"><article><span>分批回溯</span><strong>{% if capture_v2.enabled %}{{ capture_v2.coverage_complete }} / {{ capture_v2.coverage_total }}{% else %}未啟用{% endif %}</strong><small>進行中：{{ capture_v2.active_epochs }} · 待處理：{{ capture_v2.open_batches }}<br>查看詳細 →</small></article></a>
   <a class="stat-card-link" href="/storage" aria-label="查看硬碟用量詳細內容"><article><span>硬碟用量</span><strong>{% if storage_latest %}{{ storage_latest.used_display }}{% else %}等待統計{% endif %}</strong><small>{% if storage_latest %}每日增加：{{ storage_latest.used_delta_display }}<br>{% endif %}查看詳細 →</small></article></a>
   <article><span>Apify 官方用量</span><strong>{% if official_usage %}${{ "%.2f"|format(official_usage.used_usd) }} / ${{ "%.2f"|format(budget) }}{% else %}尚未查詢{% endif %}</strong>{% if official_usage %}<small>重置倒數：<b data-usage-countdown data-cycle-end="{{ official_usage.cycle_end_at }}">計算中…</b><br>帳期：{{ official_usage.cycle_start_display }} ～ {{ official_usage.cycle_end_display }}<br>查詢：{{ official_usage.fetched_display }}</small>{% endif %}</article>
   <article><span>SerpApi 查詢額度</span><strong>{% if serpapi_usage %}{{ serpapi_usage.searches_left }} / {{ serpapi_usage.searches_per_month }}{% else %}尚未查詢{% endif %}</strong>{% if serpapi_usage %}<small>{{ serpapi_usage.plan_name }}<br>重置：{{ serpapi_usage.renewal_date or '—' }}</small>{% endif %}</article>
 </section>
-<section class="panel"><div class="panel-heading"><h2>Facebook 帳號</h2><div class="panel-actions"><small class="sort-hint">拖曳卡片可調整順序</small><form method="post" action="/profiles/scan-all" onsubmit="return confirm('將全部啟用帳號排到拜訪佇列最前端？仍會遵守間隔與預算限制。')"><button class="button" type="submit">立即拜訪（全部）</button></form></div></div>
-<form class="add-profile-form" method="post" action="/profiles">
-  <label for="profile-url">新增監控網址</label>
-  <div><input id="profile-url" name="url" type="url" required autocomplete="url" placeholder="https://www.facebook.com/使用者名稱或數字ID"><button class="button" type="submit">驗證並新增</button></div>
-  <small>接受 Facebook 個人檔案首頁網址；新增後會立即排程，由個人檔案 Actor 驗證公開可讀性。</small>
-</form>
+<section class="panel accounts-panel"><div class="panel-heading"><div><h2>Facebook 帳號</h2><small>點選帳號可查看貼文、留言與媒體</small></div><div class="panel-actions"><small class="sort-hint">拖曳卡片可調整順序</small><form method="post" action="/profiles/scan-all" onsubmit="return confirm('將全部啟用帳號排到拜訪佇列最前端？仍會遵守間隔與預算限制。')"><button class="button" type="submit">立即拜訪（全部）</button></form></div></div>
+<details class="dashboard-add-profile" data-disclosure-key="dashboard-add-profile">
+  <summary>＋ 新增監控帳號</summary>
+  <form class="add-profile-form" method="post" action="/profiles">
+    <label for="profile-url">Facebook 個人檔案網址</label>
+    <div><input id="profile-url" name="url" type="url" required autocomplete="url" placeholder="https://www.facebook.com/使用者名稱或數字ID"><button class="button" type="submit">驗證並新增</button></div>
+    <small>新增後會立即排程，並驗證個人檔案的可讀性。</small>
+  </form>
+</details>
 <div class="cards" data-profile-cards>{% for p in profiles %}<div class="profile-card-wrap" data-profile-id="{{ p.id }}">
   <span class="drag-handle" draggable="true" aria-label="拖曳調整順序" title="拖曳調整順序">⠿</span>
   <div class="profile-card" data-gallery="dashboard-profile-{{ p.id }}">
   {% if p.cover_media_id %}<div class="card-cover"><button class="card-media-button" type="button" data-lightbox-src="/media/{{ p.cover_media_id }}" data-download="/media/{{ p.cover_media_id }}?download=true" aria-label="查看 {{ p.display_name or p.name }} 封面照"><img src="/media/{{ p.cover_media_id }}/thumbnail" alt="{{ p.display_name or p.name }} 封面照"></button></div>{% endif %}
-  <div class="profile-head">{% if p.avatar_media_id %}<button class="card-avatar-button" type="button" data-lightbox-src="/media/{{ p.avatar_media_id }}" data-download="/media/{{ p.avatar_media_id }}?download=true" aria-label="查看 {{ p.display_name or p.name }} 大頭照"><img class="avatar" src="/media/{{ p.avatar_media_id }}" alt="{{ p.display_name or p.name }} 大頭照"></button>{% else %}<span class="avatar placeholder">FB</span>{% endif %}<div><span class="dot {{ p.public_state }}"></span><strong>{{ p.display_name or p.name }}</strong>{% if p.display_name and p.name != p.display_name %}<small class="alias">別名：{{ p.name }}</small>{% endif %}{% if p.previous_names %}<small class="alias">曾用名稱：{{ p.previous_names|join('、') }}</small>{% endif %}</div></div>
+  <div class="profile-head">{% if p.avatar_media_id %}<button class="card-avatar-button" type="button" data-lightbox-src="/media/{{ p.avatar_media_id }}" data-download="/media/{{ p.avatar_media_id }}?download=true" aria-label="查看 {{ p.display_name or p.name }} 大頭照"><img class="avatar" src="/media/{{ p.avatar_media_id }}" alt="{{ p.display_name or p.name }} 大頭照"></button>{% else %}<span class="avatar placeholder">FB</span>{% endif %}<div><span class="dot {{ p.public_state }}"></span><a class="profile-name" href="/profiles/{{ p.id }}"><strong>{{ p.display_name or p.name }}</strong></a>{% if p.display_name and p.name != p.display_name %}<small class="alias">別名：{{ p.name }}</small>{% endif %}{% if p.previous_names %}<small class="alias">曾用名稱：{{ p.previous_names|join('、') }}</small>{% endif %}</div></div>
   <small>{{ p.public_state }} · Facebook ID：{{ p.display_fb_id or '尚未解析' }}</small>
-  {% if p.details %}<div class="profile-details">
-    {% if p.details.profile_intro_text %}<p>{{ p.details.profile_intro_text }}</p>{% endif %}
-    <small>{% if p.details.profile_data_source %}個人資料來源：{{ p.details.profile_data_source }}{% endif %}{% if p.details.followers %}<br>追蹤者：{{ p.details.followers }}{% endif %}{% if p.details.current_city %}<br>居住地：{{ p.details.current_city }}{% endif %}{% if p.details.hometown %}<br>家鄉：{{ p.details.hometown }}{% endif %}{% if p.work_labels %}<br>工作：{{ p.work_labels[0] }}{% endif %}{% if p.education_labels %}<br>學歷：{{ p.education_labels[0] }}{% endif %}<br>監控網址：<span class="break-all">{{ p.url }}</span>{% if p.details.url and p.details.url != p.url %}<br>Facebook 網址：<span class="break-all">{{ p.details.url }}</span>{% endif %}</small>
-  </div>{% endif %}
+  {% if p.details %}
+    {% if p.details.profile_intro_text %}<p class="profile-intro">{{ p.details.profile_intro_text }}</p>{% endif %}
+    <details class="profile-meta-disclosure" data-disclosure-key="profile-{{ p.id }}-meta"><summary>公開個人資料</summary><div class="profile-details">
+      <small>{% if p.details.profile_data_source %}個人資料來源：{{ p.details.profile_data_source }}{% endif %}{% if p.details.followers %}<br>追蹤者：{{ p.details.followers }}{% endif %}{% if p.details.current_city %}<br>居住地：{{ p.details.current_city }}{% endif %}{% if p.details.hometown %}<br>家鄉：{{ p.details.hometown }}{% endif %}{% if p.work_labels %}<br>工作：{{ p.work_labels[0] }}{% endif %}{% if p.education_labels %}<br>學歷：{{ p.education_labels[0] }}{% endif %}<br>監控網址：<span class="break-all">{{ p.url }}</span>{% if p.details.url and p.details.url != p.url %}<br>Facebook 網址：<span class="break-all">{{ p.details.url }}</span>{% endif %}</small>
+    </div></details>
+  {% endif %}
   {% if p.public_photo_ids %}<div class="card-photo-strip">{% for media_id in p.public_photo_ids %}<button class="card-media-button" type="button" data-lightbox-src="/media/{{ media_id }}" data-download="/media/{{ media_id }}?download=true" aria-label="查看第 {{ loop.index }} 張照片"><img src="/media/{{ media_id }}/thumbnail" alt="第 {{ loop.index }} 張照片" loading="lazy"></button>{% endfor %}</div>{% endif %}
-  <p>{{ p.post_count }} 篇貼文 · {{ p.comment_count }} 則留言 · {{ p.photo_count }} 張照片</p>
-  <small>照片回溯：<span class="badge {{ p.photo_capture.status }}">{{ p.photo_capture.status_label }}</span>{% if p.photo_capture.discovered_count %} · 已發現 {{ p.photo_capture.discovered_count }} 張{% endif %}{% if p.photo_capture.source_policy_label %}<br>預定策略：{{ p.photo_capture.source_policy_label }}{% endif %}<br>範圍：{{ p.photo_capture.access_scope_label }} · 來源：{{ p.photo_capture.source_label }}{% if p.photo_capture.updated_display %}<br>照片更新：{{ p.photo_capture.updated_display }}{% endif %}</small>
-  <small>Capture V2：<span class="badge {{ p.capture_v2_gate.code }}">{{ p.capture_v2_gate.label }}</span><br>{{ p.capture_v2_gate.reason }}</small>
-  <small>最近成功：{{ p.last_success_display if p.last_success_at else '—' }}<br>下次拜訪：{{ p.next_visit_display if p.next_visit_at else '佇列中' }}</small>
+  <p class="profile-counts">{{ p.post_count }} 篇貼文 · {{ p.comment_count }} 則留言 · {{ p.photo_count }} 張照片</p>
+  <div class="profile-state-row"><span>照片回溯 <span class="badge {{ p.photo_capture.status }}">{{ p.photo_capture.status_label }}</span></span><span>貼文回溯 <span class="badge {{ p.capture_v2_gate.code }}">{{ p.capture_v2_gate.label }}</span></span></div>
+  <small class="profile-schedule">最近成功：{{ p.last_success_display if p.last_success_at else '—' }}<br>下次拜訪：{{ p.next_visit_display if p.next_visit_at else '佇列中' }}</small>
+  <details class="profile-capture-disclosure" data-disclosure-key="profile-{{ p.id }}-capture"><summary>擷取狀態詳情</summary><div class="profile-capture-details">
+    <small>照片回溯：<span class="badge {{ p.photo_capture.status }}">{{ p.photo_capture.status_label }}</span>{% if p.photo_capture.discovered_count %} · 已發現 {{ p.photo_capture.discovered_count }} 張{% endif %}{% if p.photo_capture.source_policy_label %}<br>預定策略：{{ p.photo_capture.source_policy_label }}{% endif %}<br>範圍：{{ p.photo_capture.access_scope_label }} · 來源：{{ p.photo_capture.source_label }}{% if p.photo_capture.updated_display %}<br>照片更新：{{ p.photo_capture.updated_display }}{% endif %}</small>
+    <small>Capture V2：<span class="badge {{ p.capture_v2_gate.code }}">{{ p.capture_v2_gate.label }}</span><br>{{ p.capture_v2_gate.reason }}</small>
+  </div></details>
+  <div class="card-primary-actions">
+    <a class="button" href="/profiles/{{ p.id }}">查看資料</a>
+    <form method="post" action="/profiles/{{ p.id }}/scan" onsubmit="return confirm('立即執行拜訪 {{ p.display_name or p.name }}？同一帳號 10 分鐘內不可重複執行。')"><button class="button secondary" type="submit"{% if p.manual_available_at %} disabled data-manual-cooldown="{{ p.manual_available_at }}"{% endif %}><span data-manual-label>{% if p.manual_available_at %}冷卻中{% else %}立即拜訪{% endif %}</span></button></form>
   </div>
-  <div class="card-admin-actions">
+  <details class="profile-admin-disclosure" data-disclosure-key="profile-{{ p.id }}-admin"><summary>管理與進階操作</summary><div class="card-admin-actions">
     <form method="post" action="/profiles/{{ p.id }}/refresh-name" onsubmit="return confirm('重新抓取此帳號名稱？目前顯示名稱會先清除。')"><button class="button secondary" type="submit">重新抓取名稱</button></form>
     {% if browser_enabled %}<form method="post" action="/profiles/{{ p.id }}/browser-scan" onsubmit="return confirm('立即使用 Chromium 拜訪 {{ p.display_name or p.name }}？')"><button class="button secondary" type="submit"{% if p.browser_manual_available_at %} disabled data-manual-cooldown="{{ p.browser_manual_available_at }}"{% endif %}><span data-manual-label>{% if p.browser_manual_available_at %}瀏覽器冷卻中{% else %}立即瀏覽器拜訪{% endif %}</span></button></form>{% endif %}
     <form class="photo-capture-form" method="post" action="/profiles/{{ p.id }}/capture-photos" onsubmit="return confirm('開始 {{ p.display_name or p.name }} 照片分批回溯？選擇 Apify 或自動後備可能會使用付費額度；可見範圍會分開記錄，既有內容會依內容去重。')"><select name="source_policy" aria-label="{{ p.display_name or p.name }} 照片來源"><option value="auto"{% if not p.photo_auto_available %} disabled{% endif %}>{{ p.photo_auto_label }}</option><option value="account"{% if not p.photo_browser_available %} disabled{% endif %}>僅登入帳號可見{% if not p.photo_browser_available %}（Chromium 未啟用）{% endif %}</option><option value="apify"{% if not p.photo_actor_available %} disabled{% endif %}>僅 Apify 公開照片{% if not p.photo_actor_available %}（{{ p.photo_actor_unavailable_reason }}）{% endif %}</option></select><button class="button secondary" type="submit"{% if p.photo_capture.active or not p.photo_auto_available %} disabled{% endif %}>{% if p.photo_capture.active %}照片回溯中{% elif not p.photo_auto_available %}照片擷取未啟用{% elif p.photo_capture.status == 'complete' %}重新核對全部照片{% else %}擷取全部照片{% endif %}</button></form>
-    <a class="button secondary" href="/profiles/{{ p.id }}">查看資料</a>
     <a class="button secondary" href="/diagnostics?profile_id={{ p.id }}">Apify 紀錄</a>
     <form method="post" action="/profiles/{{ p.id }}/apify-freeze" onsubmit="return confirm('{% if p.apify_frozen %}解除此帳號的 Apify 凍結？{% else %}凍結後，此帳號將不使用任何 Apify 功能，其他功能維持正常。確定凍結？{% endif %}')"><button class="button {% if p.apify_frozen %}secondary{% else %}danger{% endif %}" type="submit">{% if p.apify_frozen %}解除 Apify 凍結{% else %}凍結 Apify{% endif %}</button></form>
     {% if p.apify_frozen %}<span class="badge gone">Apify 已凍結</span>{% endif %}
     {% if p.browser_capture_available %}<a class="button secondary" href="/profiles/{{ p.id }}/browser-screenshot" target="_blank" title="最後擷取：{{ p.browser_capture_display }}">瀏覽器擷取畫面</a>{% endif %}
     <button class="button secondary" type="button" data-copy-profile>複製內容</button>
-    <form method="post" action="/profiles/{{ p.id }}/scan" onsubmit="return confirm('立即執行拜訪 {{ p.display_name or p.name }}？同一帳號 10 分鐘內不可重複執行。')"><button class="button secondary" type="submit"{% if p.manual_available_at %} disabled data-manual-cooldown="{{ p.manual_available_at }}"{% endif %}><span data-manual-label>{% if p.manual_available_at %}冷卻中{% else %}立即拜訪{% endif %}</span></button></form>
     <form method="post" action="/profiles/{{ p.id }}/remove" onsubmit="return confirm('停止監控 {{ p.display_name or p.name }}？歷史貼文與留言會保留。')"><button class="button danger" type="submit">移除</button></form>
+  </div></details>
   </div>
 </div>{% endfor %}</div></section>
-<section class="panel"><h2>Apify 使用估算</h2><table><thead><tr><th>月份</th><th>類別</th><th>結果</th><th>美元</th></tr></thead><tbody>{% for u in usage %}<tr><td>{{ u.month }}</td><td>{{ u.category }}</td><td>{{ u.results }}</td><td>${{ "%.4f"|format(u.estimated_usd) }}</td></tr>{% else %}<tr><td colspan="4">尚無資料</td></tr>{% endfor %}</tbody></table></section>
-<section class="panel"><h2>SerpApi 可靠度（最近 30 天）</h2><div class="queue-table"><table><thead><tr><th>帳號</th><th>成功率</th><th>成功／空結果／錯誤</th><th>最近成功</th><th>最近嘗試</th></tr></thead><tbody>
+<details class="panel dashboard-tool-panel" data-disclosure-key="dashboard-apify-estimate"><summary><span>Apify 使用估算</span><small>排錯時再展開</small></summary><div class="dashboard-tool-body"><table><thead><tr><th>月份</th><th>類別</th><th>結果</th><th>美元</th></tr></thead><tbody>{% for u in usage %}<tr><td>{{ u.month }}</td><td>{{ u.category }}</td><td>{{ u.results }}</td><td>${{ "%.4f"|format(u.estimated_usd) }}</td></tr>{% else %}<tr><td colspan="4">尚無資料</td></tr>{% endfor %}</tbody></table></div></details>
+<details class="panel dashboard-tool-panel" data-disclosure-key="dashboard-serpapi"><summary><span>SerpApi 可靠度（最近 30 天）</span><small>查看成功、空結果與錯誤比例</small></summary><div class="dashboard-tool-body"><div class="queue-table"><table><thead><tr><th>帳號</th><th>成功率</th><th>成功／空結果／錯誤</th><th>最近成功</th><th>最近嘗試</th></tr></thead><tbody>
 {% for row in serpapi_reliability %}<tr><td>{{ row.name }}<br><small>{{ row.fb_id or '尚未解析 ID' }}</small></td><td>{% if row.success_rate is not none %}{{ row.success_rate }}%{% else %}尚無紀錄{% endif %}</td><td>{{ row.success_count }} / {{ row.empty_count }} / {{ row.error_count }}</td><td>{{ row.last_success_display if row.last_success_at else '—' }}</td><td>{{ row.last_attempt_display if row.last_attempt_at else '—' }}</td></tr>{% else %}<tr><td colspan="5" class="muted">尚未累積 SerpApi 查詢紀錄</td></tr>{% endfor %}
-</tbody></table></div></section>
-<section class="panel outbox-panel">
-  <div class="panel-heading"><h2>發送佇列</h2><form method="post" action="/outbox/clear" onsubmit="return confirm('清空所有待發與重試中的 Telegram 訊息？')"><button class="button danger" type="submit">清空待發佇列</button></form></div>
+</tbody></table></div></div></details>
+<details class="panel dashboard-tool-panel outbox-panel" data-disclosure-key="dashboard-outbox"{% if outbox_counts.get('pending', 0) or outbox_counts.get('failed', 0) %} open{% endif %}>
+  <summary><span>發送佇列</span><small>待發 {{ outbox_counts.get('pending', 0) }} · 失敗 {{ outbox_counts.get('failed', 0) }}</small></summary>
+  <div class="dashboard-tool-body"><div class="panel-heading"><span></span><form method="post" action="/outbox/clear" onsubmit="return confirm('清空所有待發與重試中的 Telegram 訊息？')"><button class="button danger" type="submit">清空待發佇列</button></form></div>
   <div class="queue-stats"><span>待發 {{ outbox_counts.get('pending', 0) }}</span><span>已失敗 {{ outbox_counts.get('failed', 0) }}</span><span>已取消 {{ outbox_counts.get('cancelled', 0) }}</span></div>
   <div class="queue-table"><table><thead><tr><th>內容</th><th>帳號／建立時間</th><th>下次嘗試</th><th>狀態</th><th></th></tr></thead><tbody>
   {% for item in outbox_rows %}<tr><td>{{ item.summary[:160] }}</td><td>{{ item.profile_name }}<br><small>{{ item.created_display }}</small></td><td>{{ item.next_display }}<br><small>{{ item.attempts }} 次</small></td><td><span class="badge {{ item.status }}">{{ item.status }}</span>{% if item.last_error %}<br><small>{{ item.last_error[:100] }}</small>{% endif %}</td><td>{% if item.status == 'pending' %}<form method="post" action="/outbox/{{ item.id }}/cancel"><button class="button secondary" type="submit">取消</button></form>{% endif %}</td></tr>{% else %}<tr><td colspan="5" class="muted">目前沒有待處理訊息</td></tr>{% endfor %}
-  </tbody></table></div>
-</section>
-<section class="panel maintenance-panel">
-  <h2>去重與維護紀錄</h2>
-  <div class="queue-table"><table><thead><tr><th>工作</th><th>時間</th><th>狀態</th><th>結果</th></tr></thead><tbody>
+  </tbody></table></div></div>
+</details>
+<details class="panel dashboard-tool-panel maintenance-panel" data-disclosure-key="dashboard-maintenance">
+  <summary><span>去重與維護紀錄</span><small>最近 {{ maintenance_runs|length }} 筆</small></summary>
+  <div class="dashboard-tool-body"><div class="queue-table"><table><thead><tr><th>工作</th><th>時間</th><th>狀態</th><th>結果</th></tr></thead><tbody>
   {% for run in maintenance_runs %}<tr><td>{{ run.task_name }}</td><td>{{ run.started_display }}{% if run.finished_at %}<br><small>完成：{{ run.finished_display }}</small>{% endif %}</td><td><span class="badge {{ run.status }}">{{ run.status }}</span></td><td>{% if run.summary %}貼文合併 {{ run.summary.get('posts_merged', 0) }}、留言合併 {{ run.summary.get('comments_merged', 0) }}、媒體合併 {{ run.summary.get('merged', 0) }}、無引用檔案 {{ run.summary.get('orphaned', 0) }}{% endif %}{% if run.error %}<br><small>{{ run.error }}</small>{% endif %}</td></tr>{% else %}<tr><td colspan="4" class="muted">尚無維護紀錄</td></tr>{% endfor %}
-  </tbody></table></div>
-</section>
+  </tbody></table></div></div>
+</details>
 </div>
 {% endblock %}

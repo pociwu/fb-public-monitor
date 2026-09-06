@@ -6,6 +6,7 @@
   let items = [];
   let current = 0;
   let touchStartX = 0;
+  let dashboardDisclosureState = new Map();
 
   function show(index) {
     if (!items.length) return;
@@ -202,7 +203,21 @@
     const delta = event.changedTouches[0].clientX - touchStartX;
     if (Math.abs(delta) > 50) show(current + (delta < 0 ? 1 : -1));
   }, { passive: true });
+  document.addEventListener("htmx:beforeSwap", (event) => {
+    if (event.target.id !== "dashboard") return;
+    dashboardDisclosureState = new Map(
+      [...event.target.querySelectorAll("details[data-disclosure-key]")]
+        .map((element) => [element.dataset.disclosureKey, element.open])
+    );
+  });
   document.addEventListener("htmx:afterSwap", (event) => {
+    if (event.target.id === "dashboard") {
+      event.target.querySelectorAll("details[data-disclosure-key]").forEach((element) => {
+        if (dashboardDisclosureState.has(element.dataset.disclosureKey)) {
+          element.open = dashboardDisclosureState.get(element.dataset.disclosureKey);
+        }
+      });
+    }
     initExpandable(event.target);
     initProfileSorting(event.target);
     updateUsageCountdowns(event.target);

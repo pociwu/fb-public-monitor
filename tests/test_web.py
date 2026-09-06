@@ -2,12 +2,77 @@ import json
 import os
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
 from fb_monitor.config import load_settings
 from fb_monitor.serpapi import SerpApiAccount
 from fb_monitor.web import create_app
+
+
+def test_dashboard_mobile_keeps_secondary_controls_collapsed(
+    tmp_path: Path, monkeypatch
+):
+    """The mobile dashboard must remain readable even with every control enabled."""
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("FACEBOOK_BROWSER_ENABLED", "1")
+    monkeypatch.setenv("APIFY_TOKEN", "test-token")
+    app = create_app(load_settings(config))
+    app.state.db.execute(
+        "UPDATE profiles SET display_name='Mobile Example',profile_details_json=? WHERE id=1",
+        ('{"profile_intro_text":"A long public biography for the mobile layout probe","followers":"1234","current_city":"Taipei"}',),
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert 'class="mobile-nav"' in response.text
+    assert 'class="profile-admin-disclosure"' in response.text
+
+    try:
+        from playwright.sync_api import Error as PlaywrightError
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        pytest.skip("Playwright is not installed")
+
+    css = (Path(__file__).parents[1] / "fb_monitor" / "static" / "style.css").read_text(
+        encoding="utf-8"
+    )
+    html = response.text.replace(
+        '<link rel="stylesheet" href="/static/style.css">', f"<style>{css}</style>"
+    )
+    html = html.replace(
+        '<script src="https://unpkg.com/htmx.org@2.0.4" defer></script>', ""
+    ).replace('<script src="/static/app.js" defer></script>', "")
+    with sync_playwright() as playwright:
+        try:
+            browser = (
+                playwright.chromium.launch(channel="msedge", headless=True)
+                if os.name == "nt"
+                else playwright.chromium.launch(headless=True)
+            )
+        except PlaywrightError:
+            pytest.skip("No Playwright browser is available")
+        page = browser.new_page(viewport={"width": 390, "height": 844})
+        page.set_content(html, wait_until="domcontentloaded")
+        card = page.locator(".profile-card").first
+        assert page.locator(".mobile-nav").is_visible()
+        assert not page.locator(".desktop-nav").is_visible()
+        assert not card.locator(".profile-admin-disclosure").evaluate(
+            "element => element.open"
+        )
+        assert card.locator(".button:visible").count() <= 2
+        assert page.locator("body").evaluate(
+            "element => element.scrollWidth <= element.clientWidth"
+        )
+        browser.close()
 
 
 def _capture_v2_test_app(tmp_path: Path, monkeypatch, *, enabled: bool = True):
