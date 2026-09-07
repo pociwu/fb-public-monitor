@@ -67,6 +67,7 @@ from .facebook_browser import (
     public_content_proof_matches_profile,
 )
 from .ingest import Ingester, external_id, is_placeholder_profile_name, monitored_projection, profile_display_name
+from .health import collect_health
 from .media import MediaStore, extract_media
 from .normalize import content_hash, facebook_post_identity, normalize_url
 from .photo_actor import parse_photo_actor_output, validate_photo_actor_input
@@ -74,7 +75,7 @@ from .raw_retention import cleanup_capture_raw
 from .telegram import TelegramSender
 from .serpapi import SerpApiError, SerpApiGateway, SerpApiNoResults, SerpApiQuotaExceeded, profile_id_from_url
 from .storage import collect_storage_snapshot, daily_storage_message
-from .timeutil import telegram_time
+from .timeutil import parse_time, telegram_time
 
 log = logging.getLogger(__name__)
 PRICES = {
@@ -580,12 +581,13 @@ class MonitorService:
         ``needs_reconcile`` so startup can never purchase the page again.
         """
 
+        self._recover_interrupted_visits()
         counts = {"pending": 0, "needs_reconcile": 0}
         now = utcnow()
         jobs = self.db.rows(
             """SELECT * FROM jobs WHERE status='running' AND job_type IN (
             'detect_public_v2','verify_public_v2','capture_posts_v2','capture_profile_photos',
-            'contract_test_posts_v2'
+            'contract_test_posts_v2','profile_browser_fallback'
             ) ORDER BY id"""
         )
         for job in jobs:
@@ -4672,6 +4674,30 @@ class MonitorService:
     def stop(self) -> None:
         self.stop_event.set()
 
+    def _recover_interrupted_visits(self) -> None:
+        now = datetime.now(UTC)
+        cutoff = (now - timedelta(minutes=WORKER_LEASE_MINUTES)).isoformat()
+        reason = "巡檢工作租約過期／服務中斷；已恢復後續巡檢排程"
+        with self.db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """SELECT id,profile_id FROM jobs WHERE job_type IN ('visit','browser_visit')
+                AND status='running' AND COALESCE(leased_at,started_at,created_at)<?
+                AND (lease_owner IS NULL OR lease_owner<>?)""", (cutoff, self.worker_id),
+            ).fetchall()
+            for row in rows:
+                # Close the interrupted attempt, never replay a potentially
+                # paid V1 request inside it. The next normal patrol applies
+                # current budget, source controls and durable V2 checkpoints.
+                conn.execute(
+                    "UPDATE jobs SET status='failed',finished_at=?,error=?,lease_owner=NULL,leased_at=NULL WHERE id=?",
+                    (now.isoformat(), reason, row["id"]),
+                )
+                conn.execute(
+                    """UPDATE profiles SET next_visit_at=COALESCE(next_visit_at,?),last_error=?
+                    WHERE id=? AND enabled=1""", (now.isoformat(), reason, row["profile_id"]),
+                )
+
     def _seed_initial_jobs(self) -> None:
         if self.db.row("SELECT id FROM jobs WHERE status IN ('pending','running') LIMIT 1") or self.db.row("SELECT id FROM profiles WHERE last_attempt_at IS NOT NULL OR next_visit_at IS NOT NULL LIMIT 1"):
             return
@@ -4962,6 +4988,23 @@ class MonitorService:
                 await self.visit_profile(int(job["profile_id"]))
             elif job["job_type"] == "browser_visit":
                 await self.browser_visit_profile(int(job["profile_id"]))
+            elif job["job_type"] == "profile_browser_fallback":
+                profile = self.db.row("SELECT * FROM profiles WHERE id=? AND enabled=1", (job["profile_id"],))
+                # A successful SerpApi refresh can supersede this fallback.
+                # last_success_at also advances on public verification, which
+                # does not refresh profile details and must not cancel it.
+                last_refresh = parse_time(profile.get("serp_last_checked_at")) if profile else None
+                requested_at = parse_time(job_payload.get("requested_at") or job["created_at"])
+                if profile and not (last_refresh and requested_at and last_refresh > requested_at):
+                    refreshed = await self._try_browser_fallback(
+                        profile, str(job_payload.get("primary_error") or ""),
+                        str(job_payload.get("brightdata_error") or ""), continuation=True,
+                    )
+                    if not refreshed:
+                        self.db.execute(
+                            "UPDATE jobs SET status='failed',finished_at=?,error=? WHERE id=? AND status='running' AND lease_owner=?",
+                            (utcnow(), (self.db.row("SELECT last_error FROM profiles WHERE id=?", (profile["id"],)) or {}).get("last_error"), job["id"], self.worker_id),
+                        )
             elif job["job_type"] == "detect_public_v2":
                 await self.detect_public_v2(int(job["profile_id"]))
             elif job["job_type"] == "verify_public_v2":
@@ -8233,8 +8276,16 @@ class MonitorService:
         )
         return True
 
-    async def _try_browser_fallback(self, profile: dict[str, Any], primary_error: str, brightdata_error: str) -> bool:
+    def _profile_refresh_failed(self, profile_id: int, reason: str, *, deferred: bool = False) -> None:
+        self.db.execute(
+            "UPDATE profiles SET last_error=?,consecutive_failures=consecutive_failures+? WHERE id=?",
+            (reason[:1000], 0 if deferred else 1, profile_id),
+        )
+
+    async def _try_browser_fallback(self, profile: dict[str, Any], primary_error: str, brightdata_error: str, *, continuation: bool = False) -> bool:
+        failure_prefix = f"SerpApi：{primary_error[:250]}；Bright Data：{brightdata_error[:250]}；瀏覽器："
         if not self.settings.facebook_browser_enabled:
+            self._profile_refresh_failed(int(profile["id"]), failure_prefix + "未啟用")
             hour = datetime.now(UTC).strftime("%Y-%m-%dT%H")
             self.db.add_event(
                 f"profile-fallback:{profile['id']}:{hour}:failed",
@@ -8247,12 +8298,22 @@ class MonitorService:
                 int(profile["id"]),
             )
             return False
-        if not self._acquire_browser(
-            profile,
-            anonymous=False,
-            operation="profile_fallback",
-            defer_job=False,
-        ):
+        try:
+            self._acquire_browser(
+                profile, anonymous=False, operation="profile_fallback", defer_job=True,
+            )
+        except BrowserGuardDeferred as exc:
+            retry_at = exc.decision.retry_at or (datetime.now(UTC) + timedelta(minutes=5))
+            self._profile_refresh_failed(
+                int(profile["id"]), failure_prefix + f"{exc.decision.reason}；已排入備援補跑 {retry_at.isoformat()}", deferred=True,
+            )
+            if continuation:
+                raise
+            self.db.queue_unique_job(
+                profile_id=int(profile["id"]), job_type="profile_browser_fallback", priority=5,
+                dedupe_key=f"profile-browser-fallback:{profile['id']}", available_at=retry_at.isoformat(),
+                payload={"primary_error": primary_error[:250], "brightdata_error": brightdata_error[:250], "requested_at": utcnow()},
+            )
             return False
         try:
             attempted_at = utcnow()
@@ -8264,6 +8325,7 @@ class MonitorService:
             item = await self.facebook_browser.profile(str(profile["url"]), str(profile["id"]))
             await self._store_profile_details(profile, item)
         except FacebookBrowserChallengeRequired as exc:
+            self._profile_refresh_failed(int(profile["id"]), failure_prefix + str(exc))
             self._record_browser_challenge(
                 profile,
                 anonymous=False,
@@ -8282,6 +8344,7 @@ class MonitorService:
             )
             return False
         except FacebookBrowserLoginRequired as exc:
+            self._profile_refresh_failed(int(profile["id"]), failure_prefix + str(exc))
             day = datetime.now(UTC).date().isoformat()
             self.db.add_event(
                 f"facebook-browser:{day}:login-required",
@@ -8294,6 +8357,7 @@ class MonitorService:
             )
             return False
         except FacebookBrowserError as exc:
+            self._profile_refresh_failed(int(profile["id"]), failure_prefix + str(exc))
             hour = datetime.now(UTC).strftime("%Y-%m-%dT%H")
             self.db.add_event(
                 f"profile-fallback:{profile['id']}:{hour}:failed",
@@ -8814,27 +8878,66 @@ class MonitorService:
             local = datetime.now(tz)
             if local.hour == self.settings.health_hour:
                 key = f"health:{local.date().isoformat()}"
-                profiles = self.db.rows("SELECT COALESCE(display_name,name) name,public_state,last_success_at,next_visit_at,consecutive_failures FROM profiles WHERE enabled=1 ORDER BY id")
+                with self.db.connect() as connection:
+                    profiles = collect_health(connection, stale_hours=self.settings.serpapi_profile_refresh_hours + self.settings.visit_max_hours)["profiles"]
                 free_gb = __import__("shutil").disk_usage(self.settings.data_dir).free / 1024**3
                 official = self.db.apify_usage_snapshot()
                 used = float(official["used_usd"]) if official else self.settings.monthly_budget_usd - self._remaining_budget()
                 usage_label = "官方" if official else "本地估算"
-                lines = self._health_profile_lines(profiles, self.settings.timezone)
-                self.db.add_event(key, "health", {"title": "每日 08:00 健康摘要", "text": "\n".join(lines) + f"\n磁碟剩餘：{free_gb:.1f} GB\nApify（{usage_label}）：${used:.2f}/${self.settings.monthly_budget_usd:.2f}"})
+                footer = f"磁碟剩餘：{free_gb:.1f} GB\nApify（{usage_label}）：${used:.2f}/${self.settings.monthly_budget_usd:.2f}"
+                pages = self._health_summary_pages(profiles, footer, self.settings.timezone)
+                for index, page in enumerate(pages):
+                    page_key = key if index == 0 else f"{key}:{index + 1}"
+                    title = f"每日 {self.settings.health_hour:02d}:00 健康摘要"
+                    if len(pages) > 1:
+                        title += f"（{index + 1}/{len(pages)}）"
+                    self.db.add_event(page_key, "health", {"title": title, "text": page})
             try:
                 await asyncio.wait_for(self.stop_event.wait(), timeout=60)
             except TimeoutError:
                 pass
 
     @staticmethod
+    def _health_summary_pages(profiles: list[dict[str, Any]], footer: str, timezone: str = "Asia/Taipei") -> list[str]:
+        # Keep complete account blocks together, allowing for Telegram HTML
+        # escaping and the sender's 3500-character body limit.
+        blocks = ["\n".join(MonitorService._health_profile_lines([profile], timezone)) for profile in profiles]
+        blocks.append(footer)
+        pages: list[str] = []
+        current = ""
+        for block in blocks:
+            candidate = f"{current}\n\n{block}" if current else block
+            if current and len(TelegramSender._escape(candidate)) > 3000:
+                pages.append(current)
+                current = block
+            else:
+                current = candidate
+        if current:
+            pages.append(current)
+        return pages
+
+    @staticmethod
     def _health_profile_lines(profiles: list[dict[str, Any]], timezone: str = "Asia/Taipei") -> list[str]:
         lines = []
         for profile in profiles:
-            name = str(profile["name"])
+            name = str(profile["name"])[:100]
             if name.startswith("FB-") and name[3:].isdigit():
                 name = "姓名待確認"
             last_success = telegram_time(profile.get("last_success_at"), timezone)
             lines.append(f"{name}: {profile['public_state']} · 最近成功 {last_success}")
+            if profile.get("stale"):
+                age = profile.get("age_hours")
+                lines.append(f"  ⚠ 個人資料逾期 {int(age)} 小時" if age is not None else "  ⚠ 尚無成功更新")
+            if profile.get("last_error"):
+                reason = " ".join(str(profile["last_error"]).split())
+                lines.append(f"  原因：{reason[:180]}")
+            pending = profile.get("pending_refresh")
+            if pending:
+                when = telegram_time(pending.get("available_at"), timezone)
+                label = "備援補跑" if pending.get("job_type") == "profile_browser_fallback" else "巡檢"
+                lines.append(f"  {label}：{pending['status']} · 預定 {when}")
+            elif profile.get("stale"):
+                lines.append(f"  下次巡檢：{telegram_time(profile.get('next_visit_at'), timezone)}")
         return lines
 
     async def _media_retry_loop(self) -> None:

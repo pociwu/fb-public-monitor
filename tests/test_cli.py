@@ -23,6 +23,33 @@ storage:
     return config
 
 
+def test_health_is_read_only_and_exposes_stale_refresh_evidence(tmp_path, monkeypatch, capsys):
+    config = _write_cli_config(tmp_path)
+    settings = load_settings(config)
+    db = Database(settings.db_path)
+    db.sync_profiles(settings.profiles)
+    db.execute("UPDATE profiles SET last_success_at='2026-01-01T00:00:00+00:00',last_error='login required' WHERE id=1")
+    job_id, _ = db.queue_unique_job(
+        profile_id=1, job_type="profile_browser_fallback", priority=5,
+        dedupe_key="test-refresh", available_at="2026-09-08T00:00:00+00:00",
+    )
+    db.record_serpapi_profile_attempts(1, [{"query": "100", "status": "empty", "error": "no results"}])
+
+    def must_not_initialize_database(*args, **kwargs):
+        raise AssertionError("health must not initialize/migrate/sync the production database")
+
+    monkeypatch.setattr("fb_monitor.cli.Database", must_not_initialize_database)
+    monkeypatch.setattr(sys, "argv", ["fb-monitor", "--config", str(config), "health"])
+    main()
+    report = json.loads(capsys.readouterr().out)
+    profile = report["profiles"][0]
+    assert profile["stale"] is True
+    assert profile["last_error"] == "login required"
+    assert profile["pending_refresh"]["id"] == job_id
+    assert profile["serpapi_latest"]["status"] == "empty"
+    assert "serpapi_key" not in report["settings"]
+
+
 def _prepare_source_reconcile_fixture(db: Database, window: str) -> dict:
     epoch, _ = db.get_or_create_capture_epoch(1, "test", status="ready")
     coverage = db.upsert_coverage_stream(

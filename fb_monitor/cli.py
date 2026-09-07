@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 from datetime import UTC, datetime
 
 import uvicorn
@@ -83,8 +84,25 @@ def main() -> None:
     )
     reconcile_contract.add_argument("--dataset-id", default="")
     sub.add_parser("status")
+    sub.add_parser("health", help="唯讀檢查資料過期、巡檢佇列與來源失敗證據")
     args = parser.parse_args()
     settings = load_settings(args.config)
+    if args.command == "health":
+        from .health import collect_health
+        with sqlite3.connect(settings.db_path.resolve().as_uri() + "?mode=ro", uri=True) as connection:
+            connection.execute("BEGIN")
+            report = collect_health(connection, stale_hours=settings.serpapi_profile_refresh_hours + settings.visit_max_hours)
+        report["settings"] = {
+            "scheduler_enabled": settings.scheduler_enabled,
+            "deploy_maintenance_active": settings.deploy_maintenance_flag.exists(),
+            "serpapi_configured": bool(settings.serpapi_key),
+            "brightdata_configured": bool(settings.brightdata_api_token),
+            "browser_enabled": settings.facebook_browser_enabled,
+            "profile_refresh_hours": settings.serpapi_profile_refresh_hours,
+            "visit_max_hours": settings.visit_max_hours,
+        }
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return
     if args.command == "run":
         from .web import create_app
         uvicorn.run(create_app(settings), host=settings.web_host, port=settings.web_port, log_level="info")

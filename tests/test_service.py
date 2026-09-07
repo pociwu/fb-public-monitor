@@ -978,6 +978,65 @@ def test_health_summary_uses_resolved_display_name():
     ]
 
 
+def test_expired_visit_cannot_block_future_patrols(tmp_path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text("profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n", encoding="utf-8")
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    service = MonitorService(load_settings(config))
+    old = (datetime.now(UTC) - timedelta(days=4)).isoformat()
+    job_id = service._enqueue(1, "visit", 10, datetime.now(UTC))
+    service.db.execute("UPDATE jobs SET status='running',started_at=?,leased_at=?,lease_owner='stopped-container' WHERE id=?", (old, old, job_id))
+    service.db.execute("UPDATE profiles SET last_attempt_at=?,last_success_at=?,next_visit_at=NULL WHERE id=1", (old, old))
+    service._recover_stale_capture_v2_jobs()
+    service._enqueue_due_visits()
+    assert service.db.row("SELECT status FROM jobs WHERE id=?", (job_id,))["status"] == "failed"
+    assert service.db.row("SELECT COUNT(*) n FROM jobs WHERE job_type='visit' AND status='pending'")["n"] == 1
+    assert service.db.row("SELECT last_success_at FROM profiles WHERE id=1")["last_success_at"] == old
+
+
+@pytest.mark.parametrize("same_worker", [False, True])
+def test_visit_recovery_does_not_interrupt_a_live_worker(tmp_path, monkeypatch, same_worker):
+    config = tmp_path / "config.yaml"
+    config.write_text("profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n", encoding="utf-8")
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    service = MonitorService(load_settings(config))
+    job_id = service._enqueue(1, "visit", 10, datetime.now(UTC))
+    leased_at = datetime.now(UTC) - timedelta(days=4) if same_worker else datetime.now(UTC)
+    owner = service.worker_id if same_worker else "other-live-worker"
+    service.db.execute("UPDATE jobs SET status='running',leased_at=?,lease_owner=? WHERE id=?", (leased_at.isoformat(), owner, job_id))
+    service._recover_interrupted_visits()
+    assert service.db.row("SELECT status FROM jobs WHERE id=?", (job_id,))["status"] == "running"
+
+
+def test_health_summary_explains_staleness_and_scheduled_fallback():
+    lines = MonitorService._health_profile_lines([{
+        "name": "watched", "public_state": "public", "last_success_at": "2026-08-27T13:00:00+00:00",
+        "stale": True, "age_hours": 250, "last_error": "SerpApi：no results；瀏覽器：daily_limit",
+        "pending_refresh": {"job_type": "profile_browser_fallback", "status": "pending", "available_at": "2026-09-07T16:00:00+00:00"},
+    }])
+    assert "最近成功 2026/8/27 21:00" in lines[0]
+    assert "逾期 250 小時" in lines[1]
+    assert "daily_limit" in lines[2]
+    assert "備援補跑：pending · 預定 2026/9/8 00:00" in lines[3]
+
+
+def test_health_summary_pages_preserve_all_accounts_without_telegram_truncation():
+    profiles = [{
+        "name": f"watched-{number}", "public_state": "public",
+        "last_success_at": "2026-08-27T13:00:00+00:00", "stale": True,
+        "age_hours": 250, "last_error": "source <error> & retry " * 20,
+    } for number in range(15)]
+    pages = MonitorService._health_summary_pages(profiles, "磁碟剩餘：95.8 GB")
+    from fb_monitor.telegram import TelegramSender
+    assert 1 < len(pages) <= 4
+    for page in pages:
+        assert len(page) < 3500
+        assert len(TelegramSender._escape(page)) <= 3000
+    for number in range(15):
+        assert "\n".join(pages).count(f"watched-{number}:") == 1
+    assert pages[-1].endswith("磁碟剩餘：95.8 GB")
+
+
 @pytest.mark.asyncio
 async def test_browser_profile_name_cannot_overwrite_existing_canonical_name(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
@@ -1190,6 +1249,8 @@ schedule:
     assert profile["public_state"] == "unknown"
     assert profile["serp_last_checked_at"] is None
     assert service.db.row("SELECT COUNT(*) count FROM events WHERE event_type='facebook_browser_login_required'")["count"] == 1
+    assert "login required" in (profile["last_error"] or "")
+    assert profile["consecutive_failures"] == 1
     event = service.db.row("SELECT payload_json FROM events WHERE event_type='facebook_browser_login_required'")
     payload = json.loads(event["payload_json"])
     assert "監控網址：https://facebook.com/100" in payload["text"]
@@ -1223,6 +1284,89 @@ storage:
     payload = json.loads(event["payload_json"])
     assert "監控網址：https://facebook.com/100" in payload["text"]
     assert payload["source_url"] == "https://facebook.com/100"
+
+
+@pytest.mark.asyncio
+async def test_profile_fallback_resumes_after_guard_without_rebuying_api(tmp_path, monkeypatch):
+    from fb_monitor.browser_guard import BrowserDecision
+
+    config = tmp_path / "config.yaml"
+    config.write_text("profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\nschedule:\n  spacing_min_minutes: 0\n  spacing_max_minutes: 0\n", encoding="utf-8")
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    monkeypatch.setenv("FACEBOOK_BROWSER_ENABLED", "1")
+    monkeypatch.delenv("BRIGHTDATA_API_TOKEN", raising=False)
+    service = MonitorService(load_settings(config))
+    old_success = "2026-08-27T13:00:00+00:00"
+    service.db.execute("UPDATE profiles SET last_success_at=? WHERE id=1", (old_success,))
+    retry_at = datetime.now(UTC) + timedelta(minutes=5)
+    monkeypatch.setattr(service.browser_guard, "acquire", lambda _: BrowserDecision(False, "global_spacing", retry_at, 1))
+    api_calls = []
+
+    async def failed_api(*args, **kwargs):
+        api_calls.append(1)
+        raise SerpApiError("no results")
+
+    monkeypatch.setattr(service.serpapi, "profile", failed_api)
+    await service.visit_profile(1)
+    job = service.db.row("SELECT * FROM jobs WHERE job_type='profile_browser_fallback' AND status='pending'")
+    assert job is not None, "Deferred fallback was lost until the next 6–8 hour visit"
+    assert job["available_at"] == retry_at.isoformat()
+    profile = service.db.row("SELECT * FROM profiles WHERE id=1")
+    assert profile["last_success_at"] == old_success
+    assert "global_spacing" in profile["last_error"]
+    await service._try_browser_fallback(profile, "no results", "not configured")
+    assert service.db.row("SELECT COUNT(*) n FROM jobs WHERE job_type='profile_browser_fallback' AND status='pending'")["n"] == 1
+
+    # Execute the durable continuation through the real worker after restart.
+    service = MonitorService(load_settings(config))
+    monkeypatch.setattr(service.serpapi, "profile", failed_api)
+    monkeypatch.setattr(service.browser_guard, "acquire", lambda _: BrowserDecision(False, "global_spacing", retry_at, 1))
+    service.db.execute("UPDATE jobs SET available_at=? WHERE id=?", ("2026-01-01T00:00:00+00:00", job["id"]))
+    await service._run_next_job()
+    deferred = service.db.row("SELECT * FROM jobs WHERE id=?", (job["id"],))
+    assert deferred["status"] == "pending"
+    assert deferred["available_at"] == retry_at.isoformat()
+    assert deferred["attempts"] == 0
+    assert len(api_calls) == 1
+    monkeypatch.setattr(service.browser_guard, "acquire", lambda _: BrowserDecision(True, "allowed", None, 2))
+
+    async def browser_profile(url, diagnostic_key=None):
+        return {"id": "100", "name": "watched", "url": url, "profile_data_source": "Facebook 直接瀏覽器"}
+
+    monkeypatch.setattr(service.facebook_browser, "profile", browser_profile)
+    service.db.execute("UPDATE jobs SET available_at=? WHERE id=?", ("2026-01-01T00:00:00+00:00", job["id"]))
+    await service._run_next_job()
+    assert len(api_calls) == 1
+    profile = service.db.row("SELECT * FROM profiles WHERE id=1")
+    assert profile["last_success_at"] != old_success
+    assert profile["last_error"] is None
+    assert service.db.row("SELECT status FROM jobs WHERE id=?", (job["id"],))["status"] == "done"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("serpapi_refreshed", [False, True])
+async def test_public_verification_alone_does_not_cancel_profile_fallback(tmp_path, monkeypatch, serpapi_refreshed):
+    config = tmp_path / "config.yaml"
+    config.write_text("profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n", encoding="utf-8")
+    monkeypatch.setenv("FB_MONITOR_SCHEDULER", "0")
+    service = MonitorService(load_settings(config))
+    now = datetime.now(UTC).isoformat()
+    service.db.execute("UPDATE profiles SET last_success_at=?,serp_last_checked_at=? WHERE id=1", (now, now if serpapi_refreshed else None))
+    job_id, _ = service.db.queue_unique_job(
+        profile_id=1, job_type="profile_browser_fallback", priority=5,
+        dedupe_key="test-fallback", available_at="2026-01-01T00:00:00+00:00",
+        payload={"requested_at": "2026-01-01T00:00:00+00:00"},
+    )
+    calls = []
+
+    async def fallback(*args, **kwargs):
+        calls.append(1)
+        return True
+
+    monkeypatch.setattr(service, "_try_browser_fallback", fallback)
+    await service._run_next_job()
+    assert len(calls) == (0 if serpapi_refreshed else 1)
+    assert service.db.row("SELECT status FROM jobs WHERE id=?", (job_id,))["status"] == "done"
 
 
 def test_browser_heading_repair_resets_bad_name_and_queues_refresh(tmp_path: Path, monkeypatch):

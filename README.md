@@ -148,6 +148,8 @@ browser_canary:
 
 ```bash
 docker compose exec monitor fb-monitor status
+# 唯讀檢查最近成功過舊：來源錯誤、瀏覽器限制、巡檢佇列與最近內容入庫
+docker compose exec -T monitor fb-monitor health
 docker compose exec monitor fb-monitor scan 1
 docker compose exec monitor fb-monitor scan example-account
 docker compose exec monitor fb-monitor diagnose
@@ -167,6 +169,12 @@ docker compose exec monitor fb-monitor reconcile-contract-run 7 --run-id EXISTIN
 # 已確認契約 run 未啟動：保留失敗稽核；grant 仍有效時才重排
 docker compose exec monitor fb-monitor reconcile-contract-run 7 --confirm-not-launched
 ```
+
+健康摘要的「最近成功」記錄成功取得個人資料，或 V2 成功確認公開存取的時間，不代表貼文／照片工作完成時間；不會因為工作結束或排入佇列就更新。超過個人資料更新間隔加一次巡檢最長間隔（預設 48 + 8 小時），摘要會標示逾期、最近失敗原因與待補跑時間。帳號較多時分頁發送，避免後段被 Telegram 截斷。
+
+`fb-monitor health` 不啟動 Actor、不消耗查詢額度，也不修改資料庫。它包含每個帳號最近巡檢／SerpApi 結果、來源存取證據、瀏覽器安全閘門及來源用量快照，方便區分登入失效、來源無結果、額度／每日限制與工作卡住。來源快照可能不是即時用量，單靠 Apify 尚有餘額不能判定其他來源也可使用。
+
+巡檢備援被瀏覽器閘門延後時，會建立去重且持久化的 `profile_browser_fallback` 工作，於允許時間補跑；此工作不重查 SerpApi／Bright Data。登入失效仍需人工重新登入，不會繞過驗證或安全限制。服務中斷留下、且租約已過期的巡檢會保留為失敗紀錄並恢復後續排程，而非直接重播可能付費的舊請求。
 
 ### OCI 維運選單
 
