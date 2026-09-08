@@ -98,6 +98,8 @@ def main() -> None:
             "serpapi_configured": bool(settings.serpapi_key),
             "brightdata_configured": bool(settings.brightdata_api_token),
             "browser_enabled": settings.facebook_browser_enabled,
+            "browser_global_daily_batches": settings.browser_daily_batches,
+            "browser_profile_daily_batches": settings.browser_profile_daily_batches,
             "profile_refresh_hours": settings.serpapi_profile_refresh_hours,
             "visit_max_hours": settings.visit_max_hours,
         }

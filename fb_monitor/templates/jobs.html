@@ -3,7 +3,10 @@
 {% block content %}
 <div class="panel-heading"><div><h1>工作紀錄</h1><small>共 {{ count }} 筆</small></div><a href="/" class="button secondary">返回儀表板</a></div>
 <nav class="tabs" aria-label="工作狀態篩選">
-  <a class="{% if status == 'active' %}active{% endif %}" href="/jobs?status=active">進行中</a>
+  <a class="{% if status == 'active' %}active{% endif %}" href="/jobs?status=active">佇列全部</a>
+  <a class="{% if status == 'ready' %}active{% endif %}" href="/jobs?status=ready">可執行</a>
+  <a class="{% if status == 'limited' %}active{% endif %}" href="/jobs?status=limited">受限等待</a>
+  <a class="{% if status == 'scheduled' %}active{% endif %}" href="/jobs?status=scheduled">尚未到期</a>
   <a class="{% if status == 'pending' %}active{% endif %}" href="/jobs?status=pending">等待中</a>
   <a class="{% if status == 'running' %}active{% endif %}" href="/jobs?status=running">執行中</a>
   <a class="{% if status == 'failed' %}active{% endif %}" href="/jobs?status=failed">失敗</a>

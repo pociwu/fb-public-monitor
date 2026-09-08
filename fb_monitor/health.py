@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .timeutil import parse_time
+from .job_queue import queue_counts
 
 
 def collect_health(
@@ -54,6 +55,7 @@ def collect_health(
     return {
         "observed_at": now.isoformat(), "stale_after_hours": stale_hours,
         "profiles": profiles,
+        "queue": queue_counts(connection, now.isoformat()),
         "jobs_by_status": rows("SELECT job_type,status,COUNT(*) count FROM jobs WHERE status IN ('pending','running') GROUP BY job_type,status"),
         "browser_limits": rows("""SELECT browser_identity,scope_type,scope_id,breaker_state,
             breaker_reason,blocked_until,next_allowed_at,daily_date,daily_batches FROM browser_limits"""),

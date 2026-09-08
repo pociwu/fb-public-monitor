@@ -21,6 +21,8 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from .config import MAX_PROFILES, Settings, add_profile_to_config, load_settings, remove_profile_from_config
 from .db import Database, utcnow
 from .ingest import is_placeholder_profile_name
+from .job_queue import QUEUE_STATE_SQL, queue_counts
+from .browser_guard import TAIPEI
 from .normalize import normalize_url
 from .service import MonitorService
 from .serpapi import profile_id_from_url
@@ -720,7 +722,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     break
             profile["public_photo_ids"] = public_photo_ids
         usage = db.rows("SELECT * FROM usage ORDER BY month DESC,category")
-        pending = db.row("SELECT COUNT(*) count FROM jobs WHERE status IN ('pending','running')")
+        with db.connect() as connection:
+            pending = queue_counts(connection, utcnow())
+        browser_limit = db.row("SELECT * FROM browser_limits WHERE browser_identity='global' AND scope_type='global' AND scope_id=''")
+        browser_used = int(browser_limit.get("daily_batches") or 0) if browser_limit and browser_limit.get("daily_date") == datetime.now(TAIPEI).date().isoformat() else 0
+        pending["browser_used"] = browser_used
+        pending["browser_global_limit"] = cfg.browser_daily_batches
+        pending["browser_profile_limit"] = cfg.browser_profile_daily_batches
         outbox = db.row("SELECT COUNT(*) count FROM outbox WHERE status='pending'")
         outbox_counts = {row["status"]: row["count"] for row in db.rows("SELECT status,COUNT(*) count FROM outbox GROUP BY status")}
         outbox_rows = db.rows("""SELECT o.*,e.payload_json event_payload,COALESCE(p.display_name,p.name,'系統') profile_name
@@ -1565,12 +1573,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/jobs")
     def jobs(
         request: Request,
-        status: str = Query("active", pattern="^(active|all|pending|running|done|failed|cancelled|deferred_budget)$"),
+        status: str = Query("active", pattern="^(active|all|pending|running|ready|limited|scheduled|done|failed|cancelled|deferred_budget)$"),
         page: int = Query(1, ge=1),
     ):
         db: Database = request.app.state.db
         if status == "active":
             where, params = "WHERE j.status IN ('pending','running')", ()
+        elif status in {"ready", "limited", "scheduled"}:
+            where, params = f"WHERE ({QUEUE_STATE_SQL})=?", (utcnow(), status)
         elif status == "all":
             where, params = "", ()
         else:
@@ -1592,6 +1602,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "contract_test_posts_v2": "Capture V2 Actor 契約測試",
             "capture_posts_v2": "Capture V2 貼文續抓",
             "capture_profile_photos": "帳號可見照片完整回溯",
+            "profile_browser_fallback": "個人資料瀏覽器補跑",
         }
         status_labels = {"pending": "等待中", "running": "執行中", "done": "完成", "failed": "失敗", "source_limited": "照片來源受限", "cancelled": "已取消", "superseded": "已退役", "deferred_budget": "額度延後", "budget_paused": "預算暫停", "needs_reconcile": "待人工對帳"}
         for row in rows:

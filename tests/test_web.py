@@ -116,7 +116,8 @@ def test_dashboard_health_and_diagnostics_routes(tmp_path: Path, monkeypatch):
         jobs = client.get("/jobs?status=active")
         assert jobs.status_code == 200
         assert "工作紀錄" in jobs.text
-        assert "進行中" in jobs.text
+        assert "佇列全部" in jobs.text
+        assert "受限等待" in jobs.text
         assert client.get("/healthz").json() == {"ok": True}
         assert client.get("/diagnostics").status_code == 200
         assert client.get("/diagnostics?profile_id=").status_code == 200

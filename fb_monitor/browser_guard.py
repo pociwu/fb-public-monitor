@@ -80,7 +80,8 @@ class BrowserGuard:
         evidence_root: Path,
         *,
         browser_identity: str = "default",
-        daily_batch_limit: int = 8,
+        daily_batch_limit: int = 32,
+        profile_daily_batch_limit: int = 8,
         global_spacing_minutes: tuple[float, float] = (2, 5),
         profile_spacing_minutes: tuple[float, float] = (30, 60),
         challenge_hours: int = 24,
@@ -95,6 +96,8 @@ class BrowserGuard:
             raise ValueError("browser_identity must not be empty")
         if daily_batch_limit < 1:
             raise ValueError("daily_batch_limit must be greater than zero")
+        if profile_daily_batch_limit < 1:
+            raise ValueError("profile_daily_batch_limit must be greater than zero")
         for label, bounds in {
             "global_spacing_minutes": global_spacing_minutes,
             "profile_spacing_minutes": profile_spacing_minutes,
@@ -107,6 +110,7 @@ class BrowserGuard:
         self.evidence_root = Path(evidence_root).resolve()
         self.browser_identity = browser_identity.strip()
         self.daily_batch_limit = daily_batch_limit
+        self.profile_daily_batch_limit = profile_daily_batch_limit
         self.global_spacing_minutes = global_spacing_minutes
         self.profile_spacing_minutes = profile_spacing_minutes
         self.challenge_duration = timedelta(hours=challenge_hours)
@@ -203,6 +207,12 @@ class BrowserGuard:
             )
             if daily_batches >= self.daily_batch_limit:
                 return BrowserDecision(False, "daily_limit", daily_retry, daily_batches)
+            profile_batches = (
+                int(profile_row.get("daily_batches") or 0)
+                if profile_row.get("daily_date") == local_date else 0
+            )
+            if profile_batches >= self.profile_daily_batch_limit:
+                return BrowserDecision(False, "profile_daily_limit", daily_retry, daily_batches)
 
             global_next = _parse_time(global_row.get("next_allowed_at"))
             if global_next and global_next > current:
@@ -231,13 +241,16 @@ class BrowserGuard:
             )
             connection.execute(
                 """UPDATE browser_limits
-                SET next_allowed_at=?,breaker_state=?,half_open_claimed_at=?,updated_at=?
+                SET next_allowed_at=?,breaker_state=?,half_open_claimed_at=?,updated_at=?,
+                    daily_date=?,daily_batches=?
                 WHERE browser_identity=? AND scope_type='profile' AND scope_id=?""",
                 (
                     profile_allowed_at.isoformat(),
                     "half_open" if profile_half_open else str(profile_row.get("breaker_state") or "closed"),
                     now_text if profile_half_open else profile_row.get("half_open_claimed_at"),
                     now_text,
+                    local_date,
+                    profile_batches + 1,
                     self.browser_identity,
                     profile_scope,
                 ),

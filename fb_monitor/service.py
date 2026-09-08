@@ -23,7 +23,7 @@ from .apify import (
     provider_charge_ceiling,
 )
 from .brightdata import BrightDataError, BrightDataGateway
-from .browser_guard import BrowserDecision, BrowserGuard
+from .browser_guard import TAIPEI, BrowserDecision, BrowserGuard
 from .capture_coordinator import (
     reconcile_post_media_checkpoint,
     resolve_epoch,
@@ -180,6 +180,7 @@ class MonitorService:
         evidence_root = settings.data_dir / "browser-evidence"
         guard_options = {
             "daily_batch_limit": settings.browser_daily_batches,
+            "profile_daily_batch_limit": settings.browser_profile_daily_batches,
             "global_spacing_minutes": cross_account_spacing,
             "profile_spacing_minutes": account_spacing,
             "challenge_hours": settings.browser_breaker_hours,
@@ -4861,20 +4862,32 @@ class MonitorService:
         priority queue continues instead of idling.
         """
 
+        # Keep urgent V2 work and its 4:1 fairness rule. Within ordinary
+        # refreshes, give each profile a turn before retrying an old failure;
+        # among equally served profiles prefer the oldest successful refresh.
+        local_date = self._capture_v2_datetime(now).astimezone(TAIPEI).date().isoformat()
+        refresh = "j.priority>=0 AND j.job_type IN ('visit','profile_browser_fallback','browser_visit')"
+        query = f"""SELECT j.* FROM jobs j LEFT JOIN profiles p ON p.id=j.profile_id
+            LEFT JOIN browser_limits b ON b.browser_identity='global'
+                AND b.scope_type='profile' AND b.scope_id=CAST(j.profile_id AS TEXT)
+            WHERE j.status='pending' AND j.available_at<=? {{ordinary}}
+            ORDER BY CASE WHEN {refresh} THEN 5 ELSE j.priority END,
+                CASE WHEN {refresh} AND b.daily_date=? THEN b.daily_batches ELSE 0 END,
+                CASE WHEN {refresh} THEN COALESCE(julianday(p.last_success_at),0) ELSE 0 END,
+                j.id LIMIT 1"""
         recent = self.db.rows(
             "SELECT priority FROM jobs WHERE started_at IS NOT NULL ORDER BY started_at DESC,id DESC LIMIT 4"
         )
         if len(recent) == 4 and all(int(row["priority"]) < 0 for row in recent):
             ordinary = self.db.row(
-                """SELECT * FROM jobs WHERE status='pending' AND available_at<=?
-                AND priority>=0 ORDER BY priority,id LIMIT 1""",
-                (now,),
+                query.format(ordinary="AND j.priority>=0"),
+                (now, local_date),
             )
             if ordinary:
                 return ordinary
         return self.db.row(
-            "SELECT * FROM jobs WHERE status='pending' AND available_at<=? ORDER BY priority,id LIMIT 1",
-            (now,),
+            query.format(ordinary=""),
+            (now, local_date),
         )
 
     async def _run_next_job(self) -> None:
@@ -6245,6 +6258,7 @@ class MonitorService:
             except BrowserGuardDeferred as exc:
                 long_deferral = exc.decision.reason in {
                     "daily_limit",
+                    "profile_daily_limit",
                     "breaker_open",
                 }
                 actor_on_long_deferral = bool(
@@ -7691,7 +7705,11 @@ class MonitorService:
             return
         now = utcnow()
         self.db.execute("UPDATE profiles SET last_attempt_at=? WHERE id=?", (now, profile_id))
-        if self._serpapi_profile_due(profile):
+        pending_refresh = self.db.row(
+            """SELECT id FROM jobs WHERE profile_id=? AND job_type='profile_browser_fallback'
+            AND status IN ('pending','running') LIMIT 1""", (profile_id,),
+        )
+        if self._serpapi_profile_due(profile) and not pending_refresh:
             try:
                 await self._refresh_serpapi_profile(profile)
                 profile = self.db.row("SELECT * FROM profiles WHERE id=?", (profile_id,)) or profile
@@ -8309,11 +8327,12 @@ class MonitorService:
             )
             if continuation:
                 raise
-            self.db.queue_unique_job(
+            fallback_job_id, _ = self.db.queue_unique_job(
                 profile_id=int(profile["id"]), job_type="profile_browser_fallback", priority=5,
                 dedupe_key=f"profile-browser-fallback:{profile['id']}", available_at=retry_at.isoformat(),
                 payload={"primary_error": primary_error[:250], "brightdata_error": brightdata_error[:250], "requested_at": utcnow()},
             )
+            self.db.execute("UPDATE jobs SET error=? WHERE id=? AND status='pending'", (str(exc), fallback_job_id))
             return False
         try:
             attempted_at = utcnow()

@@ -55,7 +55,8 @@ browser_guard:
   cross_account_max_minutes: 5
   album_operations: 20
   batch_seconds: 180
-  daily_batches: 8
+  global_daily_batches: 32
+  profile_daily_batches: 8
   breaker_hours: 24
   breaker_repeat_hours: 72
 

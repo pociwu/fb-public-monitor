@@ -13,7 +13,7 @@
 - 個人檔案每 48 小時最多更新一次姓名、ID、網址、公開狀態、簡介、地點、學歷、工作、追蹤者、大頭照、封面與最多 6 張來源可取得照片；查詢順序為 SerpApi → Bright Data → 已登入 Chromium。
 - 已登入 Chromium 的「可讀取」只代表 `authenticated_visible`，不能據此判定匿名公開。一般 SerpApi／Apify 訊號先標為疑似公開，再由無登入瀏覽器或通過公開判定契約的匿名來源確認。
 - Chromium 每次直接擷取會先等待 3 秒，再依姓名區塊與圖片載入狀態最多等待 5 秒；並依帳號覆寫保存最新畫面，首頁個人卡片與個人詳細頁的「瀏覽器擷取畫面」可直接開啟查看。
-- 所有可能啟動 Chromium 的手動拜訪、匿名公開驗證、金絲雀與個人資料備援都經過同一個 OCI/IP 共用的 `BrowserGuard`，共同實施全域／單帳號隨機冷卻、每日批次上限與 challenge 熔斷。匿名或登入瀏覽器任一方遇到真正的 checkpoint、challenge 或 429，都會暫停全部 Chromium 工作；單純匿名登入牆只記為未知，不會誤開熔斷器。被延後的手動／驗證工作保留同一筆 job 稍後再跑，自動備援則安全略過並寫入非通知事件。
+- 所有可能啟動 Chromium 的手動拜訪、匿名公開驗證、金絲雀與個人資料備援都經過同一個 OCI/IP 共用的 `BrowserGuard`，共同實施全域／單帳號隨機冷卻、每日批次上限與 challenge 熔斷。預設全域每日 32 批、單帳號每日 8 批，兩層額度在啟動前原子保留並跨重啟保存。匿名或登入瀏覽器任一方遇到真正的 checkpoint、challenge 或 429，都會暫停全部 Chromium 工作；單純匿名登入牆只記為未知，不會誤開熔斷器。被延後的手動／驗證與個資備援均保留工作稍後再跑，尚有個資備援等待時不重查 SerpApi／Bright Data。
 - Facebook 出現 checkpoint／challenge／HTTP 429 時會啟動 24 小時全域熔斷，72 小時內重複發生則延長為 72 小時；已登入瀏覽器單純登入失效只要求重新登入，不會誤開平台風控熔斷。現場畫面以 lossless WebP 保存 180 天，並以 500 MiB 總上限每日自動清理。
 - Chromium 每次最多處理 2 篇有固定連結的貼文；單一相簿批次預設最多 20 次操作或 3 分鐘（可用 `browser_guard.album_operations` / `batch_seconds` 向下調整），每次切換隨機等待 3–7 秒。照片集合採累積式 checkpoint；暫時找不到相片連結、圖片沒有切換或游標失效只會標示 stalled／source-limited，不會誤判完成。
 - 每張帳號卡片可獨立排入「擷取全部照片」，並選擇「自動」、「僅登入帳號可見」或「僅 Apify 公開照片」。自動模式優先使用已登入 Chromium，同時讀取操作帳號可見的本人上傳 `/photos_by` 與被標註 `/photos_of` 兩個照片頁；遇到 `daily_limit` 或 `breaker_open` 這類長延遲時可先用受預算控制的 Apify 照片 Actor 補抓，並在 BrowserGuard 原定時間排回「僅登入帳號」續抓；短時的 profile/global cooldown 不會為此啟動付費 Actor。每批最多 20 張並為兩個頁面各自保存續抓 checkpoint；照片以 Facebook media ID 建立 `photo` entity，再沿用 SHA-256／感知雜湊去重。照片回溯使用獨立的分代狀態簿，不會佔用或污染 Capture V2 的付費 Actor epoch。只有兩個照片頁都到達可驗證的終點、所有發現的照片都已處理，且列出的媒體實檔均已下載，才會將該分代標成完成。Apify 結果只完成 Actor 可見範圍，不會被當成登入帳號可見清冊的完整證據。暫時下載失敗會在補抓期內只刷新失敗照片的 permalink，不重掃整個網格；登入失效、DOM 停滯、Actor 受限或無法解析的永久連結則如實標成 `source_limited`。首次完整回溯只發一則摘要，後續完整核對才逐項通知真正新增／變更且未重複的照片。
@@ -175,6 +175,22 @@ docker compose exec monitor fb-monitor reconcile-contract-run 7 --confirm-not-la
 `fb-monitor health` 不啟動 Actor、不消耗查詢額度，也不修改資料庫。它包含每個帳號最近巡檢／SerpApi 結果、來源存取證據、瀏覽器安全閘門及來源用量快照，方便區分登入失效、來源無結果、額度／每日限制與工作卡住。來源快照可能不是即時用量，單靠 Apify 尚有餘額不能判定其他來源也可使用。
 
 巡檢備援被瀏覽器閘門延後時，會建立去重且持久化的 `profile_browser_fallback` 工作，於允許時間補跑；此工作不重查 SerpApi／Bright Data。登入失效仍需人工重新登入，不會繞過驗證或安全限制。服務中斷留下、且租約已過期的巡檢會保留為失敗紀錄並恢復後續排程，而非直接重播可能付費的舊請求。
+
+### 從共用每日 8 批升級為全域 32／單帳號 8 批
+
+在 OCI 的 `config.yaml` **既有 `browser_guard` 區塊**加入／更新以下兩個鍵，保留其他間隔和風控設定（不要新增第二個同名區塊）：
+
+```yaml
+browser_guard:
+  global_daily_batches: 32
+  profile_daily_batches: 8
+```
+
+舊 `daily_batches` 仍相容且代表全域上限；新 `global_daily_batches` 優先。若只有舊的 `daily_batches: 8`，程式不會偷偷覆寫成 32，必須明確設定新鍵。未指定兩者時預設全域 32。更新程式與設定後用 `bash scripts/deploy.sh` 部署，接著以 `docker compose exec -T monitor fb-monitor health` 檢查 `settings.browser_global_daily_batches` 與 `settings.browser_profile_daily_batches`。
+
+全域與單帳號每日計数以台北午夜換日，不因重啟清零。升級前沒有記錄的單帳號歷史批次不反推或捏造；原有全域計數照常保留。已因舊上限延至次日的工作保留預定時間，不會因提高設定立刻集中重跑。
+
+一般個資巡檢及備援共用公平排序：今天已使用的瀏覽器批次較少者先，同批次數再按最近成功時間由舊到新；特殊高優先工作與每四個高優先批次放行一次一般工作的規則維持。首頁工作佇列分成執行中、可執行（已到期）、受限等待及尚未到期，各自可點入篩選。這不是來源成功保證，Apify 回溯仍需通過既有契約、預算與存取驗證。
 
 ### OCI 維運選單
 
