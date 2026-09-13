@@ -19,6 +19,7 @@
 - 每張帳號卡片可獨立排入「擷取全部照片」，並選擇「自動」、「僅登入帳號可見」或「僅 Apify 公開照片」。自動模式優先使用已登入 Chromium，同時讀取操作帳號可見的本人上傳 `/photos_by` 與被標註 `/photos_of` 兩個照片頁；遇到 `daily_limit` 或 `breaker_open` 這類長延遲時可先用受預算控制的 Apify 照片 Actor 補抓，並在 BrowserGuard 原定時間排回「僅登入帳號」續抓；短時的 profile/global cooldown 不會為此啟動付費 Actor。每批最多 20 張並為兩個頁面各自保存續抓 checkpoint；照片以 Facebook media ID 建立 `photo` entity，再沿用 SHA-256／感知雜湊去重。照片回溯使用獨立的分代狀態簿，不會佔用或污染 Capture V2 的付費 Actor epoch。只有兩個照片頁都到達可驗證的終點、所有發現的照片都已處理，且列出的媒體實檔均已下載，才會將該分代標成完成。Apify 結果只完成 Actor 可見範圍，不會被當成登入帳號可見清冊的完整證據。暫時下載失敗會在補抓期內只刷新失敗照片的 permalink，不重掃整個網格；登入失效、DOM 停滯、Actor 受限或無法解析的永久連結則如實標成 `source_limited`。首次完整回溯只發一則摘要，後續完整核對才逐項通知真正新增／變更且未重複的照片。
 - 內容消失需連續兩次成功核對才確認；Actor 失敗不會改變 Facebook 狀態。
 - SQLite 保存實體、版本、事件、排程、通知 outbox、SerpApi 額度、本地費用估算與 Apify 官方用量快照。JSON、Markdown 和媒體保存在 `/data`。
+- 同一實體再次出現已保存的內容（例如 A → B → A）會重用原版本、更新最近觀察時間，不重建 JSON／Markdown 或重送通知；缺少的媒體仍可安靜補抓。實體查找與版本寫入在同一個 SQLite 寫入交易內完成，避免並行抓取造成唯一鍵衝突；既有資料與唯一鍵限制皆保留，不需清空資料庫。
 - 每日在健康摘要時段統計本專案的圖片、影片／附件、SQLite、JSON／Markdown、縮圖快取與 Chromium 用量；首頁可進入最近 30 天詳細頁，Telegram 每日傳送相較前一日的增加量。專案總用量不包含其他 Docker、Docker Images、Build Cache 或 Ubuntu 系統檔案。
 - 媒體以 Facebook media ID／canonical URL／SHA-256 去重；相同影像不同解析度只將最高解析度保留為有效檔案。磁碟少於 30 GB 時暫停媒體下載；貼文清冊游標仍可保存，失敗項目保留補抓狀態。
 - Chromium 個人檔案中與大頭照或封面照同一 CDN 資產的模糊預覽不會下載；升級重啟時也會移除既有重複關聯、原檔與縮圖快取。

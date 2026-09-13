@@ -217,25 +217,20 @@ class Ingester:
         media_refs = extract_media(item, kind)
         normalized = monitored_projection(item, kind, media_refs)
         digest = content_hash(normalized)
-        if kind == "profile":
-            display_name = profile_display_name(item)
-            if display_name:
-                self.db.execute("UPDATE profiles SET display_name=? WHERE id=?", (display_name, profile_id))
-        existing = self.db.row("SELECT * FROM entities WHERE profile_id=? AND kind=? AND external_id=?", (profile_id, kind, ext_id))
-        if not existing and dedupe_key:
-            existing = self.db.row("SELECT * FROM entities WHERE profile_id=? AND kind='comment' AND dedupe_key=?", (profile_id, dedupe_key))
-        if existing and existing["current_hash"] == digest:
-            await self._refresh_unchanged_media(existing, media_refs)
-            self.db.execute("UPDATE entities SET notification_hash=COALESCE(notification_hash,?),last_seen_at=?,present=1,missing_successes=0 WHERE id=?", (digest, now, existing["id"]))
-            return int(existing["id"]), ext_id, False
-        notify_change = notify and not (existing and existing.get("notification_hash") is None)
-        profile_dir = self.root / str(profile_id) / f"{kind}s" / safe_part(ext_id)
-        profile_dir.mkdir(parents=True, exist_ok=True)
-        raw_path = profile_dir / f"{now.replace(':', '-')}-{digest[:12]}.json"
-        md_path = profile_dir / f"{now.replace(':', '-')}-{digest[:12]}.md"
-        raw_path.write_text(json.dumps(item, ensure_ascii=False, indent=2), encoding="utf-8")
-        md_path.write_text(markdown_for(item, kind), encoding="utf-8")
         with self.db.connect() as conn:
+            # Serialize the lookup with the insert: a pre-transaction lookup
+            # lets concurrent captures both decide to create the same version.
+            # No media downloads or other awaits belong in this transaction.
+            conn.execute("BEGIN IMMEDIATE")
+            if kind == "profile":
+                display_name = profile_display_name(item)
+                if display_name:
+                    conn.execute("UPDATE profiles SET display_name=? WHERE id=?", (display_name, profile_id))
+            row = conn.execute("SELECT * FROM entities WHERE profile_id=? AND kind=? AND external_id=?", (profile_id, kind, ext_id)).fetchone()
+            if row is None and dedupe_key:
+                row = conn.execute("SELECT * FROM entities WHERE profile_id=? AND kind='comment' AND dedupe_key=?", (profile_id, dedupe_key)).fetchone()
+            existing = dict(row) if row is not None else None
+            notify_change = notify and not (existing and existing.get("notification_hash") is None)
             if not existing:
                 cur = conn.execute(
                     """INSERT INTO entities(profile_id,kind,external_id,parent_external_id,dedupe_key,source_url,published_at,current_hash,notification_hash,present,first_seen_at,last_seen_at)
@@ -247,15 +242,33 @@ class Ingester:
             else:
                 entity_id = int(existing["id"])
                 change_type = "restored" if not existing["present"] else "updated"
-            cur = conn.execute(
-                "INSERT INTO versions(entity_id,content_hash,normalized_json,raw_path,markdown_path,seen_at,change_type) VALUES(?,?,?,?,?,?,?)",
-                (entity_id, digest, json.dumps(normalized, ensure_ascii=False), str(raw_path), str(md_path), now, change_type),
-            )
-            version_id = int(cur.lastrowid)
+            known_version = conn.execute(
+                "SELECT id FROM versions WHERE entity_id=? AND content_hash=?",
+                (entity_id, digest),
+            ).fetchone()
+            if known_version is not None:
+                # A -> B -> A is an observation of known content, not a new
+                # version. Preserve its original files and notification history.
+                version_id = int(known_version["id"])
+            else:
+                profile_dir = self.root / str(profile_id) / f"{kind}s" / safe_part(ext_id)
+                profile_dir.mkdir(parents=True, exist_ok=True)
+                raw_path = profile_dir / f"{now.replace(':', '-')}-{digest[:12]}.json"
+                md_path = profile_dir / f"{now.replace(':', '-')}-{digest[:12]}.md"
+                raw_path.write_text(json.dumps(item, ensure_ascii=False, indent=2), encoding="utf-8")
+                md_path.write_text(markdown_for(item, kind), encoding="utf-8")
+                cur = conn.execute(
+                    "INSERT INTO versions(entity_id,content_hash,normalized_json,raw_path,markdown_path,seen_at,change_type) VALUES(?,?,?,?,?,?,?)",
+                    (entity_id, digest, json.dumps(normalized, ensure_ascii=False), str(raw_path), str(md_path), now, change_type),
+                )
+                version_id = int(cur.lastrowid)
             conn.execute(
                 "UPDATE entities SET source_url=?,published_at=?,dedupe_key=COALESCE(dedupe_key,?),current_hash=?,notification_hash=?,current_version_id=?,present=1,missing_successes=0,last_seen_at=? WHERE id=?",
                 (source_url, published, dedupe_key, digest, digest, version_id, now, entity_id),
             )
+        if known_version is not None:
+            await self._refresh_unchanged_media({"id": entity_id, "current_version_id": version_id}, media_refs)
+            return entity_id, ext_id, False
         payload = _event_payload(self.db, profile_id, kind, change_type, item, source_url, ext_id, media_refs)
         event_id = self.db.add_event(
             f"{kind}:{profile_id}:{ext_id}:{digest}", f"{kind}_{change_type}", payload,
