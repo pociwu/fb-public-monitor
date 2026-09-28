@@ -17,6 +17,63 @@ def make_ingester(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_profile_rotating_source_id_does_not_create_or_notify(tmp_path):
+    db, ingester = make_ingester(tmp_path)
+    db.execute("UPDATE profiles SET fb_id='100010197287448' WHERE id=1")
+    first, identity, _ = await ingester.ingest(1, "profile", {"id": "pfbid-old", "name": "person"})
+    before = db.rows("SELECT * FROM events")
+    second, identity, changed = await ingester.ingest(1, "profile", {"id": "pfbid-new", "name": "person"})
+    assert second == first
+    assert identity == "100010197287448"
+    assert changed is False
+    assert db.rows("SELECT * FROM events") == before
+    assert db.row("SELECT COUNT(*) n FROM entities")["n"] == 1
+    _, _, changed = await ingester.ingest(1, "profile", {"id": "pfbid-third", "name": "new name"})
+    assert changed is True
+    assert db.row("SELECT event_type FROM events ORDER BY id DESC LIMIT 1")["event_type"] == "profile_updated"
+
+
+@pytest.mark.asyncio
+async def test_profile_adopts_existing_legacy_identity_silently(tmp_path):
+    db, ingester = make_ingester(tmp_path)
+    entity_id, _, _ = await ingester.ingest(1, "profile", {"id": "legacy", "name": "person"})
+    db.execute("UPDATE entities SET external_id='pfbid-old' WHERE id=?", (entity_id,))
+    db.execute("UPDATE profiles SET fb_id='100010197287448' WHERE id=1")
+    before = db.rows("SELECT * FROM events")
+    result = await ingester.ingest(1, "profile", {"id": "pfbid-new", "name": "person"})
+    assert result == (entity_id, "100010197287448", False)
+    assert db.rows("SELECT * FROM events") == before
+
+
+@pytest.mark.asyncio
+async def test_profile_without_facebook_id_is_scoped_to_account(tmp_path):
+    db, ingester = make_ingester(tmp_path)
+    db.execute("INSERT INTO profiles(name,url,created_at,updated_at) VALUES('other','https://facebook.com/other','x','x')")
+    first = await ingester.ingest(1, "profile", {"id": "rotating-one", "name": "same"})
+    repeat = await ingester.ingest(1, "profile", {"id": "rotating-two", "name": "same"})
+    other = await ingester.ingest(2, "profile", {"id": "rotating-one", "name": "same"})
+    assert first[0] == repeat[0]
+    assert repeat[2] is False
+    assert other[0] != first[0]
+
+
+@pytest.mark.asyncio
+async def test_multiple_legacy_profiles_adopts_matching_record_without_deletion(tmp_path):
+    db, ingester = make_ingester(tmp_path)
+    entity_id, _, _ = await ingester.ingest(1, "profile", {"id": "old", "name": "person"})
+    db.execute("UPDATE entities SET external_id='legacy-one' WHERE id=?", (entity_id,))
+    db.execute("""INSERT INTO entities(profile_id,kind,external_id,current_hash,present,first_seen_at,last_seen_at)
+        VALUES(1,'profile','legacy-two','different',1,'x','z')""")
+    before = db.rows("SELECT * FROM events")
+    result = await ingester.ingest(1, "profile", {"id": "third-token", "name": "person"})
+    assert result[0] == entity_id
+    assert result[2] is False
+    assert db.row("SELECT COUNT(*) n FROM entities")["n"] == 2
+    assert db.rows("SELECT * FROM events") == before
+    assert db.rows("PRAGMA foreign_key_check") == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["profile", "post", "comment", "photo"])
 async def test_historical_content_reuses_version_without_repeat_notification(tmp_path, kind):
     db, ingester = make_ingester(tmp_path)

@@ -4,6 +4,8 @@
 
 ## 已實作行為
 
+- 個人檔案以監控帳號的固定 Facebook ID 辨識（未知時使用本機帳號 ID），不使用來源回傳的浮動 `pfbid`。升級後接續既有相同內容或最近觀察的個人檔案，不因來源 ID 改變而再次通知「新增」；既有歷史紀錄與媒體保留。
+
 - 每個帳號在上次完成後隨機 6–8 小時再次拜訪；全域工作間隔隨機 20–30 分鐘。
 - 舊版 `unseenuser/fb-profile` 不接受可靠回溯游標，部署預設停止其付費回溯與七日重抓，避免反覆購買同一批貼文。
 - Capture V2 先由操作人明確核准一輪全域共用最多 `$0.20` 的 posts-cursor grant，再對具備完整 V2 adapter 的 Actor 執行游標／重播／已知 ID 邊界契約測試；不會對每個帳號重複核准 `$0.20`。目前只有 `spbotdel/facebook-profile-posts-all-photos-scraper` 納入貼文 V2 候選；`unseenuser/fb-posts` 沒有可跨 run 的 cursor/known-ID input，不會被誤排成無法通過的付費測試。只有相同 fingerprint 的契約通過後才允許正式付費回溯。此契約只證明貼文游標，不證明媒體或留言完整。正式流程預設每批 20 篇（可調 1–50）；每篇貼文會建立媒體 checkpoint 並保存 Actor 同批附件，但在獨立媒體契約通過前一律如實標示 `source_limited`，不會把附件數量誤當相簿完整。

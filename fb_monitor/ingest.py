@@ -223,10 +223,24 @@ class Ingester:
             # No media downloads or other awaits belong in this transaction.
             conn.execute("BEGIN IMMEDIATE")
             if kind == "profile":
+                # Provider ids can be rotating pfbid tokens. Profile identity
+                # belongs to the configured account, never to a scrape result.
+                profile = conn.execute("SELECT fb_id FROM profiles WHERE id=?", (profile_id,)).fetchone()
+                ext_id = str(profile["fb_id"] or f"profile:{profile_id}") if profile else f"profile:{profile_id}"
                 display_name = profile_display_name(item)
                 if display_name:
                     conn.execute("UPDATE profiles SET display_name=? WHERE id=?", (display_name, profile_id))
             row = conn.execute("SELECT * FROM entities WHERE profile_id=? AND kind=? AND external_id=?", (profile_id, kind, ext_id)).fetchone()
+            if row is None and kind == "profile":
+                # Adopt a legacy record without creating an upgrade notification.
+                # Prefer matching content, otherwise the latest observation.
+                row = conn.execute(
+                    """SELECT * FROM entities WHERE profile_id=? AND kind='profile'
+                    ORDER BY (current_hash=?) DESC,last_seen_at DESC,id DESC LIMIT 1""",
+                    (profile_id, digest),
+                ).fetchone()
+                if row is not None:
+                    conn.execute("UPDATE entities SET external_id=? WHERE id=?", (ext_id, row["id"]))
             if row is None and dedupe_key:
                 row = conn.execute("SELECT * FROM entities WHERE profile_id=? AND kind='comment' AND dedupe_key=?", (profile_id, dedupe_key)).fetchone()
             existing = dict(row) if row is not None else None
