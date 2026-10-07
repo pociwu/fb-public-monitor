@@ -263,27 +263,31 @@ class MonitorService:
         return leased_at > datetime.now(UTC) - timedelta(minutes=WORKER_LEASE_MINUTES)
 
     async def start(self) -> None:
-        self._cleanup_browser_evidence()
-        self._cleanup_capture_raw()
-        self._pause_unsafe_v1_jobs()
-        self._recover_stale_capture_v2_jobs()
-        self._retire_legacy_capture_v2_comment_jobs()
-        self._seed_capture_v2()
-        self._seed_browser_name_repair()
-        self._seed_historical_name_repair()
-        self._purge_duplicate_profile_previews()
-        self._seed_notification_hygiene()
-        self._seed_profile_pic_migration()
-        self._seed_upgrade_repair()
-        self._seed_latest_only_backfill_repair()
-        self._seed_initial_jobs()
-        await asyncio.gather(
-            self._scheduler_loop(), self._outbox_loop(), self._health_loop(),
-            self._media_retry_loop(), self._daily_media_dedupe_loop(),
-            self._storage_snapshot_loop(),
-            self._browser_evidence_cleanup_loop(),
-            self._capture_raw_cleanup_loop(),
-        )
+        from .runtime_diagnostics import report_task_exit
+
+        self.worker_tasks = []
+        for step in (
+            self._cleanup_browser_evidence, self._cleanup_capture_raw,
+            self._pause_unsafe_v1_jobs, self._recover_stale_capture_v2_jobs,
+            self._retire_legacy_capture_v2_comment_jobs, self._seed_capture_v2,
+            self._seed_browser_name_repair, self._seed_historical_name_repair,
+            self._purge_duplicate_profile_previews, self._seed_notification_hygiene,
+            self._seed_profile_pic_migration, self._seed_upgrade_repair,
+            self._seed_latest_only_backfill_repair, self._seed_initial_jobs,
+        ):
+            self.startup_phase = step.__name__
+            step()
+        self.startup_phase = "workers_started"
+        for loop in (
+            self._scheduler_loop, self._outbox_loop, self._health_loop,
+            self._media_retry_loop, self._daily_media_dedupe_loop,
+            self._storage_snapshot_loop, self._browser_evidence_cleanup_loop,
+            self._capture_raw_cleanup_loop,
+        ):
+            task = asyncio.create_task(loop(), name=loop.__name__)
+            task.add_done_callback(report_task_exit)
+            self.worker_tasks.append(task)
+        await asyncio.gather(*self.worker_tasks)
 
     @staticmethod
     def _browser_retry_text(decision: BrowserDecision) -> str:

@@ -27,6 +27,7 @@ from .normalize import normalize_url
 from .service import MonitorService
 from .serpapi import profile_id_from_url
 from .storage import decorate_snapshot
+from .runtime_diagnostics import report_task_exit, task_snapshot
 from .timeutil import display_time, parse_time, timezone_module_fallback
 
 PACKAGE = Path(__file__).parent
@@ -599,6 +600,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         task = asyncio.create_task(service.start(), name="monitor-service") if cfg.scheduler_enabled else None
+        app.state.monitor_task = task
+        if task:
+            task.add_done_callback(report_task_exit)
         yield
         service.stop()
         if task:
@@ -1661,5 +1665,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/healthz")
     def healthz():
         return {"ok": True}
+
+    @app.get("/diagnostics/runtime", include_in_schema=False)
+    async def runtime_diagnostics(request: Request):
+        # Inspect through docker exec/SSH, not the unauthenticated LAN UI.
+        if request.client is None or request.client.host not in {"127.0.0.1", "::1"}:
+            raise HTTPException(status_code=403, detail="Local access only")
+        return {
+            "scheduler_enabled": cfg.scheduler_enabled,
+            "startup_phase": getattr(service, "startup_phase", "not_started"),
+            "stop_requested": service.stop_event.is_set(),
+            "service": task_snapshot(getattr(app.state, "monitor_task", None)),
+            "workers": [task_snapshot(task) for task in getattr(service, "worker_tasks", [])],
+        }
 
     return app
