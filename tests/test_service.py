@@ -1418,7 +1418,8 @@ def test_historical_name_repair_restores_latest_known_name(tmp_path: Path, monke
     assert service.db.row("SELECT display_name FROM profiles WHERE id=1")["display_name"] == "吳佳欣"
 
 
-def test_duplicate_profile_preview_cleanup_deletes_database_file_and_thumbnail(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize("mode", ["normal", "abort", "shared", "pending"])
+def test_duplicate_profile_preview_cleanup_deletes_database_file_and_thumbnail(tmp_path: Path, monkeypatch, mode):
     config = tmp_path / "config.yaml"
     config.write_text(
         "profiles:\n  - name: watched\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n",
@@ -1459,14 +1460,64 @@ def test_duplicate_profile_preview_cleanup_deletes_database_file_and_thumbnail(t
     thumbnail.parent.mkdir(parents=True, exist_ok=True)
     thumbnail.write_bytes(b"preview")
 
+    alias_id = service.db.execute(
+        """INSERT INTO media_aliases(profile_id,entity_id,media_id,canonical_media_id,
+        provider,alias_type,alias_value,first_seen_at,last_seen_at)
+        VALUES(1,?,?,'cover','browser','representation_url','blurred','x','x')""",
+        (entity_id, stored[1][0]),
+    )
+    if mode == "shared":
+        other_version = service.db.execute(
+            "INSERT INTO versions(entity_id,content_hash,normalized_json,raw_path,seen_at,change_type) VALUES(?,'other','{}','other.json','x','updated')",
+            (entity_id,),
+        )
+        service.db.execute("INSERT INTO entity_media(entity_id,version_id,media_id,role) VALUES(?,?,?,'attachment')", (entity_id, other_version, stored[1][0]))
+    elif mode == "pending":
+        service.db.execute("INSERT INTO outbox(kind,payload_json,next_attempt_at,created_at,media_sha256) VALUES('media','{}','x','x',?)", (stored[1][2],))
+    if mode == "abort":
+        service.db.execute("CREATE TRIGGER fail_media_delete BEFORE DELETE ON media BEGIN SELECT RAISE(ABORT,'injected failure'); END")
+        with pytest.raises(Exception, match="injected failure"):
+            service._purge_duplicate_profile_previews()
+        assert service.db.row("SELECT media_id FROM media_aliases WHERE id=?", (alias_id,))["media_id"] == stored[1][0]
+        assert service.db.row("SELECT 1 FROM entity_media WHERE media_id=?", (stored[1][0],))
+        assert stored[1][1].exists() and thumbnail.exists()
+        return
+
     counts = service._purge_duplicate_profile_previews()
 
+    if mode in {"shared", "pending"}:
+        assert counts == {"links_removed": 1, "files_removed": 0}
+        assert stored[1][1].exists() and thumbnail.exists()
+        assert service.db.row("SELECT media_id FROM media_aliases WHERE id=?", (alias_id,))["media_id"] == stored[1][0]
+        assert service.db.rows("PRAGMA foreign_key_check") == []
+        return
+
     assert counts == {"links_removed": 1, "files_removed": 1}
+    assert service.db.row("SELECT media_id FROM media_aliases WHERE id=?", (alias_id,))["media_id"] is None
+    assert service.db.rows("PRAGMA foreign_key_check") == []
     assert service.db.row("SELECT id FROM media WHERE id=?", (stored[1][0],)) is None
     assert not stored[1][1].exists()
     assert not thumbnail.exists()
     assert service.db.row("SELECT id FROM media WHERE id=?", (stored[0][0],)) is not None
     assert service.db.row("SELECT id FROM media WHERE id=?", (stored[2][0],)) is not None
+
+
+def test_orphan_cleanup_delete_failure_preserves_file(tmp_path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text("profiles: []\nstorage:\n  data_dir: data\n", encoding="utf-8")
+    service = MonitorService(load_settings(config))
+    path = service.media.root / "orphan.jpg"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"keep-on-rollback")
+    media_id = service.db.execute(
+        "INSERT INTO media(sha256,source_url,path,status,first_seen_at) VALUES('orphan','url',?,'pending','x')",
+        (str(path),),
+    )
+    service.db.execute("CREATE TRIGGER fail_delete BEFORE DELETE ON media BEGIN SELECT RAISE(ABORT,'injected failure'); END")
+    counts = service._dedupe_existing_media()
+    assert counts["errors"] == 1
+    assert path.exists()
+    assert service.db.row("SELECT id FROM media WHERE id=?", (media_id,))
 
 
 @pytest.mark.asyncio

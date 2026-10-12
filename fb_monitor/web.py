@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, quote, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -27,7 +27,7 @@ from .normalize import normalize_url
 from .service import MonitorService
 from .serpapi import profile_id_from_url
 from .storage import decorate_snapshot
-from .runtime_diagnostics import report_task_exit, task_snapshot
+from .runtime_diagnostics import background_health, report_task_exit, task_snapshot
 from .timeutil import display_time, parse_time, timezone_module_fallback
 
 PACKAGE = Path(__file__).parent
@@ -1663,7 +1663,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return templates.TemplateResponse(request, "diagnostics.html", {"runs": rows, "profiles": profiles, "profile_usage": profile_usage, "cycle_start_display": display_time(cycle_start, cfg.timezone), "profile_id": selected_id, "page": page})
 
     @app.get("/healthz")
-    def healthz():
+    async def healthz():
+        if cfg.scheduler_enabled:
+            reason = background_health(service, getattr(app.state, "monitor_task", None))
+            if reason:
+                return JSONResponse({"ok": False, "reason": reason}, status_code=503)
         return {"ok": True}
 
     @app.get("/diagnostics/runtime", include_in_schema=False)

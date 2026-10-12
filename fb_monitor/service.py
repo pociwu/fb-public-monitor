@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import random
+import sqlite3
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -263,7 +264,7 @@ class MonitorService:
         return leased_at > datetime.now(UTC) - timedelta(minutes=WORKER_LEASE_MINUTES)
 
     async def start(self) -> None:
-        from .runtime_diagnostics import report_task_exit
+        from .runtime_diagnostics import WORKER_NAMES, report_task_exit
 
         self.worker_tasks = []
         for step in (
@@ -278,13 +279,8 @@ class MonitorService:
             self.startup_phase = step.__name__
             step()
         self.startup_phase = "workers_started"
-        for loop in (
-            self._scheduler_loop, self._outbox_loop, self._health_loop,
-            self._media_retry_loop, self._daily_media_dedupe_loop,
-            self._storage_snapshot_loop, self._browser_evidence_cleanup_loop,
-            self._capture_raw_cleanup_loop,
-        ):
-            task = asyncio.create_task(loop(), name=loop.__name__)
+        for name in WORKER_NAMES:
+            task = asyncio.create_task(getattr(self, name)(), name=name)
             task.add_done_callback(report_task_exit)
             self.worker_tasks.append(task)
         await asyncio.gather(*self.worker_tasks)
@@ -4623,42 +4619,50 @@ class MonitorService:
 
     def _purge_duplicate_profile_previews(self) -> dict[str, int]:
         """Remove downloaded image previews that duplicate an avatar or cover asset."""
-        rows = self.db.rows(
-            """SELECT e.profile_id,em.entity_id,em.version_id,em.media_id,em.role,
-            m.source_url,m.path,m.sha256
-            FROM entity_media em
-            JOIN entities e ON e.id=em.entity_id
-            JOIN media m ON m.id=em.media_id
-            WHERE e.kind='profile' AND em.role IN ('profile_picture','cover_photo','image')"""
-        )
-        protected_assets: dict[int, set[str]] = {}
-        for row in rows:
-            if row["role"] in {"profile_picture", "cover_photo"}:
-                protected_assets.setdefault(int(row["profile_id"]), set()).add(
-                    normalize_url(str(row["source_url"]))
-                )
-
-        duplicate_links = [
-            row for row in rows
-            if row["role"] == "image"
-            and normalize_url(str(row["source_url"])) in protected_assets.get(int(row["profile_id"]), set())
-        ]
         counts = {"links_removed": 0, "files_removed": 0}
-        affected_media: dict[int, dict[str, Any]] = {}
-        for row in duplicate_links:
-            self.db.execute(
-                "DELETE FROM entity_media WHERE entity_id=? AND version_id=? AND media_id=? AND role='image'",
-                (row["entity_id"], row["version_id"], row["media_id"]),
-            )
-            counts["links_removed"] += 1
-            affected_media[int(row["media_id"])] = row
+        removed_media = []
+        with self.db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = [dict(row) for row in conn.execute(
+                """SELECT e.profile_id,em.entity_id,em.version_id,em.media_id,em.role,
+                m.source_url,m.path,m.sha256
+                FROM entity_media em
+                JOIN entities e ON e.id=em.entity_id
+                JOIN media m ON m.id=em.media_id
+                WHERE e.kind='profile' AND em.role IN ('profile_picture','cover_photo','image')"""
+            )]
+            protected_assets: dict[int, set[str]] = {}
+            for row in rows:
+                if row["role"] in {"profile_picture", "cover_photo"}:
+                    protected_assets.setdefault(int(row["profile_id"]), set()).add(
+                        normalize_url(str(row["source_url"]))
+                    )
+            affected_media = {}
+            for row in rows:
+                if row["role"] != "image" or normalize_url(str(row["source_url"])) not in protected_assets.get(int(row["profile_id"]), set()):
+                    continue
+                cur = conn.execute(
+                    "DELETE FROM entity_media WHERE entity_id=? AND version_id=? AND media_id=? AND role='image'",
+                    (row["entity_id"], row["version_id"], row["media_id"]),
+                )
+                counts["links_removed"] += cur.rowcount
+                affected_media[int(row["media_id"])] = row
+            for media_id, row in affected_media.items():
+                if conn.execute("SELECT 1 FROM entity_media WHERE media_id=? LIMIT 1", (media_id,)).fetchone():
+                    continue
+                if conn.execute("SELECT 1 FROM outbox WHERE kind='media' AND status='pending' AND media_sha256=? LIMIT 1", (row["sha256"],)).fetchone():
+                    continue
+                # Preserve provenance, but detach aliases from the retired file.
+                # All changes roll back together if another reference blocks it.
+                conn.execute("UPDATE media_aliases SET media_id=NULL WHERE media_id=?", (media_id,))
+                conn.execute("DELETE FROM media WHERE id=?", (media_id,))
+                if not conn.execute("SELECT 1 FROM media WHERE path=? LIMIT 1", (row["path"],)).fetchone():
+                    removed_media.append(row)
 
+        # Never remove files before the database transaction has committed.
         media_root = self.media.root.resolve()
         thumbnail_root = (self.settings.data_dir / "cache" / "thumbnails").resolve()
-        for media_id, row in affected_media.items():
-            if self.db.row("SELECT 1 present FROM entity_media WHERE media_id=? LIMIT 1", (media_id,)):
-                continue
-            self.db.execute("DELETE FROM media WHERE id=?", (media_id,))
+        for row in removed_media:
             path = Path(str(row.get("path") or ""))
             try:
                 resolved = path.resolve()
@@ -9146,12 +9150,25 @@ class MonitorService:
               )"""
         ):
             try:
+                with self.db.connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    deleted = conn.execute(
+                        """DELETE FROM media WHERE id=?
+                        AND NOT EXISTS(SELECT 1 FROM entity_media WHERE media_id=media.id)
+                        AND NOT EXISTS(SELECT 1 FROM media_aliases WHERE media_id=media.id)
+                        AND NOT EXISTS(SELECT 1 FROM outbox WHERE kind='media'
+                            AND status='pending' AND media_sha256=media.sha256)""",
+                        (row["id"],),
+                    ).rowcount
+                    shared_path = conn.execute("SELECT 1 FROM media WHERE path=? LIMIT 1", (row.get("path"),)).fetchone()
+                if not deleted:
+                    continue
                 path = Path(row.get("path") or "")
-                if path.is_file():
+                root = self.media.root.resolve()
+                if not shared_path and path.is_file() and root in path.resolve().parents:
                     path.unlink()
-                self.db.execute("DELETE FROM media WHERE id=?", (row["id"],))
                 counts["orphaned"] += 1
-            except OSError:
+            except (OSError, sqlite3.Error):
                 counts["errors"] += 1
         return counts
 
