@@ -24,7 +24,7 @@ from .apify import (
     provider_charge_ceiling,
 )
 from .brightdata import BrightDataError, BrightDataGateway, BrightDataPending
-from .scrapecreators import ScrapeCreatorsGateway, ScrapeCreatorsError
+from .scrapecreators import ScrapeCreatorsGateway, ScrapeCreatorsError, reserved_public_profile
 from .browser_guard import TAIPEI, BrowserDecision, BrowserGuard
 from .capture_coordinator import (
     reconcile_post_media_checkpoint,
@@ -3397,6 +3397,7 @@ class MonitorService:
         items: list[dict[str, Any]],
         *,
         notify: bool,
+        provider: str = "apify",
     ) -> dict[str, Any]:
         identities: list[str] = []
         new_count = 0
@@ -3435,7 +3436,7 @@ class MonitorService:
                 identity=identity,
                 persisted_id=persisted_id,
                 entity_id=entity_id,
-                provider="apify",
+                provider=provider,
             )
         return {
             "identities": list(dict.fromkeys(identities)),
@@ -5038,7 +5039,11 @@ class MonitorService:
             elif job["job_type"] == "verify_public_v2":
                 await self.verify_public_v2(int(job["profile_id"]))
             elif job["job_type"] == "capture_posts_v2":
-                await self.capture_posts_v2(int(job["profile_id"]), job_payload)
+                try:
+                    await self.capture_posts_v2(int(job["profile_id"]), job_payload)
+                except (ApifyFrozen, BudgetExceeded, RuntimeError):
+                    await self._capture_scrapecreators_posts(int(job["profile_id"]))
+                    raise
             elif job["job_type"] == "capture_profile_photos":
                 photo_outcome = await self.capture_profile_photos(
                     int(job["profile_id"]), job_payload
@@ -7805,6 +7810,9 @@ class MonitorService:
                     "regular_visit_v2",
                     observed_at=self._capture_v2_datetime(now),
                 )
+                if (self.db.profile_source_frozen(profile_id, "apify")
+                        or not self._preferred_posts_v2_contract() or self._remaining_budget() <= 0):
+                    await self._capture_scrapecreators_posts(profile_id)
             else:
                 canary_items = await self._try_browser_canary(
                     profile, 0, "apify_v1_disabled"
@@ -7812,6 +7820,8 @@ class MonitorService:
                 await self._ingest_browser_canary_posts(
                     profile_id, canary_items, notify=True
                 )
+                if not canary_items:
+                    await self._capture_scrapecreators_posts(profile_id)
             self._schedule_next(profile_id)
             return
         initial = not bool(self.db.row("SELECT id FROM entities WHERE profile_id=? AND kind='post' LIMIT 1", (profile_id,)))
@@ -7836,6 +7846,7 @@ class MonitorService:
             posts = await self._fetch_regular_posts(profile, initial)
         except (ApifyFrozen, BudgetExceeded) as exc:
             reason = "apify_frozen" if isinstance(exc, ApifyFrozen) else "apify_budget"
+            await self._capture_scrapecreators_posts(profile_id)
             canary_items = await self._try_browser_canary(profile, 0, reason)
             await self._ingest_browser_canary_posts(profile_id, canary_items, notify=not initial)
             self._schedule_next(profile_id)
@@ -8313,17 +8324,59 @@ class MonitorService:
         return True
 
     async def _try_scrapecreators_fallback(self, profile: dict[str, Any], primary_error: str, brightdata_error: str) -> bool:
-        if self.settings.scrapecreators_enabled:
-            try:
-                item = await self.scrapecreators.profile(str(profile["url"]))
-                target_id = self._capture_v2_target_id(profile)
-                if not target_id or str(item.get("id")) != target_id:
-                    raise ScrapeCreatorsError("ScrapeCreators 回傳帳號身份不一致；未匯入")
-                await self._store_profile_details(profile, item)
-                return True
-            except ScrapeCreatorsError as exc:
-                brightdata_error += f"；ScrapeCreators：{exc}"
+        # Reserve the limited trial for public posts, not routine profile refreshes.
         return await self._try_browser_fallback(profile, primary_error, brightdata_error)
+
+    async def _capture_scrapecreators_posts(self, profile_id: int) -> dict[str, Any] | None:
+        """One bounded fallback page. Historical imports are quiet and checkpointed."""
+        profile = self.db.row("SELECT * FROM profiles WHERE id=?", (profile_id,))
+        if not (self.settings.scrapecreators_enabled and profile and reserved_public_profile(self.db, profile)):
+            return None
+        checkpoint = self.db.row("SELECT * FROM scrapecreators_captures WHERE profile_id=?", (profile_id,))
+        if checkpoint and checkpoint["status"] in {"source_limited", "invalid_identity"}:
+            return None
+        cursor = checkpoint.get("cursor") if checkpoint else None
+        try:
+            if checkpoint and checkpoint.get("pending_json"):
+                data = json.loads(checkpoint["pending_json"])
+            else:
+                data = await self.scrapecreators.posts(str(profile["url"]), cursor)
+                self.db.execute("""INSERT INTO scrapecreators_captures(profile_id,cursor,pending_json,status,updated)
+                    VALUES (?,?,?,'in_progress',?) ON CONFLICT(profile_id) DO UPDATE
+                    SET pending_json=excluded.pending_json,status='in_progress',updated=excluded.updated""",
+                    (profile_id, cursor, json.dumps(data, ensure_ascii=False), time.time()))
+            items = data["posts"]
+            if not reserved_public_profile(self.db, profile):
+                return None
+            if data.get("cursor") is not None and not isinstance(data["cursor"], str):
+                raise ScrapeCreatorsError("貼文分頁游標格式不符；保留樣本，不匯入")
+            if any(not p.get("id") or not isinstance(p.get("author"), dict)
+                   or str(p["author"].get("id")) != "100027675104517" for p in items):
+                self.db.execute("UPDATE scrapecreators_captures SET status='invalid_identity' WHERE profile_id=?", (profile_id,))
+                raise ScrapeCreatorsError("貼文作者身分不一致；保留樣本，不匯入")
+            identities = sorted(str(p["id"]) for p in items)
+            normalized_items = []
+            for post in items:
+                item = {key: post[key] for key in ("id", "text", "url", "permalink", "author",
+                        "image", "images", "videoDetails", "attachments", "publishTime") if key in post}
+                if not item.get("publishTime") and post.get("creation_time"):
+                    item["publishTime"] = post["creation_time"]
+                normalized_items.append(item)
+            counts = await self._ingest_capture_v2_posts(profile_id, normalized_items, notify=False, provider="scrapecreators")
+            next_cursor = data.get("cursor")
+            repeated = bool(checkpoint and checkpoint.get("last_ids") == json.dumps(identities))
+            status = "in_progress" if items and next_cursor and next_cursor != cursor and not repeated else "source_limited"
+            self.db.execute("""UPDATE scrapecreators_captures SET cursor=?,pending_json=NULL,
+                status=?,last_ids=?,updated=? WHERE profile_id=?""",
+                (next_cursor if status == "in_progress" else cursor, status, json.dumps(identities), time.time(), profile_id))
+            self.db.add_event(f"scrapecreators-import:{profile_id}:{hashlib.sha256(json.dumps(identities).encode()).hexdigest()}",
+                "scrapecreators_import", {"title": "ScrapeCreators 免費備援匯入", "text": json.dumps(counts, ensure_ascii=False)},
+                profile_id, notify=False)
+            return counts
+        except ScrapeCreatorsError as exc:
+            self.db.add_event(f"scrapecreators-limited:{profile_id}:{utcnow()[:10]}",
+                "scrapecreators_limited", {"title": "ScrapeCreators 免費備援停止", "text": str(exc)}, profile_id, notify=False)
+            return None
 
     def _profile_refresh_failed(self, profile_id: int, reason: str, *, deferred: bool = False) -> None:
         self.db.execute(

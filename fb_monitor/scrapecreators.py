@@ -7,6 +7,23 @@ from pathlib import Path
 import httpx
 
 from .provider_state import ProviderState
+from .serpapi import profile_id_from_url
+
+RESERVED_PROFILE_ID = "100027675104517"
+
+
+def reserved_public_profile(db, profile: dict) -> bool:
+    if not profile.get("enabled"):
+        return False
+    url_id = profile_id_from_url(str(profile.get("url") or ""))
+    identity = str(profile.get("fb_id") or url_id)
+    if identity != RESERVED_PROFILE_ID or (url_id.isdigit() and url_id != RESERVED_PROFILE_ID):
+        return False
+    latest = db.row("""SELECT verdict FROM access_observations
+        WHERE profile_id=? AND identity_match=1 AND target_fb_id=? AND observed_fb_id=? AND
+        (auth_scope='anonymous' OR source='contract_explicit' OR source LIKE 'contract:%')
+        ORDER BY observed_at DESC,id DESC LIMIT 1""", (profile["id"], RESERVED_PROFILE_ID, RESERVED_PROFILE_ID))
+    return bool(latest and latest["verdict"] == "confirmed_public")
 
 
 class ScrapeCreatorsError(RuntimeError):

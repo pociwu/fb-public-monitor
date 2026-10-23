@@ -7,10 +7,14 @@ pending 或暫時下載失敗保留 ID，下次巡檢續查，不重新 POST。
 提交逾時、非 JSON 或缺少 snapshot ID 時保留 launching，禁止自動重送；需人工在供應商後台核對。
 終止失敗也不自動重新計費。正常結果短暫快取 5 分鐘。
 
-ScrapeCreators 加入個人檔案備援：SerpApi → Bright Data → ScrapeCreators（選用）→ 瀏覽器。
-Bright Data 還在處理時不立即連鎖呼叫其他來源。
-結果只能作為公開訊號，不會升格成已確認公開，也不證明完整歷史。
-貼文提供單頁試用命令，原始回應和 cursor 保存在 SQLite，尚未啟用自動完整回溯。
+ScrapeCreators 額度只保留給 Facebook ID `100027675104517`，且最新匿名、身分一致的觀察必須為 `confirmed_public`。
+疑似公開、私人、未知、僅登入可見、其他帳號皆不得呼叫；手動 source-trial 亦受此限制。
+一般個人檔案更新不使用 ScrapeCreators：SerpApi → Bright Data → 瀏覽器。
+主要貼文來源失敗、Apify 凍結、預算不足或缺少合格契約時，可啟用 ScrapeCreators 貼文備援。
+每輪一頁；原始回應先存 SQLite，貼文與媒體走既有身分別名／內容雜湊去重。
+匯入成功後才推進專屬 cursor；失敗重播同一樣本，不重新購買。下一輪備援續抓下一頁。
+沒有下一頁、空頁或重複批次只標記來源受限，不宣告完整回溯完成。
+歷史貼文靜默匯入，照片由既有媒體流程下載／重試，不逐篇發 Telegram。
 
 ## 設定位置
 
@@ -38,13 +42,13 @@ Compose 使用 env_file 載入 .env；修改後須重建容器環境：
 cd ~/fb-public-monitor
 docker compose up -d --build --force-recreate monitor
 docker compose exec -T monitor fb-monitor source-status
-docker compose exec -T monitor fb-monitor source-trial 2
-docker compose exec -T monitor fb-monitor source-trial 2 --surface posts
 ```
 
 每次試用僅一次 API 請求；同端點/參數在 24 小時內使用已保存結果。
 試用不發 Telegram、不修改帳號公開狀態、不匯入貼文/留言，也不下載所有照片。
-確認個人檔案結果可用後，可將 `SCRAPECREATORS_ENABLED=1` 啟用受相同試用上限約束的自動個人檔案備援。
+部署此限制版本後，可將 `SCRAPECREATORS_ENABLED=1` 啟用指定帳號的自動貼文備援。
+未確認公開時不耗點。原先帳號 2 的試測命令現在會被拒絕。
+部署與重啟不得清除 provider_trial_usage；原先已用 2 次，上限 5 次仍只剩 3 次。
 用完即停止；`source-status` 是本機查詢，不耗供應商點數。
 
 ## 官方契約

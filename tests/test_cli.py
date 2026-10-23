@@ -32,23 +32,20 @@ def test_source_status_does_not_call_provider(tmp_path, monkeypatch, capsys):
     assert report["requests"] == []
 
 
-def test_source_trial_saves_sample_without_importing(tmp_path, monkeypatch, capsys):
+def test_source_trial_denies_other_profiles_before_network(tmp_path, monkeypatch, capsys):
     import httpx
     config = _write_cli_config(tmp_path)
     monkeypatch.setenv("SCRAPECREATORS_API_KEY", "secret")
     monkeypatch.setenv("SCRAPECREATORS_FREE_ONLY_CONFIRMED", "1")
     async def get(self, url, **kwargs):
-        assert url.endswith("/v1/facebook/profile/posts")
-        return httpx.Response(200, json={"success": True, "posts": [{"id": "p1"}], "cursor": "next"})
+        pytest.fail("reserved source must not call other profiles")
     monkeypatch.setattr(httpx.AsyncClient, "get", get)
     monkeypatch.setattr(sys, "argv", ["fb-monitor", "--config", str(config), "source-trial", "1", "--surface", "posts"])
-    main()
-    report = json.loads(capsys.readouterr().out)
-    assert report["posts"] == 1
-    assert report["cursor"] == "next"
+    with pytest.raises(SystemExit, match="僅保留"):
+        main()
     db = Database(load_settings(config).db_path)
     assert db.row("SELECT COUNT(*) n FROM entities")["n"] == 0
-    assert db.row("SELECT used FROM provider_trial_usage")["used"] == 1
+    assert db.row("SELECT used FROM provider_trial_usage") is None
 
 
 def test_health_is_read_only_and_exposes_stale_refresh_evidence(tmp_path, monkeypatch, capsys):

@@ -17,6 +17,9 @@ class ProviderState:
             PRIMARY KEY(provider, request_key))""")
         self.conn.execute("""CREATE TABLE IF NOT EXISTS provider_trial_usage (
             provider TEXT PRIMARY KEY, used INTEGER NOT NULL DEFAULT 0)""")
+        self.conn.execute("""CREATE TABLE IF NOT EXISTS scrapecreators_captures (
+            profile_id INTEGER PRIMARY KEY, cursor TEXT, pending_json TEXT,
+            status TEXT NOT NULL DEFAULT 'in_progress', last_ids TEXT, updated REAL NOT NULL)""")
         self.conn.commit()
 
     def claim(self, provider: str, key: str, ttl: int = 300) -> tuple[bool, dict]:

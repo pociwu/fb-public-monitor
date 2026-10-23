@@ -118,7 +118,7 @@ def main() -> None:
     db.sync_profiles(settings.profiles)
     if args.command in {"source-trial", "source-status"}:
         import asyncio
-        from .scrapecreators import ScrapeCreatorsGateway, ScrapeCreatorsError
+        from .scrapecreators import ScrapeCreatorsGateway, ScrapeCreatorsError, reserved_public_profile, RESERVED_PROFILE_ID
         gateway = ScrapeCreatorsGateway(
             settings.scrapecreators_api_key, state_path=settings.db_path,
             enabled=True, free_only_confirmed=settings.scrapecreators_free_only_confirmed,
@@ -130,11 +130,15 @@ def main() -> None:
                 "requests": db.rows("SELECT provider,request_key,status,remote_id,updated FROM provider_requests ORDER BY updated DESC LIMIT 30"),
                 "trial_limit": settings.scrapecreators_trial_limit,
                 "automatic_fallback_enabled": settings.scrapecreators_enabled,
+                "reserved_profile_id": RESERVED_PROFILE_ID,
+                "captures": db.rows("SELECT profile_id,cursor,status,updated FROM scrapecreators_captures"),
             }, ensure_ascii=False, indent=2))
             return
         profile = db.row("SELECT * FROM profiles WHERE CAST(id AS TEXT)=? OR name=? OR display_name=? OR url=?", (args.profile,) * 4)
         if not profile:
             raise SystemExit("找不到指定 profile")
+        if not reserved_public_profile(db, profile):
+            raise SystemExit("ScrapeCreators 僅保留給 100027675104517，且須先確認匿名公開；未呼叫 API")
         try:
             if args.surface == "profile":
                 if args.cursor:

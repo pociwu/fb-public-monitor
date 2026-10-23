@@ -1169,19 +1169,20 @@ schedule:
 
 
 @pytest.mark.asyncio
-async def test_scrapecreators_fallback_preserves_provider_and_weak_evidence(tmp_path: Path, monkeypatch):
+async def test_scrapecreators_fallback_does_not_spend_on_other_profile(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text("profiles:\n  - name: FB-100\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n  low_disk_gb: 0\n", encoding="utf-8")
     monkeypatch.setenv("SCRAPECREATORS_ENABLED", "1")
     service = MonitorService(load_settings(config))
     async def profile(url):
-        return {"id": "100", "name": "Alice", "url": url, "profile_data_source": "ScrapeCreators"}
+        pytest.fail("reserved credits must not be used")
     service.scrapecreators.profile = profile
+    service.scrapecreators.posts = profile
+    async def browser(*args):
+        return False
+    service._try_browser_fallback = browser
     original = service.db.row("SELECT * FROM profiles WHERE id=1")
-    assert await service._try_scrapecreators_fallback(original, "empty", "failed")
-    observation = service.db.row("SELECT * FROM access_observations ORDER BY id DESC LIMIT 1")
-    assert observation["source"] == "profile_refresh:scrapecreators"
-    assert observation["verdict"] == "suspected_public"
+    assert not await service._try_scrapecreators_fallback(original, "empty", "failed")
 
 
 @pytest.mark.asyncio
