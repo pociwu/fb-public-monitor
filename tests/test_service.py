@@ -1169,6 +1169,39 @@ schedule:
 
 
 @pytest.mark.asyncio
+async def test_scrapecreators_fallback_preserves_provider_and_weak_evidence(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text("profiles:\n  - name: FB-100\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n  low_disk_gb: 0\n", encoding="utf-8")
+    monkeypatch.setenv("SCRAPECREATORS_ENABLED", "1")
+    service = MonitorService(load_settings(config))
+    async def profile(url):
+        return {"id": "100", "name": "Alice", "url": url, "profile_data_source": "ScrapeCreators"}
+    service.scrapecreators.profile = profile
+    original = service.db.row("SELECT * FROM profiles WHERE id=1")
+    assert await service._try_scrapecreators_fallback(original, "empty", "failed")
+    observation = service.db.row("SELECT * FROM access_observations ORDER BY id DESC LIMIT 1")
+    assert observation["source"] == "profile_refresh:scrapecreators"
+    assert observation["verdict"] == "suspected_public"
+
+
+@pytest.mark.asyncio
+async def test_brightdata_pending_does_not_fan_out(tmp_path: Path, monkeypatch):
+    from fb_monitor.brightdata import BrightDataPending
+    config = tmp_path / "config.yaml"
+    config.write_text("profiles:\n  - name: FB-100\n    url: https://facebook.com/100\nstorage:\n  data_dir: data\n", encoding="utf-8")
+    monkeypatch.setenv("BRIGHTDATA_API_TOKEN", "secret")
+    service = MonitorService(load_settings(config))
+    async def pending(url):
+        raise BrightDataPending("snapshot pending")
+    async def forbidden(*args):
+        pytest.fail("pending must not launch another provider")
+    service.brightdata.profile = pending
+    service._try_scrapecreators_fallback = forbidden
+    assert not await service._try_brightdata_fallback(service.db.row("SELECT * FROM profiles WHERE id=1"), "empty")
+    assert service.db.row("SELECT consecutive_failures FROM profiles WHERE id=1")["consecutive_failures"] == 0
+
+
+@pytest.mark.asyncio
 async def test_logged_in_browser_is_final_profile_fallback(tmp_path: Path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text(

@@ -16,6 +16,11 @@ def main() -> None:
     parser.add_argument("--config", default=None)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("run")
+    source_trial = sub.add_parser("source-trial", help="限量免費試用 ScrapeCreators；保存回應但不發 Telegram")
+    source_trial.add_argument("profile", help="已設定的 profile ID、名稱或 URL")
+    source_trial.add_argument("--surface", choices=["profile", "posts"], default="profile")
+    source_trial.add_argument("--cursor", default=None, help="僅限 ScrapeCreators 貼文的續頁 cursor")
+    sub.add_parser("source-status", help="檢視非 Apify 備援請求與本機試用用量；不呼叫外部 API")
     scan = sub.add_parser("scan")
     scan.add_argument("profile", help="profile ID、名稱或 Facebook URL")
     diagnose = sub.add_parser("diagnose")
@@ -111,7 +116,39 @@ def main() -> None:
         return
     db = Database(settings.db_path)
     db.sync_profiles(settings.profiles)
-    if args.command == "scan":
+    if args.command in {"source-trial", "source-status"}:
+        import asyncio
+        from .scrapecreators import ScrapeCreatorsGateway, ScrapeCreatorsError
+        gateway = ScrapeCreatorsGateway(
+            settings.scrapecreators_api_key, state_path=settings.db_path,
+            enabled=True, free_only_confirmed=settings.scrapecreators_free_only_confirmed,
+            trial_limit=settings.scrapecreators_trial_limit,
+        )
+        if args.command == "source-status":
+            print(json.dumps({
+                "trial_usage": db.rows("SELECT provider,used FROM provider_trial_usage"),
+                "requests": db.rows("SELECT provider,request_key,status,remote_id,updated FROM provider_requests ORDER BY updated DESC LIMIT 30"),
+                "trial_limit": settings.scrapecreators_trial_limit,
+                "automatic_fallback_enabled": settings.scrapecreators_enabled,
+            }, ensure_ascii=False, indent=2))
+            return
+        profile = db.row("SELECT * FROM profiles WHERE CAST(id AS TEXT)=? OR name=? OR display_name=? OR url=?", (args.profile,) * 4)
+        if not profile:
+            raise SystemExit("找不到指定 profile")
+        try:
+            if args.surface == "profile":
+                if args.cursor:
+                    raise SystemExit("個人檔案測試不接受 cursor")
+                result = asyncio.run(gateway.profile(profile["url"]))
+                summary = {"id": result.get("id"), "name": result.get("name"), "source": "ScrapeCreators"}
+            else:
+                result = asyncio.run(gateway.posts(profile["url"], args.cursor))
+                summary = {"posts": len(result["posts"]), "cursor": result.get("cursor"), "coverage": "partial"}
+        except ScrapeCreatorsError as exc:
+            raise SystemExit(str(exc)) from exc
+        summary["saved"] = "provider_requests.payload（僅試用樣本，尚未匯入貼文或發通知）"
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    elif args.command == "scan":
         profile = db.row("SELECT * FROM profiles WHERE CAST(id AS TEXT)=? OR name=? OR display_name=? OR url=?", (args.profile, args.profile, args.profile, args.profile.rstrip("/")))
         if not profile:
             raise SystemExit("找不到指定 profile")

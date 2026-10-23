@@ -83,6 +83,7 @@ class AuthScope(StrEnum):
 
 
 class EvidenceSource(StrEnum):
+    SCRAPECREATORS = "scrapecreators"
     SERPAPI = "serpapi"
     APIFY = "apify"
     BRIGHT_DATA = "bright_data"

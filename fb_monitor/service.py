@@ -23,7 +23,8 @@ from .apify import (
     StartedActor,
     provider_charge_ceiling,
 )
-from .brightdata import BrightDataError, BrightDataGateway
+from .brightdata import BrightDataError, BrightDataGateway, BrightDataPending
+from .scrapecreators import ScrapeCreatorsGateway, ScrapeCreatorsError
 from .browser_guard import TAIPEI, BrowserDecision, BrowserGuard
 from .capture_coordinator import (
     reconcile_post_media_checkpoint,
@@ -149,7 +150,13 @@ class MonitorService:
         self.db.sync_profiles(settings.profiles)
         self.apify = ApifyGateway(settings.apify_token)
         self.serpapi = SerpApiGateway(settings.serpapi_key)
-        self.brightdata = BrightDataGateway(settings.brightdata_api_token, settings.brightdata_dataset_id)
+        self.brightdata = BrightDataGateway(settings.brightdata_api_token, settings.brightdata_dataset_id, state_path=settings.db_path)
+        self.scrapecreators = ScrapeCreatorsGateway(
+            settings.scrapecreators_api_key, state_path=settings.db_path,
+            enabled=settings.scrapecreators_enabled,
+            free_only_confirmed=settings.scrapecreators_free_only_confirmed,
+            trial_limit=settings.scrapecreators_trial_limit,
+        )
         self.facebook_browser = FacebookBrowserGateway(
             settings.facebook_browser_enabled,
             settings.facebook_browser_data_dir,
@@ -8288,12 +8295,15 @@ class MonitorService:
 
     async def _try_brightdata_fallback(self, profile: dict[str, Any], primary_error: str) -> bool:
         if not self.settings.brightdata_api_token:
-            return await self._try_browser_fallback(profile, primary_error, "Bright Data API token 未設定")
+            return await self._try_scrapecreators_fallback(profile, primary_error, "Bright Data API token 未設定")
         try:
             item = await self.brightdata.profile(str(profile["url"]))
             await self._store_profile_details(profile, item)
+        except BrightDataPending as exc:
+            self._profile_refresh_failed(int(profile["id"]), str(exc), deferred=True)
+            return False
         except BrightDataError as exc:
-            return await self._try_browser_fallback(profile, primary_error, str(exc))
+            return await self._try_scrapecreators_fallback(profile, primary_error, str(exc))
         self.db.add_event(
             f"brightdata:{profile['id']}:{utcnow()[:13]}:success",
             "brightdata_fallback",
@@ -8301,6 +8311,19 @@ class MonitorService:
             int(profile["id"]),
         )
         return True
+
+    async def _try_scrapecreators_fallback(self, profile: dict[str, Any], primary_error: str, brightdata_error: str) -> bool:
+        if self.settings.scrapecreators_enabled:
+            try:
+                item = await self.scrapecreators.profile(str(profile["url"]))
+                target_id = self._capture_v2_target_id(profile)
+                if not target_id or str(item.get("id")) != target_id:
+                    raise ScrapeCreatorsError("ScrapeCreators 回傳帳號身份不一致；未匯入")
+                await self._store_profile_details(profile, item)
+                return True
+            except ScrapeCreatorsError as exc:
+                brightdata_error += f"；ScrapeCreators：{exc}"
+        return await self._try_browser_fallback(profile, primary_error, brightdata_error)
 
     def _profile_refresh_failed(self, profile_id: int, reason: str, *, deferred: bool = False) -> None:
         self.db.execute(
@@ -8486,6 +8509,10 @@ class MonitorService:
             evidence_source = EvidenceSource.BROWSER
             auth_scope = AuthScope.AUTHENTICATED
             observation_source = "profile_refresh:authenticated_browser"
+        elif "scrapecreators" in lowered_source:
+            evidence_source = EvidenceSource.SCRAPECREATORS
+            auth_scope = AuthScope.ANONYMOUS
+            observation_source = "profile_refresh:scrapecreators"
         elif "bright" in lowered_source:
             evidence_source = EvidenceSource.BRIGHT_DATA
             auth_scope = AuthScope.ANONYMOUS
