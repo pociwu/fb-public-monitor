@@ -16,6 +16,16 @@ def test_actor_input_keeps_native_values():
     assert result == {"profileUrls": ["a", "b"], "limit": 20}
 
 
+@pytest.mark.parametrize("limit,reserve,expected", [(90, 10, (90, 10)), (999, 0, (90, 10)), (5, 20, (5, 20))])
+def test_scrapecreators_budget_config_preserves_hard_guards(tmp_path, monkeypatch, limit, reserve, expected):
+    config = tmp_path / "config.yaml"
+    config.write_text("profiles: []\n", encoding="utf-8")
+    monkeypatch.setenv("SCRAPECREATORS_TRIAL_LIMIT", str(limit))
+    monkeypatch.setenv("SCRAPECREATORS_CREDIT_RESERVE", str(reserve))
+    settings = load_settings(config)
+    assert (settings.scrapecreators_trial_limit, settings.scrapecreators_credit_reserve) == expected
+
+
 def test_browser_canary_defaults_are_conservative(tmp_path: Path):
     config = tmp_path / "config.yaml"
     config.write_text("profiles: []\n", encoding="utf-8")

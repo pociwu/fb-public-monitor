@@ -158,6 +158,7 @@ class Settings:
     scrapecreators_enabled: bool = False
     scrapecreators_free_only_confirmed: bool = False
     scrapecreators_trial_limit: int = 5
+    scrapecreators_credit_reserve: int = 10
     facebook_browser_enabled: bool = False
     facebook_browser_data_dir: Path = Path("/browser-data")
     facebook_browser_timeout_seconds: int = 60
@@ -322,7 +323,8 @@ def load_settings(path: str | Path | None = None) -> Settings:
         scrapecreators_api_key=os.getenv("SCRAPECREATORS_API_KEY", ""),
         scrapecreators_enabled=os.getenv("SCRAPECREATORS_ENABLED", "0").lower() in {"1", "true"},
         scrapecreators_free_only_confirmed=os.getenv("SCRAPECREATORS_FREE_ONLY_CONFIRMED", "0").lower() in {"1", "true"},
-        scrapecreators_trial_limit=max(0, min(10, int(os.getenv("SCRAPECREATORS_TRIAL_LIMIT", "5")))),
+        scrapecreators_trial_limit=max(0, min(90, int(os.getenv("SCRAPECREATORS_TRIAL_LIMIT", "5")))),
+        scrapecreators_credit_reserve=max(10, int(os.getenv("SCRAPECREATORS_CREDIT_RESERVE", "10"))),
         facebook_browser_enabled=os.getenv("FACEBOOK_BROWSER_ENABLED", "0") in {"1", "true", "True"},
         facebook_browser_data_dir=Path(os.getenv("FACEBOOK_BROWSER_DATA_DIR", "/browser-data")),
         facebook_browser_timeout_seconds=int(os.getenv("FACEBOOK_BROWSER_TIMEOUT_SECONDS", "60")),

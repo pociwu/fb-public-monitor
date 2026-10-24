@@ -14,6 +14,7 @@ def service_fixture(tmp_path, monkeypatch, verdict="confirmed_public"):
     config.write_text(f"profiles:\n  - name: target\n    url: https://www.facebook.com/{RESERVED_PROFILE_ID}\nstorage:\n  data_dir: data\n  low_disk_gb: 0\n", encoding="utf-8")
     monkeypatch.setenv("SCRAPECREATORS_ENABLED", "1")
     service = MonitorService(load_settings(config))
+    service.db.execute("UPDATE scrapecreators_budget SET remaining=100,observed_remaining=100,blocked_reason=NULL WHERE id=1")
     service.db.record_access_observation(1, source="anonymous_browser", auth_scope="anonymous",
         verdict=verdict, target_fb_id=RESERVED_PROFILE_ID, observed_fb_id=RESERVED_PROFILE_ID, identity_match=True)
     return service

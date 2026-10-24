@@ -123,12 +123,14 @@ def main() -> None:
             settings.scrapecreators_api_key, state_path=settings.db_path,
             enabled=True, free_only_confirmed=settings.scrapecreators_free_only_confirmed,
             trial_limit=settings.scrapecreators_trial_limit,
+            credit_reserve=settings.scrapecreators_credit_reserve,
         )
         if args.command == "source-status":
             print(json.dumps({
                 "trial_usage": db.rows("SELECT provider,used FROM provider_trial_usage"),
                 "requests": db.rows("SELECT provider,request_key,status,remote_id,updated FROM provider_requests ORDER BY updated DESC LIMIT 30"),
                 "trial_limit": settings.scrapecreators_trial_limit,
+                "credit_budget": gateway.budget_status(),
                 "automatic_fallback_enabled": settings.scrapecreators_enabled,
                 "reserved_profile_id": RESERVED_PROFILE_ID,
                 "captures": db.rows("SELECT profile_id,cursor,status,updated FROM scrapecreators_captures"),

@@ -61,6 +61,8 @@ docker compose logs -f monitor
 - `APIFY_TOKEN`：Apify Console → Integrations 中的 API token。
 - `SERPAPI_KEY`：SerpApi 帳號 API key；程式先查免費 Account API，剩餘次數為 0 時不會執行個人檔案查詢。
 - `BRIGHTDATA_API_TOKEN`：Bright Data API token。設定後，SerpApi 額度用完、連線失敗或查無結果時，才呼叫 Facebook Profiles Scraper API 作備援。
+- ScrapeCreators 保留免費備援：`SCRAPECREATORS_TRIAL_LIMIT=90` 表示累計最多 90 次（含已用次數），`SCRAPECREATORS_CREDIT_RESERVE=10` 表示至少保留 10 credits。程式硬限制最多 90 次／最少保留 10 點，兩者任一達限即停止；仍需 `SCRAPECREATORS_FREE_ONLY_CONFIRMED=1` 且僅允許 `100027675104517` 確認匿名公開後使用。官方帳戶自動儲值須保持關閉，本程式不呼叫購點或儲值端點。
+- 額度帳本從既存官方回應遷移，不歸零已用次數、不為查餘額額外耗點。每次呼叫先原子預留 1 點，再依 `credits_charged`／`credits_remaining` 校正；無可信餘額、結果不明或單次扣點超過 1 時停止新請求。原始結果可以離線重播，不重新購買。其他程式若共用同一 API key 仍可能改變官方餘額；本機保留門檻以最近已知回應及預留帳本為準，不能控制外部用量。可用 `fb-monitor source-status` 查看 `credit_budget`。
 - `BRIGHTDATA_DATASET_ID`：Bright Data Facebook Profiles dataset ID，預設 `gd_mf0urb782734ik94dz`，通常不需修改。
 - `FACEBOOK_BROWSER_ENABLED=1`：啟用已登入 Chromium 個人檔案備援與帳號可見照片回溯；匿名公開驗證仍使用獨立空白資料目錄。
 - `FACEBOOK_BROWSER_DATA_DIR=/browser-data`：容器內持久化瀏覽器登入狀態的路徑。

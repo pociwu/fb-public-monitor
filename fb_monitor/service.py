@@ -156,6 +156,7 @@ class MonitorService:
             enabled=settings.scrapecreators_enabled,
             free_only_confirmed=settings.scrapecreators_free_only_confirmed,
             trial_limit=settings.scrapecreators_trial_limit,
+            credit_reserve=settings.scrapecreators_credit_reserve,
         )
         self.facebook_browser = FacebookBrowserGateway(
             settings.facebook_browser_enabled,
@@ -8370,8 +8371,7 @@ class MonitorService:
         checkpoint = self.db.row("SELECT * FROM scrapecreators_captures WHERE profile_id=?", (profile_id,))
         if checkpoint and checkpoint["status"] != "in_progress":
             return None
-        used = self.db.row("SELECT used FROM provider_trial_usage WHERE provider='scrapecreators'")
-        if (used or {}).get("used", 0) >= gateway.trial_limit and not (checkpoint and checkpoint.get("pending_json")):
+        if not gateway.budget_status()["can_request"] and not (checkpoint and checkpoint.get("pending_json")):
             return None
         available = datetime.now(UTC)
         if checkpoint:
