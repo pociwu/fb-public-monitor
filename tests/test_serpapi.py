@@ -77,7 +77,7 @@ async def test_profile_tries_stable_alias_after_empty_result(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_profile_records_two_empty_results_then_stops(monkeypatch):
+async def test_profile_does_not_spend_twice_on_same_empty_identifier(monkeypatch):
     gateway = SerpApiGateway("secret")
     searched = []
 
@@ -90,5 +90,5 @@ async def test_profile_records_two_empty_results_then_stops(monkeypatch):
     monkeypatch.setattr(gateway, "_get_json", fake_get)
     with pytest.raises(SerpApiNoResults) as caught:
         await gateway.profile("https://www.facebook.com/123", empty_retry_seconds=0)
-    assert searched == ["123", "123"]
-    assert len(caught.value.attempts) == 2
+    assert searched == ["123"]
+    assert len(caught.value.attempts) == 1

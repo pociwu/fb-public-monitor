@@ -84,7 +84,7 @@ class SerpApiGateway:
         max_attempts: int = 2,
         empty_retry_seconds: float = 30,
     ) -> SerpApiProfileResult:
-        """Look up a profile through stable identifiers with one bounded retry.
+        """Look up a profile through distinct identifiers with a bounded budget.
 
         A Facebook Profile search is charged per request, so this deliberately
         never fans out without a small, explicit attempt limit.  Aliases are
@@ -95,11 +95,12 @@ class SerpApiGateway:
         if account.searches_left <= 0:
             raise SerpApiQuotaExceeded("SerpApi 本帳期查詢額度已用完", account)
         candidates = list(dict.fromkeys(value for value in (profile_id_from_url(profile_url), *aliases) if value))
-        limit = max(1, min(int(max_attempts), len(candidates) + 1, int(account.searches_left)))
+        limit = max(1, min(int(max_attempts), len(candidates), int(account.searches_left)))
         attempts: list[dict[str, str]] = []
         for index in range(limit):
-            # With one known identifier, retry it once after a short delay.
-            candidate = candidates[min(index, len(candidates) - 1)]
+            # Empty results are not transient transport failures. Never buy
+            # the same identifier twice in a single lookup.
+            candidate = candidates[index]
             try:
                 data = await self._get_json(
                     "https://serpapi.com/search.json",
@@ -109,12 +110,14 @@ class SerpApiGateway:
                 exc.account = account
                 raise
             item = data.get("profile_results")
-            if isinstance(item, dict):
+            if isinstance(item, dict) and item:
                 attempts.append({"query": candidate, "status": "success", "error": ""})
                 normalized = dict(item)
                 if isinstance(normalized.get("photos"), list):
                     normalized["photos"] = normalized["photos"][:6]
-                normalized.setdefault("url", profile_url)
+                if not normalized.get("url"):
+                    normalized["url"] = profile_url
+                    normalized["_url_from_request"] = True
                 return SerpApiProfileResult(normalized, account, attempts, len(attempts))
 
             message = str(data.get("error") or "SerpApi Facebook Profile API 未回傳 profile_results")

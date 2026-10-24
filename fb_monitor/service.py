@@ -595,7 +595,7 @@ class MonitorService:
         jobs = self.db.rows(
             """SELECT * FROM jobs WHERE status='running' AND job_type IN (
             'detect_public_v2','verify_public_v2','capture_posts_v2','capture_profile_photos',
-            'contract_test_posts_v2','profile_browser_fallback'
+            'contract_test_posts_v2','profile_browser_fallback','scrapecreators_posts'
             ) ORDER BY id"""
         )
         for job in jobs:
@@ -1100,6 +1100,8 @@ class MonitorService:
                         "intent": epoch_intent,
                     },
                 )
+        if not contract or self.db.profile_source_frozen(profile_id, "apify") or self._remaining_budget() <= 0:
+            self._queue_scrapecreators_posts(profile)
         return self.db.row("SELECT * FROM capture_epochs WHERE id=?", (epoch["id"],)) or epoch
 
     @staticmethod
@@ -1285,6 +1287,8 @@ class MonitorService:
             if value.isdigit():
                 return value
         for key in ("url", "profileUrl", "profile_url", "facebookUrl"):
+            if key == "url" and item.get("_url_from_request") is True:
+                continue
             value = str(item.get(key) or "").strip()
             if not value:
                 continue
@@ -1294,7 +1298,7 @@ class MonitorService:
                 continue
             if candidate:
                 return candidate
-        return ""
+        return str(item.get("id") or "").strip()
 
     @staticmethod
     def _capture_v2_target_id(profile: dict[str, Any]) -> str:
@@ -2257,6 +2261,12 @@ class MonitorService:
         )
         if classification is EvidenceClass.SUSPECTED_PUBLIC and state is AccessState.SUSPECTED_PUBLIC:
             self._enqueue_v2_unique(profile_id, "verify_public_v2", -410, {"epoch_id": 0})
+        elif item and target_id.isdigit() and observed_id and not observed_id.isdigit():
+            # A slug is not proof that this is the configured person. Resolve
+            # the ambiguity by visiting the ORIGINAL numeric target without
+            # cookies; never trust a name, request URL, or guessed alias.
+            self._enqueue_v2_unique(profile_id, "verify_public_v2", -410,
+                                    {"epoch_id": 0, "reason": "unresolved_profile_alias"})
         elif decision.degraded or error:
             self.db.add_event(
                 f"capture-v2:detection:{profile_id}:{observation['id']}",
@@ -4948,13 +4958,14 @@ class MonitorService:
         # 20–30 minute cross-account visit spacing when both adjacent jobs are
         # pages of the same profile/epoch.
         same_profile_posts_successor = bool(
-            job["job_type"] == "capture_posts_v2"
+            job["job_type"] in {"capture_posts_v2", "scrapecreators_posts"}
             and last
-            and last.get("job_type") == "capture_posts_v2"
+            and last.get("job_type") == job["job_type"]
             and int(last.get("profile_id") or 0) == int(job["profile_id"] or 0)
-            and str(job_payload.get("epoch_id") or "")
-            and str(job_payload.get("epoch_id") or "")
-            == str(last_payload.get("epoch_id") or "")
+            and (job["job_type"] == "scrapecreators_posts" or (
+                str(job_payload.get("epoch_id") or "")
+                and str(job_payload.get("epoch_id") or "") == str(last_payload.get("epoch_id") or "")
+            ))
         )
         # Local slices of an already-purchased photo Actor result are not new
         # Facebook visits.  Let them drain at their own one-minute cadence so
@@ -5038,11 +5049,15 @@ class MonitorService:
                 await self.detect_public_v2(int(job["profile_id"]))
             elif job["job_type"] == "verify_public_v2":
                 await self.verify_public_v2(int(job["profile_id"]))
+            elif job["job_type"] == "scrapecreators_posts":
+                await self._capture_scrapecreators_posts(int(job["profile_id"]))
             elif job["job_type"] == "capture_posts_v2":
                 try:
                     await self.capture_posts_v2(int(job["profile_id"]), job_payload)
                 except (ApifyFrozen, BudgetExceeded, RuntimeError):
-                    await self._capture_scrapecreators_posts(int(job["profile_id"]))
+                    fallback_profile = self.db.row("SELECT * FROM profiles WHERE id=?", (job["profile_id"],))
+                    if fallback_profile:
+                        self._queue_scrapecreators_posts(fallback_profile)
                     raise
             elif job["job_type"] == "capture_profile_photos":
                 photo_outcome = await self.capture_profile_photos(
@@ -5103,6 +5118,10 @@ class MonitorService:
                 WHERE id=? AND status='running' AND lease_owner=?""",
                 (job_terminal_status, utcnow(), job["id"], self.worker_id),
             )
+            if job["job_type"] == "scrapecreators_posts":
+                profile = self.db.row("SELECT * FROM profiles WHERE id=?", (job["profile_id"],))
+                if profile:
+                    self._queue_scrapecreators_posts(profile)
         except DurableActorRunDeferred as exc:
             self.db.execute(
                 """UPDATE jobs SET status='pending',available_at=?,started_at=NULL,
@@ -7749,21 +7768,28 @@ class MonitorService:
                 await self._try_brightdata_fallback(profile, str(exc))
             except SerpApiNoResults as exc:
                 self._record_serpapi_attempts(profile_id, exc.attempts)
-                hour = datetime.now(UTC).strftime("%Y-%m-%dT%H")
+                if exc.account is not None:
+                    exc.account.searches_left = max(0, exc.account.searches_left - len(exc.attempts))
+                    exc.account.this_month_usage += len(exc.attempts)
+                    self.db.save_serpapi_usage(exc.account)
+                recovered = await self._try_brightdata_fallback(profile, str(exc))
+                fallback_reason = (self.db.row("SELECT last_error FROM profiles WHERE id=?", (profile_id,)) or {}).get("last_error")
+                day = datetime.now(UTC).strftime("%Y-%m-%d")
                 self.db.add_event(
-                    f"serpapi:{profile_id}:{hour}:empty",
+                    f"serpapi:{profile_id}:{day}:empty",
                     "serpapi_empty",
                     {
                         "title": "SerpApi 個人檔案查無結果",
                         "text": (
-                            f"已用 {len(exc.attempts)} 次受控查詢仍無結果；將改用備援來源。\n"
+                            f"已查詢 {len(exc.attempts)} 個不同識別碼仍無結果；"
+                            f"{'備援已成功更新個人檔案' if recovered else (fallback_reason or '備援尚未取得資料')}。\n"
                             f"監控網址：{profile['url']}"
                         ),
                         "source_url": profile["url"],
                     },
                     profile_id,
+                    notify=False,
                 )
-                await self._try_brightdata_fallback(profile, str(exc))
             except SerpApiError as exc:
                 self._record_serpapi_attempts(profile_id, [{
                     "query": profile_id_from_url(str(profile["url"])), "status": "error", "error": str(exc),
@@ -7812,7 +7838,7 @@ class MonitorService:
                 )
                 if (self.db.profile_source_frozen(profile_id, "apify")
                         or not self._preferred_posts_v2_contract() or self._remaining_budget() <= 0):
-                    await self._capture_scrapecreators_posts(profile_id)
+                    self._queue_scrapecreators_posts(profile)
             else:
                 canary_items = await self._try_browser_canary(
                     profile, 0, "apify_v1_disabled"
@@ -7821,7 +7847,7 @@ class MonitorService:
                     profile_id, canary_items, notify=True
                 )
                 if not canary_items:
-                    await self._capture_scrapecreators_posts(profile_id)
+                    self._queue_scrapecreators_posts(profile)
             self._schedule_next(profile_id)
             return
         initial = not bool(self.db.row("SELECT id FROM entities WHERE profile_id=? AND kind='post' LIMIT 1", (profile_id,)))
@@ -7846,7 +7872,7 @@ class MonitorService:
             posts = await self._fetch_regular_posts(profile, initial)
         except (ApifyFrozen, BudgetExceeded) as exc:
             reason = "apify_frozen" if isinstance(exc, ApifyFrozen) else "apify_budget"
-            await self._capture_scrapecreators_posts(profile_id)
+            self._queue_scrapecreators_posts(profile)
             canary_items = await self._try_browser_canary(profile, 0, reason)
             await self._ingest_browser_canary_posts(profile_id, canary_items, notify=not initial)
             self._schedule_next(profile_id)
@@ -8274,6 +8300,12 @@ class MonitorService:
         return post_urls, persisted_ids
 
     def _serpapi_profile_due(self, profile: dict[str, Any]) -> bool:
+        latest = self.db.row("""SELECT status,attempted_at FROM serpapi_profile_attempts
+            WHERE profile_id=? ORDER BY id DESC LIMIT 1""", (profile["id"],))
+        if latest and latest["status"] == "empty":
+            attempted = parse_time(latest["attempted_at"])
+            if attempted and datetime.now(UTC) - attempted < timedelta(hours=max(24, self.settings.serpapi_profile_refresh_hours)):
+                return False
         checked_at = profile.get("serp_last_checked_at")
         if not checked_at:
             return True
@@ -8327,13 +8359,41 @@ class MonitorService:
         # Reserve the limited trial for public posts, not routine profile refreshes.
         return await self._try_browser_fallback(profile, primary_error, brightdata_error)
 
+    def _queue_scrapecreators_posts(self, profile: dict[str, Any]) -> int | None:
+        """Resume bounded fallback pages independently of regular visits."""
+        gateway = self.scrapecreators
+        if not (self.settings.scrapecreators_enabled and gateway.enabled
+                and gateway.free_only_confirmed and gateway.api_key
+                and reserved_public_profile(self.db, profile)):
+            return None
+        profile_id = int(profile["id"])
+        checkpoint = self.db.row("SELECT * FROM scrapecreators_captures WHERE profile_id=?", (profile_id,))
+        if checkpoint and checkpoint["status"] != "in_progress":
+            return None
+        used = self.db.row("SELECT used FROM provider_trial_usage WHERE provider='scrapecreators'")
+        if (used or {}).get("used", 0) >= gateway.trial_limit and not (checkpoint and checkpoint.get("pending_json")):
+            return None
+        available = datetime.now(UTC)
+        if checkpoint:
+            available = max(available, datetime.fromtimestamp(checkpoint["updated"], UTC) + timedelta(
+                minutes=self.settings.capture_v2_posts_batch_spacing_max_minutes))
+        with self.db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            latest = conn.execute("""SELECT status FROM jobs WHERE profile_id=? AND
+                job_type='scrapecreators_posts' ORDER BY id DESC LIMIT 1""", (profile_id,)).fetchone()
+            if latest and latest["status"] in {"pending", "running", "failed"}:
+                return None
+            result = conn.execute("""INSERT INTO jobs(profile_id,job_type,priority,payload_json,available_at,created_at)
+                VALUES (?,'scrapecreators_posts',-290,'{}',?,?)""", (profile_id, available.isoformat(), utcnow()))
+            return int(result.lastrowid)
+
     async def _capture_scrapecreators_posts(self, profile_id: int) -> dict[str, Any] | None:
         """One bounded fallback page. Historical imports are quiet and checkpointed."""
         profile = self.db.row("SELECT * FROM profiles WHERE id=?", (profile_id,))
         if not (self.settings.scrapecreators_enabled and profile and reserved_public_profile(self.db, profile)):
             return None
         checkpoint = self.db.row("SELECT * FROM scrapecreators_captures WHERE profile_id=?", (profile_id,))
-        if checkpoint and checkpoint["status"] in {"source_limited", "invalid_identity"}:
+        if checkpoint and checkpoint["status"] in {"source_limited", "invalid_identity", "blocked"}:
             return None
         cursor = checkpoint.get("cursor") if checkpoint else None
         try:
@@ -8374,6 +8434,10 @@ class MonitorService:
                 profile_id, notify=False)
             return counts
         except ScrapeCreatorsError as exc:
+            self.db.execute("""INSERT INTO scrapecreators_captures(profile_id,status,updated)
+                VALUES (?,'blocked',?) ON CONFLICT(profile_id) DO UPDATE
+                SET status=CASE WHEN status='invalid_identity' THEN status ELSE 'blocked' END,updated=excluded.updated""",
+                (profile_id, time.time()))
             self.db.add_event(f"scrapecreators-limited:{profile_id}:{utcnow()[:10]}",
                 "scrapecreators_limited", {"title": "ScrapeCreators 免費備援停止", "text": str(exc)}, profile_id, notify=False)
             return None
