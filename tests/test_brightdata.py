@@ -4,6 +4,16 @@ import pytest
 from fb_monitor.brightdata import BrightDataError, BrightDataGateway, normalize_brightdata_profile
 
 
+def test_single_profile_object_and_error_response():
+    item = BrightDataGateway._normalize({"id": "123", "name": "Alice", "profile_photo": "https://cdn/avatar.jpg"}, "https://facebook.com/123")
+    assert item["id"] == "123"
+    assert item["profile_picture"] == "https://cdn/avatar.jpg"
+    with pytest.raises(BrightDataError, match="denied"):
+        BrightDataGateway._normalize({"error": "denied"}, "https://facebook.com/123")
+    with pytest.raises(BrightDataError):
+        BrightDataGateway._normalize({}, "https://facebook.com/123")
+
+
 def test_normalize_profile_maps_dashboard_fields():
     item = normalize_brightdata_profile(
         {

@@ -98,6 +98,8 @@ class BrightDataGateway:
     @staticmethod
     def _normalize(data: Any, profile_url: str) -> dict[str, Any]:
         rows = data if isinstance(data, list) else data.get("data") if isinstance(data, dict) else None
+        if isinstance(data, dict) and "data" not in data:
+            rows = [data]
         if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
             raise BrightDataError("Bright Data Facebook Profiles API 未回傳資料")
         row = rows[0]
