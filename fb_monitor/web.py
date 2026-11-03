@@ -1608,7 +1608,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "capture_profile_photos": "帳號可見照片完整回溯",
             "profile_browser_fallback": "個人資料瀏覽器補跑",
         }
-        status_labels = {"pending": "等待中", "running": "執行中", "done": "完成", "failed": "失敗", "source_limited": "照片來源受限", "cancelled": "已取消", "superseded": "已退役", "deferred_budget": "額度延後", "budget_paused": "預算暫停", "needs_reconcile": "待人工對帳"}
+        status_labels = {"pending": "等待中", "running": "執行中", "done": "完成", "failed": "失敗", "deferred_profile": "個資待補跑", "source_limited": "照片來源受限", "cancelled": "已取消", "superseded": "已退役", "deferred_budget": "額度延後", "budget_paused": "預算暫停", "needs_reconcile": "待人工對帳"}
         for row in rows:
             row["type_label"] = type_labels.get(str(row["job_type"]), str(row["job_type"]))
             row["status_label"] = status_labels.get(str(row["status"]), str(row["status"]))

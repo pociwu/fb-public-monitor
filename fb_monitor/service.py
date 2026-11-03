@@ -2362,8 +2362,8 @@ class MonitorService:
         display = str(profile.get("display_name") or profile.get("name") or target_id or "Facebook")
         if classification is EvidenceClass.STRONG_PUBLIC and state is AccessState.CONFIRMED_PUBLIC:
             self.db.execute(
-                "UPDATE profiles SET public_state='public',last_success_at=?,last_error=NULL WHERE id=?",
-                (utcnow(), profile_id),
+                "UPDATE profiles SET public_state='public' WHERE id=?",
+                (profile_id,),
             )
             if previous_state != "public":
                 self.db.add_event(
@@ -3246,8 +3246,8 @@ class MonitorService:
             raise RuntimeError("Capture V2 契約通過但未能建立強公開證據")
         previous_state = str(profile.get("public_state") or "unknown")
         self.db.execute(
-            "UPDATE profiles SET public_state='public',last_success_at=?,last_error=NULL WHERE id=?",
-            (utcnow(), profile_id),
+            "UPDATE profiles SET public_state='public' WHERE id=?",
+            (profile_id,),
         )
         if previous_state != "public":
             display = profile.get("display_name") or profile.get("name") or "Facebook"
@@ -5027,6 +5027,10 @@ class MonitorService:
         try:
             if job["job_type"] == "visit":
                 await self.visit_profile(int(job["profile_id"]))
+                outcome = self.db.row("SELECT last_error FROM profiles WHERE id=?", (job["profile_id"],))
+                if outcome and outcome.get("last_error"):
+                    pending = self.db.row("SELECT id FROM jobs WHERE profile_id=? AND job_type='profile_browser_fallback' AND status IN ('pending','running')", (job["profile_id"],))
+                    job_terminal_status = 'deferred_profile' if pending else 'failed'
             elif job["job_type"] == "browser_visit":
                 await self.browser_visit_profile(int(job["profile_id"]))
             elif job["job_type"] == "profile_browser_fallback":
@@ -5119,6 +5123,8 @@ class MonitorService:
                 WHERE id=? AND status='running' AND lease_owner=?""",
                 (job_terminal_status, utcnow(), job["id"], self.worker_id),
             )
+            if job["job_type"] == 'visit' and job_terminal_status != 'done':
+                self.db.execute("UPDATE jobs SET error=(SELECT last_error FROM profiles WHERE id=?) WHERE id=?", (job["profile_id"], job["id"]))
             if job["job_type"] == "scrapecreators_posts":
                 profile = self.db.row("SELECT * FROM profiles WHERE id=?", (job["profile_id"],))
                 if profile:
@@ -7749,7 +7755,8 @@ class MonitorService:
             """SELECT id FROM jobs WHERE profile_id=? AND job_type='profile_browser_fallback'
             AND status IN ('pending','running') LIMIT 1""", (profile_id,),
         )
-        if self._serpapi_profile_due(profile) and not pending_refresh:
+        refresh_due = self._serpapi_profile_due(profile)
+        if refresh_due and not pending_refresh:
             try:
                 await self._refresh_serpapi_profile(profile)
                 profile = self.db.row("SELECT * FROM profiles WHERE id=?", (profile_id,)) or profile
@@ -7808,6 +7815,16 @@ class MonitorService:
                 )
                 await self._try_brightdata_fallback(profile, str(exc))
             profile = self.db.row("SELECT * FROM profiles WHERE id=?", (profile_id,)) or profile
+        elif not pending_refresh:
+            last_success = parse_time(profile.get('last_success_at'))
+            if not last_success or datetime.now(UTC) - last_success >= timedelta(hours=self.settings.serpapi_profile_refresh_hours):
+                reason = '個資逾期；SerpApi 尚在查詢冷卻期，已排入瀏覽器補跑'
+                self.db.queue_unique_job(profile_id=profile_id, job_type='profile_browser_fallback', priority=5,
+                    dedupe_key=f'profile-browser-fallback:{profile_id}', available_at=utcnow(),
+                    payload={'primary_error': 'SerpApi 查詢冷卻期', 'brightdata_error': '沿用舊請求保護，不重新提交', 'requested_at': utcnow()})
+                self._profile_refresh_failed(profile_id, reason, deferred=True)
+        if pending_refresh and not profile.get('last_error'):
+            self._profile_refresh_failed(profile_id, '個人資料尚未更新；瀏覽器補跑等待中', deferred=True)
         if (
             self.settings.capture_v2_enabled
             and profile.get("public_state") == "public"
@@ -8345,7 +8362,7 @@ class MonitorService:
             await self._store_profile_details(profile, item)
         except BrightDataPending as exc:
             self._profile_refresh_failed(int(profile["id"]), str(exc), deferred=True)
-            return False
+            return await self._try_browser_fallback(profile, primary_error, str(exc))
         except BrightDataError as exc:
             return await self._try_scrapecreators_fallback(profile, primary_error, str(exc))
         self.db.add_event(
