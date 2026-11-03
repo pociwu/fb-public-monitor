@@ -5030,6 +5030,9 @@ class MonitorService:
                 outcome = self.db.row("SELECT last_error FROM profiles WHERE id=?", (job["profile_id"],))
                 if outcome and outcome.get("last_error"):
                     pending = self.db.row("SELECT id FROM jobs WHERE profile_id=? AND job_type='profile_browser_fallback' AND status IN ('pending','running')", (job["profile_id"],))
+                    if not pending:
+                        current = self.db.row('SELECT url FROM profiles WHERE id=?', (job['profile_id'],))
+                        pending = self.db.row("SELECT remote_id FROM provider_requests WHERE provider='brightdata' AND request_key=? AND status='pending' AND remote_id IS NOT NULL", (self.settings.brightdata_dataset_id + ':' + current['url'].rstrip('/'),))
                     job_terminal_status = 'deferred_profile' if pending else 'failed'
             elif job["job_type"] == "browser_visit":
                 await self.browser_visit_profile(int(job["profile_id"]))
@@ -8362,7 +8365,7 @@ class MonitorService:
             await self._store_profile_details(profile, item)
         except BrightDataPending as exc:
             self._profile_refresh_failed(int(profile["id"]), str(exc), deferred=True)
-            return await self._try_browser_fallback(profile, primary_error, str(exc))
+            return False
         except BrightDataError as exc:
             return await self._try_scrapecreators_fallback(profile, primary_error, str(exc))
         self.db.add_event(
